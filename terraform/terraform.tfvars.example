@@ -12,7 +12,7 @@ ssh_public_key   = "ssh-ed25519 AAAA... you@host"
 allowed_ssh_cidr = "0.0.0.0/0"   # narrow to YOUR.IP/32
 
 # Fleet sizing (all core_fraction=100). Defaults are a sensible first run:
-# proxy 8c/16g, 2× loadgen 8c/16g, 3× backend 4c/8g, control 2c/4g.
+# proxy 8c/16g, 1× loadgen 8c/16g, 2× backend 4c/8g, control 2c/4g.
 proxy_cores    = 8
-loadgen_count  = 2
-backend_count  = 3
+loadgen_count  = 1
+backend_count  = 2

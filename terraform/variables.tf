@@ -61,8 +61,8 @@ variable "proxy_memory" {
 
 variable "loadgen_count" {
   type        = number
-  default     = 2
-  description = "Number of generator hosts. One is rarely enough to saturate a fast proxy."
+  default     = 1
+  description = "Number of generator hosts. Bump this if the self-check voids high-rate cells (one generator may not saturate a fast proxy)."
 }
 variable "loadgen_cores" {
   type    = number
@@ -75,8 +75,8 @@ variable "loadgen_memory" {
 
 variable "backend_count" {
   type        = number
-  default     = 3
-  description = "Origins. Aggregate backend capacity must exceed the proxy's; the self-check enforces it."
+  default     = 2
+  description = "Origins. Aggregate backend capacity must exceed the proxy's; the self-check voids cells where a backend saturates first."
 }
 variable "backend_cores" {
   type    = number
