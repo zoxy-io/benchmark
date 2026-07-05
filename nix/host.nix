@@ -14,6 +14,13 @@
 
   system.stateVersion = "24.11";
 
+  # Use the official Envoy release binary rather than nixpkgs' from-source Bazel
+  # build (uncached at our pin: ~1h + lots of RAM, and the release artifact is
+  # what people actually deploy). proxies.nix picks this up via pkgs.envoy.
+  nixpkgs.overlays = [
+    (final: _prev: { envoy = final.callPackage ./envoy.nix { }; })
+  ];
+
   # --- cloud / boot ----------------------------------------------------------
   boot.growPartition = true;
   services.qemuGuest.enable = true;
@@ -25,6 +32,11 @@
     # fails on first boot, pin this to the datasource your zone actually serves.
     settings.datasource_list = [ "GCE" "Ec2" "NoCloud" "None" ];
   };
+  # Single network manager: systemd-networkd. cloud-init renders networkd
+  # configs, so we must NOT also let dhcpcd manage the same links — that
+  # combination can drop networking on boot (= no SSH = dead fleet). useDHCP
+  # here is just networkd's fallback if cloud-init doesn't configure the link.
+  networking.useNetworkd = true;
   networking.useDHCP = lib.mkForce true;
 
   # --- access ----------------------------------------------------------------
