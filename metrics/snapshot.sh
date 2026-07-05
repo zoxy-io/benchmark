@@ -6,13 +6,14 @@
 #   e.g. snapshot.sh bench@51.2.3.4 results/2026-07-05T12-00-00
 set -euo pipefail
 
-CTRL=$1 DEST=$2
+CTRL=$1 DEST=$2   # CTRL = bench@<control_external_ip> (the sole public host)
 mkdir -p "$DEST"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
-name=$(ssh "$CTRL" 'curl -sf -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot' \
+name=$(ssh "${SSH_OPTS[@]}" "$CTRL" 'curl -sf -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot' \
        | jq -r '.data.name')
 [ -n "$name" ] && [ "$name" != null ] || { echo "snapshot failed (is --web.enable-admin-api set?)" >&2; exit 1; }
 
-ssh "$CTRL" "sudo tar -C /var/lib/bench-prom/snapshots -czf /tmp/${name}.tgz '${name}'"
-scp "$CTRL:/tmp/${name}.tgz" "$DEST/prometheus-snapshot.tgz"
+ssh "${SSH_OPTS[@]}" "$CTRL" "sudo tar -C /var/lib/bench-prom/snapshots -czf /tmp/${name}.tgz '${name}'"
+scp "${SSH_OPTS[@]}" "$CTRL:/tmp/${name}.tgz" "$DEST/prometheus-snapshot.tgz"
 echo "snapshot -> $DEST/prometheus-snapshot.tgz"

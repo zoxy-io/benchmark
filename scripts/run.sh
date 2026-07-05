@@ -7,9 +7,10 @@
 #
 #   scripts/run.sh [--proxies "zoxy haproxy ..."] [--matrix scenarios/matrix.yaml]
 #
-# Load ALWAYS travels the internal network (proxy ports aren't reachable
-# externally); only SSH is. The orchestrator drives loadgens over SSH and reads
-# their result JSON back.
+# Load ALWAYS travels the internal network. Only `control` has a public IP; the
+# orchestrator SSHes to it directly and reaches proxy/loadgen by their internal
+# IPs through control as a jump host (see lib.sh). Proxy ports are never exposed
+# externally. The orchestrator drives loadgens over SSH and reads their JSON back.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -42,12 +43,12 @@ WRK_CONNS=$(m '.wrk2.connections')
 MAXVUS=4000
 
 # --- inventory --------------------------------------------------------------
-PROXY_INT=$(int_ip proxy);   PROXY_EXT=$(ext_ip proxy)
+PROXY_INT=$(int_ip proxy)
 CONTROL_INT=$(int_ip control); CONTROL_EXT=$(ext_ip control)
+BASTION="bench@$CONTROL_EXT"   # sole public host; lib.sh reaches the rest via -J
 mapfile -t BACKEND_INT < <(role_int_ips backend)
 mapfile -t LOADGEN_INT < <(role_int_ips loadgen)
-mapfile -t LOADGEN_EXT < <(role_ext_ips loadgen)
-NPROC=$(sshx "$PROXY_EXT" nproc | tr -d '[:space:]')
+NPROC=$(sshx "$PROXY_INT" nproc | tr -d '[:space:]')
 WRK_THREADS=$NPROC
 log "fleet: proxy=$PROXY_INT control=$CONTROL_INT backends=[${BACKEND_INT[*]}] loadgens=[${LOADGEN_INT[*]}] nproc=$NPROC"
 
@@ -57,14 +58,15 @@ ln -sfn "$(basename "$RUN")" results/latest
 CELLS="$RUN/cells.jsonl"; : > "$CELLS"
 
 CURRENT_PROXY=""
-cleanup() { [ -n "$CURRENT_PROXY" ] && sshx "$PROXY_EXT" "sudo systemctl stop $CURRENT_PROXY" 2>/dev/null || true; }
+cleanup() { [ -n "$CURRENT_PROXY" ] && sshx "$PROXY_INT" "sudo systemctl stop $CURRENT_PROXY" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # --- setup: ship loadgen scripts, start Prometheus --------------------------
 setup() {
   log "distributing loadgen scripts"
   local h
-  for h in "${LOADGEN_EXT[@]}" "$CONTROL_EXT"; do scprx loadgen "bench@$h:~/" ; done
+  for h in "${LOADGEN_INT[@]}"; do scp_dir_to "$h" '~/' loadgen; done
+  scp_dir_to "$CONTROL_EXT" '~/' loadgen   # control runs self_check.sh
 
   log "rendering + starting Prometheus on control"
   local nodes=""
@@ -74,7 +76,7 @@ setup() {
   nodes=${nodes%,}
   sed -e "s|@@NODE_TARGETS@@|$nodes|" -e "s|@@PROXY_IP@@|$PROXY_INT|" \
     metrics/prometheus.yml.tmpl > "$RUN/prometheus.yml"
-  scpx "$RUN/prometheus.yml" "bench@$CONTROL_EXT:/etc/prometheus/prometheus.yml"
+  scp_to "$CONTROL_EXT" /etc/prometheus/prometheus.yml "$RUN/prometheus.yml"
   sshx "$CONTROL_EXT" "sudo systemctl restart bench-prometheus"
   sleep 2
 }
@@ -95,9 +97,9 @@ deploy_proxy() { # proxy tls_mode nbackends
   local rdir="$RUN/config/${proxy}_${tls_mode}_${nb}b"; rm -rf "$rdir"
   mapfile -t files < <(scripts/render-config.sh "$proxy" "$tls_mode" "$NPROC" "$rdir" "${eps[@]}")
   local etc; etc=$(proxy_etc "$proxy")
-  local f; for f in "${files[@]}"; do scpx "$f" "bench@$PROXY_EXT:$etc/$(basename "$f")"; done
+  local f; for f in "${files[@]}"; do scp_to "$PROXY_INT" "$etc/$(basename "$f")" "$f"; done
   CURRENT_PROXY=$proxy
-  sshx "$PROXY_EXT" "sudo systemctl restart $proxy"
+  sshx "$PROXY_INT" "sudo systemctl restart $proxy"
   wait_ready "$proxy" "$tls_mode"
 }
 
@@ -107,10 +109,10 @@ run_cell() {
   local dir="$RUN/cells/$tag"; mkdir -p "$dir"
   local scheme port
   case $proto in h1) scheme=http; port=8080 ;; *) scheme=https; port=8443 ;; esac
-  local n=${#LOADGEN_EXT[@]} per=$(( rate / ${#LOADGEN_EXT[@]} )); (( per < 1 )) && per=1
+  local per=$(( rate / ${#LOADGEN_INT[@]} )); (( per < 1 )) && per=1
   local i=0 pids=() start end
   start=$(date +%s)
-  for lg in "${LOADGEN_EXT[@]}"; do
+  for lg in "${LOADGEN_INT[@]}"; do
     local remote="/tmp/cell_${tag}_$i.json"
     if [ "$proto" = h1-tls ]; then
       sshx "$lg" "bash ~/loadgen/run-wrk2.sh '$scheme://$PROXY_INT:$port$reqpath' $per '$dur' $WRK_THREADS $WRK_CONNS '$remote' >/tmp/cell_${tag}_$i.log 2>&1" &
@@ -123,8 +125,8 @@ run_cell() {
   end=$(date +%s)
 
   local total=0 j=0 r
-  for lg in "${LOADGEN_EXT[@]}"; do
-    scpx "bench@$lg:/tmp/cell_${tag}_$j.json" "$dir/gen_$j.json" 2>/dev/null || echo '{}' > "$dir/gen_$j.json"
+  for lg in "${LOADGEN_INT[@]}"; do
+    scp_from "$lg" "/tmp/cell_${tag}_$j.json" "$dir/gen_$j.json" 2>/dev/null || echo '{}' > "$dir/gen_$j.json"
     if [ "$proto" = h1-tls ]; then r=$(jq -r '.achieved_rps // 0' "$dir/gen_$j.json")
     else r=$(jq -r '.metrics.http_reqs.rate // 0' "$dir/gen_$j.json"); fi
     total=$(awk -v a="$total" -v b="$r" 'BEGIN{printf "%.0f", a+b}')
@@ -194,7 +196,7 @@ run_proxy() {
           done
         done
       done
-      sshx "$PROXY_EXT" "sudo systemctl stop $proxy"; CURRENT_PROXY=""
+      sshx "$PROXY_INT" "sudo systemctl stop $proxy"; CURRENT_PROXY=""
     done
   done
 }

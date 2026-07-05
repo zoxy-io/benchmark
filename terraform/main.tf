@@ -83,8 +83,11 @@ resource "yandex_compute_instance" "host" {
   }
 
   network_interface {
-    subnet_id          = yandex_vpc_subnet.bench.id
-    nat                = true # external IP for SSH + image/metrics pull
+    subnet_id = yandex_vpc_subnet.bench.id
+    # Only `control` is public; the orchestrator reaches proxy/loadgen/backend by
+    # their internal IPs through control as a jump host. No host needs egress
+    # (the image is self-contained; cloud-init uses link-local metadata).
+    nat                = each.value.role == "control"
     security_group_ids = [yandex_vpc_security_group.bench.id]
   }
 

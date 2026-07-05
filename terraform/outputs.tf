@@ -14,10 +14,12 @@ output "inventory" {
   }
 }
 
-output "proxy_ip" {
-  value = yandex_compute_instance.host["proxy"].network_interface[0].nat_ip_address
-}
-
+# The one public IP — SSH here; the orchestrator jumps through it for the rest.
 output "control_ip" {
   value = yandex_compute_instance.host["control"].network_interface[0].nat_ip_address
+}
+
+# Proxy has no public IP now; expose its internal IP for debugging/jump.
+output "proxy_internal_ip" {
+  value = yandex_compute_instance.host["proxy"].network_interface[0].ip_address
 }

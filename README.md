@@ -156,6 +156,10 @@ make down
 - Nothing here targets anything you don't own: it stands up your own VMs in your
   own folder and load-tests your own proxy. Do not point the generators at hosts
   outside the fleet.
+- **Only `control` has a public IP.** proxy/loadgen/backend are internal-only;
+  the orchestrator reaches them by internal IP through control as an SSH jump
+  host (`ssh -J`). One public IPv4, minimal external surface — the security
+  group opens only port 22 on that one host.
 
 ## Reading the results
 

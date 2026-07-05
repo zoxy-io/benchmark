@@ -12,11 +12,40 @@ ext_ip()        { _jqi ".inventory.value.hosts[\"$1\"].external_ip"; }
 role_int_ips()  { local h; for h in $(hosts_of_role "$1"); do int_ip "$h"; done; }
 role_ext_ips()  { local h; for h in $(hosts_of_role "$1"); do ext_ip "$h"; done; }
 
+# Only `control` has a public IP; every other host is reached by its INTERNAL
+# IP through control as a jump host. BASTION is set by run.sh to
+# "bench@<control_external_ip>"; empty => everything is direct.
+BASTION="${BASTION:-}"
+
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
           -o ConnectTimeout=10 -o LogLevel=ERROR)
-sshx()  { local host=$1; shift; ssh "${SSH_OPTS[@]}" "bench@$host" "$@"; }
-scpx()  { scp "${SSH_OPTS[@]}" "$@"; }
-scprx() { scp -r "${SSH_OPTS[@]}" "$@"; }
+
+# _jump <host> -> emits "-J <bastion>" (one token per line) unless <host> IS the
+# bastion. The same key options apply to both hops via SSH_OPTS.
+_jump() {
+  [ -n "$BASTION" ] && [ "bench@$1" != "$BASTION" ] && printf -- '-J\n%s\n' "$BASTION"
+}
+
+sshx() { # sshx HOST CMD...
+  local host=$1; shift
+  local j; mapfile -t j < <(_jump "$host")
+  ssh "${j[@]}" "${SSH_OPTS[@]}" "bench@$host" "$@"
+}
+scp_to() { # scp_to HOST DEST SRC...
+  local host=$1 dest=$2; shift 2
+  local j; mapfile -t j < <(_jump "$host")
+  scp "${j[@]}" "${SSH_OPTS[@]}" "$@" "bench@$host:$dest"
+}
+scp_from() { # scp_from HOST REMOTE LOCAL
+  local host=$1 remote=$2 dst=$3
+  local j; mapfile -t j < <(_jump "$host")
+  scp "${j[@]}" "${SSH_OPTS[@]}" "bench@$host:$remote" "$dst"
+}
+scp_dir_to() { # scp_dir_to HOST DEST SRCDIR
+  local host=$1 dest=$2 src=$3
+  local j; mapfile -t j < <(_jump "$host")
+  scp -r "${j[@]}" "${SSH_OPTS[@]}" "$src" "bench@$host:$dest"
+}
 
 log() { printf '\033[36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
