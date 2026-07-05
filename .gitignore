@@ -23,3 +23,7 @@ sa-key.json
 
 .direnv
 .DS_Store
+
+# devenv (keep devenv.lock — it pins inputs)
+.devenv*
+devenv.local.nix

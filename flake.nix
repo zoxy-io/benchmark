@@ -62,6 +62,7 @@
             awscli2 # push the qcow2 to Yandex Object Storage (S3-compatible)
             jq
             yq-go
+            gnumake # the Makefile targets
             openssl # regenerate the TLS fixture if needed
             (python3.withPackages (ps: with ps; [ matplotlib pandas ]))
           ];

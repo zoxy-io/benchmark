@@ -113,13 +113,28 @@ zoxy-benchmark/
 
 ## Run it
 
+Two equivalent front-ends — pick one. With **devenv** (no `make` needed), the
+Makefile targets are mirrored as commands you run by name:
+
+```sh
+devenv shell    # toolchain: opentofu, k6, wrk2, awscli2, python, …
+image           # build the NixOS qcow2 (all five proxies + tuning) and push to YC Object Storage
+up              # tofu apply: VPC, subnet, and the loadgen/proxy/backend/control VMs
+bench           # for each proxy: render config → start → warm → run the matrix → collect
+report          # render tables + plots into results/<timestamp>/
+down            # tofu destroy
+```
+
+Or with the flake dev shell + `make` (both are provided; `nix develop` now
+includes `gnumake`):
+
 ```sh
 nix develop
-make image      # build the NixOS qcow2 (all five proxies + tuning) and push to YC Object Storage
-make up         # terraform apply: VPC, subnet, and the loadgen/proxy/backend/control VMs
-make bench      # for each proxy: render config → start → warm → run the matrix → collect
-make report     # render tables + plots into results/<timestamp>/
-make down       # terraform destroy
+make image
+make up
+make bench      # e.g. make bench PROXIES="zoxy haproxy"
+make report
+make down
 ```
 
 `make bench` is the interesting one. Per proxy it:
