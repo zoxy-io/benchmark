@@ -1,0 +1,29 @@
+# Rendered at deploy time: nbthread is set to the vCPU count and the origin
+# server lines are filled in. Serves :8080 (h1 plaintext) and :8443 (h2 +
+# http/1.1 via ALPN). No logging on the hot path; upstream keep-alive via http-reuse.
+global
+    nbthread @@NPROC@@
+    maxconn 200000
+    tune.ssl.default-dh-param 2048
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384
+
+defaults
+    mode http
+    option http-keep-alive
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+    # no `log` directives => haproxy logs nothing (keeps the hot path clean)
+
+frontend fe_plain
+    bind 0.0.0.0:8080
+    default_backend be_origin
+
+frontend fe_tls
+    bind 0.0.0.0:8443 ssl crt /etc/bench/tls/bundle.pem alpn h2,http/1.1
+    default_backend be_origin
+
+backend be_origin
+    balance roundrobin
+    http-reuse always
+@@BACKENDS@@

@@ -1,0 +1,22 @@
+# Static config (no placeholders). Dynamic routing/services/TLS live in
+# dynamic.yml, rendered at deploy time. GOMAXPROCS defaults to all cores.
+entryPoints:
+  plain:
+    address: ":8080"
+  tls:
+    address: ":8443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: false
+
+log:
+  level: ERROR
+
+# accessLog omitted => disabled (no per-request logging on the hot path)
+api:
+  dashboard: false
+
+ping:
+  entryPoint: plain

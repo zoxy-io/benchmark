@@ -1,0 +1,11 @@
+{
+  "listen": "0.0.0.0:8443",
+  "admin": "0.0.0.0:9901",
+  "tls": {
+    "certificate_file": "/etc/bench/tls/cert.pem",
+    "private_key_file": "/etc/bench/tls/key.pem",
+    "http2": true
+  },
+  "routes": [{ "cluster": "origin" }],
+  "clusters": [{ "name": "origin", "endpoints": [@@BACKENDS@@] }]
+}

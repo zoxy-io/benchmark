@@ -1,0 +1,10 @@
+#cloud-config
+# Belt-and-suspenders alongside the `ssh-keys` metadata: make sure the `bench`
+# user (baked into the image) can be reached even if the datasource doesn't map
+# GCE-style ssh-keys automatically.
+users:
+  - name: bench
+    groups: [wheel, proxy]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      - ${ssh_public_key}

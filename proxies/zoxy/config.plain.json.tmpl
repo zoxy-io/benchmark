@@ -1,0 +1,6 @@
+{
+  "listen": "0.0.0.0:8080",
+  "admin": "0.0.0.0:9901",
+  "routes": [{ "cluster": "origin" }],
+  "clusters": [{ "name": "origin", "endpoints": [@@BACKENDS@@] }]
+}

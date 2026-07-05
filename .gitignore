@@ -1,0 +1,25 @@
+# build artifacts
+result
+result-*
+*.qcow2
+
+# terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/inventory.json
+
+# secrets / creds
+*.pem
+!proxies/**/*.pem
+key.json
+sa-key.json
+
+# results (keep the dir, ignore the runs — commit summaries by hand if wanted)
+/results/*
+!/results/.gitkeep
+
+.direnv
+.DS_Store
