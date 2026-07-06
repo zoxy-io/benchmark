@@ -75,7 +75,7 @@ variable "loadgen_memory" {
 
 variable "backend_count" {
   type        = number
-  default     = 3
+  default     = 4
   description = "Origins. Must be >= the largest backend_counts entry in scenarios/matrix.yaml (run.sh fails fast otherwise), and aggregate backend capacity must exceed the proxy's; the self-check voids cells where a backend saturates first."
 }
 variable "backend_cores" {

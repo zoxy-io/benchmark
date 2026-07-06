@@ -20,8 +20,10 @@ protocols: [h1, h1-tls, h2]
 
 bodies: [64, 1k, 10k, 100k]     # request paths /64 /1k /10k /100k on the origin
 
-backend_counts: [1, 2]          # 1 = single origin; 2 = exercise the LB path
-                                # (terraform backend_count must be >= 2; run.sh checks)
+backend_counts: [1, 4]          # 1 = single origin (LB=1, origin is the likely cap);
+                                # 4 = full fan-out so 4 tuned origins (~4×70k) don't
+                                # bottleneck a fast proxy. terraform backend_count must
+                                # be >= 4 (run.sh fails fast otherwise).
 
 load:
   warmup: "10s"                 # discarded before every measured run

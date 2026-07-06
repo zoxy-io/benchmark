@@ -33,17 +33,30 @@ in
     '';
     eventsConfig = ''
       worker_connections 65535;
+      multi_accept on;   # accept all pending connections per wakeup
     '';
     appendHttpConfig = ''
       access_log off;
+      server_tokens off;
       keepalive_requests 100000000;   # don't GOAWAY mid-run
       keepalive_timeout 3600s;
       sendfile on;
       tcp_nopush on;
+      tcp_nodelay on;                 # flush keep-alive responses immediately
+      reset_timedout_connection on;   # RST dead clients, free their slots fast
+      # The origin serves the same handful of files forever — cache their open
+      # fds + metadata so requests aren't repeated open()+fstat() (denji
+      # nginx-tuning: ~600 rps/instance on this alone).
+      open_file_cache max=16384 inactive=3600s;
+      open_file_cache_valid 3600s;
+      open_file_cache_min_uses 1;
+      open_file_cache_errors on;
     '';
     virtualHosts."_" = {
       default = true;
-      listen = [ { addr = "0.0.0.0"; port = 9000; } ];
+      # reuseport shards accept across workers via SO_REUSEPORT (big win when
+      # clients open many connections); large backlog absorbs accept bursts.
+      listen = [ { addr = "0.0.0.0"; port = 9000; extraParameters = [ "reuseport" "backlog=65535" ]; } ];
       root = "${bodies}";
       locations."/".extraConfig = ''
         default_type application/octet-stream;

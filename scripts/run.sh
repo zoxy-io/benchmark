@@ -45,7 +45,7 @@ KEEPUP=$(m '.load.peak_search.keepup_ratio')
 SETTLE=$(m '.load.settle // 5')
 ERRMAX=$(m '.load.max_error_rate // 0.001')
 WRK_CONNS=$(m '.wrk2.connections')
-MAXVUS=4000
+MAXVUS=1000   # per-generator VU/connection guardrail (see loadgen/scenario.js)
 
 # --- inventory --------------------------------------------------------------
 PROXY_INT=$(int_ip proxy)

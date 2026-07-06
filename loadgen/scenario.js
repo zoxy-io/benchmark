@@ -14,7 +14,12 @@ const TARGET = __ENV.TARGET; // e.g. http://10.10.0.5:8080 or https://10.10.0.5:
 const REQ_PATH = __ENV.REQ_PATH || '/64';
 const RATE = parseInt(__ENV.RATE || '1000', 10);
 const DURATION = __ENV.DURATION || '30s';
-const MAX_VUS = parseInt(__ENV.MAX_VUS || '4000', 10);
+// Cap on concurrent VUs = cap on open connections per generator. GUARDRAIL: if
+// the target stalls, k6 must NOT spin up thousands of connections (that storm
+// overwhelmed the origin and made numbers meaningless). Capped, it drops
+// iterations instead and run.sh voids the cell — attributing the ceiling to the
+// target, not to k6 self-harm. ~1000 conns/gen sustains >=500k req/s at 2ms.
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '1000', 10);
 
 export const options = {
   discardResponseBodies: true, // keep the client cheap
@@ -26,8 +31,8 @@ export const options = {
       rate: RATE,
       timeUnit: '1s',
       duration: DURATION,
-      // enough VUs that the open loop never blocks waiting for a free VU
-      preAllocatedVUs: Math.min(MAX_VUS, Math.max(64, Math.ceil(RATE / 20))),
+      // start with enough for ~2ms latency; grow to the MAX_VUS guardrail if needed
+      preAllocatedVUs: Math.min(MAX_VUS, Math.max(64, Math.ceil(RATE / 500))),
       maxVUs: MAX_VUS,
     },
   },
