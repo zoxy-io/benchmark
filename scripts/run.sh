@@ -11,6 +11,9 @@
 # orchestrator SSHes to it directly and reaches proxy/loadgen by their internal
 # IPs through control as a jump host (see lib.sh). Proxy ports are never exposed
 # externally. The orchestrator drives loadgens over SSH and reads their JSON back.
+# Re-exec under bash if launched by another shell (your login shell may be zsh,
+# which lacks `mapfile` and some array semantics this script relies on).
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib.sh

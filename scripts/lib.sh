@@ -32,30 +32,32 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
           -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
 [ -n "$SSH_KEY" ] && SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 
-# _jump <host> -> emits "-J <bastion>" (one token per line) unless <host> IS the
-# bastion. The same key options apply to both hops via SSH_OPTS.
-_jump() {
-  [ -n "$BASTION" ] && [ "bench@$1" != "$BASTION" ] && printf -- '-J\n%s\n' "$BASTION"
+# _jset -> sets the array `j` so ssh reaches <host> through the bastion, unless
+# <host> IS the bastion. Uses an explicit ProxyCommand (not `-J`) so SSH_OPTS —
+# accept-new host keys, /dev/null known_hosts, the key, BatchMode — apply to the
+# JUMP hop too; plain `-J` leaves the jump connection on ssh defaults, which
+# prompts for control's host key and fails non-interactively. Portable (no
+# bash-only `mapfile`), so it also works when sourced under zsh.
+_jset() {
+  j=()
+  [ -n "$BASTION" ] && [ "bench@$1" != "$BASTION" ] &&
+    j=(-o "ProxyCommand=ssh ${SSH_OPTS[*]} -W %h:%p $BASTION")
 }
 
 sshx() { # sshx HOST CMD...
-  local host=$1; shift
-  local j; mapfile -t j < <(_jump "$host")
+  local host=$1; shift; local j; _jset "$host"
   ssh "${j[@]}" "${SSH_OPTS[@]}" "bench@$host" "$@"
 }
 scp_to() { # scp_to HOST DEST SRC...
-  local host=$1 dest=$2; shift 2
-  local j; mapfile -t j < <(_jump "$host")
+  local host=$1 dest=$2; shift 2; local j; _jset "$host"
   scp "${j[@]}" "${SSH_OPTS[@]}" "$@" "bench@$host:$dest"
 }
 scp_from() { # scp_from HOST REMOTE LOCAL
-  local host=$1 remote=$2 dst=$3
-  local j; mapfile -t j < <(_jump "$host")
+  local host=$1 remote=$2 dst=$3; local j; _jset "$host"
   scp "${j[@]}" "${SSH_OPTS[@]}" "bench@$host:$remote" "$dst"
 }
 scp_dir_to() { # scp_dir_to HOST DEST SRCDIR
-  local host=$1 dest=$2 src=$3
-  local j; mapfile -t j < <(_jump "$host")
+  local host=$1 dest=$2 src=$3; local j; _jset "$host"
   scp -r "${j[@]}" "${SSH_OPTS[@]}" "$src" "bench@$host:$dest"
 }
 
