@@ -40,8 +40,12 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
 # bash-only `mapfile`), so it also works when sourced under zsh.
 _jset() {
   j=()
-  [ -n "$BASTION" ] && [ "bench@$1" != "$BASTION" ] &&
+  # `if` (not a trailing &&-chain) so _jset returns 0 even when <host> IS the
+  # bastion — otherwise the false test propagates a non-zero exit and `set -e`
+  # in the caller kills the run on the first bare sshx/scp to control.
+  if [ -n "$BASTION" ] && [ "bench@$1" != "$BASTION" ]; then
     j=(-o "ProxyCommand=ssh ${SSH_OPTS[*]} -W %h:%p $BASTION")
+  fi
 }
 
 sshx() { # sshx HOST CMD...
