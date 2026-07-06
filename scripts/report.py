@@ -5,10 +5,11 @@ Reads cells.jsonl + each cell's per-generator summaries (k6 or wrk2), aggregates
 peak req/s and latency percentiles across generators and repeats, and writes
 report.md (+ PNG bar charts if matplotlib is present).
 
-CPU/mem enrichment: if PROM_URL is set and reachable (e.g. an SSH tunnel to the
-control node's :9090), the proxy's busy fraction and RSS over each peak window
-are added. Prometheus isn't reachable externally by default, so this degrades
-gracefully when unset.
+Prometheus enrichment: if PROM_URL is set and reachable (e.g. an SSH tunnel to
+the control node's :9090, or a loaded TSDB snapshot), latency percentiles for
+k6-driven cells are aggregated across generators from the remote-written native
+histograms, and the proxy's CPU/mem over each window is added. Without PROM_URL
+everything degrades gracefully to the per-generator local summaries.
 
     scripts/report.py results/latest
 """
@@ -84,8 +85,38 @@ def prom(query, when):
         return None
 
 
+def prom_latency(c):
+    """True cross-generator percentiles from k6's remote-written native
+    histograms, scoped to the cell's window. Returns (p50, p99, p999) in ms, or
+    None when PROM is unset, the query fails (e.g. metric name drift), or the
+    cell was driven by wrk2 (which doesn't remote-write) — callers fall back to
+    the conservative max across the generators' local summaries."""
+    if not PROM or c.get("proto") == "h1-tls":
+        return None
+    win = max(1, int(c["end"]) - int(c["start"]))
+    out = []
+    for qt in (0.5, 0.99, 0.999):
+        v = prom(f"histogram_quantile({qt}, sum(rate(k6_http_req_duration_seconds[{win}s])))", c["end"])
+        if v is None:
+            return None
+        out.append(v * 1000)
+    return tuple(out)
+
+
+def cell_lat_any(c):
+    """Latency for one measured cell: Prometheus aggregation when available,
+    else local summaries. Returns (p50, p99, p999, source)."""
+    lat = prom_latency(c)
+    if lat:
+        return lat[0], lat[1], lat[2], "prom"
+    if c.get("tag"):
+        loc = cell_latency(c["tag"])
+        return loc[0], loc[1], loc[2], "local"
+    return None, None, None, "none"
+
+
 def load_cells():
-    peaks, measures = {}, defaultdict(list)
+    peaks, measures, crosschecks = {}, defaultdict(list), {}
     f = RUN / "cells.jsonl"
     if not f.exists():
         sys.exit(f"no cells.jsonl in {RUN}")
@@ -96,9 +127,11 @@ def load_cells():
         key = (c["proxy"], c["proto"], c["body"], c["backends"])
         if c["kind"] == "peak":
             peaks[key] = c["achieved_rps"]
+        elif c["kind"] == "crosscheck":
+            crosschecks[key] = c
         else:
             measures[(key, c["fraction"])].append(c)
-    return peaks, measures
+    return peaks, measures, crosschecks
 
 
 def median(xs):
@@ -111,11 +144,15 @@ def fmt(x, unit=""):
 
 
 def main():
-    peaks, measures = load_cells()
+    peaks, measures, crosschecks = load_cells()
     proxies = sorted({k[0] for k in peaks})
     combos = sorted({(k[1], k[2], k[3]) for k in peaks})  # proto, body, backends
 
     out = [f"# zoxy-benchmark report — {RUN.name}", ""]
+    out += ["_h1 and h2 cells are driven by k6, h1-tls cells by wrk2 (k6 would negotiate"
+            " h2 over TLS). Compare proxies **within** a protocol; deltas **across**"
+            " protocols also include tool differences. The cross-check table below"
+            " replays each k6-found h1 peak with wrk2 so tool disagreement is visible._", ""]
     inv = RUN / "inventory.json"
     if inv.exists():
         hosts = json.loads(inv.read_text())["inventory"]["value"]["hosts"]
@@ -124,6 +161,9 @@ def main():
             roles[h["role"]] += 1
         out.append("Fleet: " + ", ".join(f"{n}×{r}" for r, n in sorted(roles.items())) + ".")
         out.append("")
+    ver = RUN / "versions.txt"
+    if ver.exists():
+        out += ["## Versions under test", "", "```", ver.read_text().rstrip(), "```", ""]
 
     out += ["## Peak req/s (higher is better)", ""]
     for proto, body, nb in combos:
@@ -135,13 +175,30 @@ def main():
             out.append(f"| {px} | {fmt(peaks.get((px, proto, body, nb)))} |")
         out.append("")
 
+    if crosschecks:
+        out += ["## wrk2 cross-check of k6-found h1 peaks", "",
+                "_wrk2 held at the k6 peak rate for one measure window; a large shortfall"
+                " means the k6 peak is tool-inflated (or the check column names the culprit)._", "",
+                "| proxy | body | be | k6 peak | wrk2 achieved | ratio | check |",
+                "|---|---|---|---|---|---|---|"]
+        for key in sorted(crosschecks):
+            c = crosschecks[key]
+            px, proto, body, nb = key
+            k6p = peaks.get(key)
+            ratio = f"{c['achieved_rps'] / k6p:.2f}" if k6p else "-"
+            out.append(f"| {px} | {body} | {nb} | {fmt(k6p)} | {fmt(c['achieved_rps'])} "
+                       f"| {ratio} | {c['check']} |")
+        out.append("")
+
     # latency at each fraction, plus voids
     voids = []
     for frac in sorted({f for (_, f) in measures}):
         out += [f"## Latency at {int(frac*100)}% of peak (ms)", "",
-                "_Aggregate is the conservative max across generators; median over repeats._", "",
-                "| proxy | proto | body | be | p50 | p99 | p99.9 | runs | voided |",
-                "|---|---|---|---|---|---|---|---|---|"]
+                "_Median over repeats; spread is min–max of p99 across repeats. Source"
+                " `prom` = cross-generator native histograms; `local` = conservative max"
+                " of per-generator summaries._", "",
+                "| proxy | proto | body | be | p50 | p99 | p99 spread | p99.9 | src | runs | voided |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
         for px in proxies:
             for proto, body, nb in combos:
                 cells = measures.get(((px, proto, body, nb), frac), [])
@@ -149,11 +206,15 @@ def main():
                     continue
                 ok = [c for c in cells if c["check"] == "ok"]
                 bad = len(cells) - len(ok)
-                p50 = median([cell_latency(c["tag"])[0] for c in ok if c["tag"]])
-                p99 = median([cell_latency(c["tag"])[1] for c in ok if c["tag"]])
-                p999 = median([cell_latency(c["tag"])[2] for c in ok if c["tag"]])
+                rows = [cell_lat_any(c) for c in ok]
+                p50 = median([r[0] for r in rows])
+                p99 = median([r[1] for r in rows])
+                p999 = median([r[2] for r in rows])
+                p99s = [r[1] for r in rows if r[1] is not None]
+                spread = f"{min(p99s):,.1f}–{max(p99s):,.1f}" if len(p99s) > 1 else "-"
+                src = ",".join(sorted({r[3] for r in rows if r[3] != "none"})) or "-"
                 out.append(f"| {px} | {proto} | {body} | {nb} | {fmt(p50)} | {fmt(p99)} "
-                           f"| {fmt(p999)} | {len(ok)} | {bad or ''} |")
+                           f"| {spread} | {fmt(p999)} | {src} | {len(ok)} | {bad or ''} |")
                 for c in cells:
                     if c["check"] != "ok":
                         voids.append(f"{px}/{proto}/{body}/{nb}b @{frac}: {c['check']}")
@@ -179,7 +240,7 @@ def main():
         out.append("")
 
     if voids:
-        out += ["## Voided cells (excluded — generator/backend was the bottleneck)", ""]
+        out += ["## Voided cells (excluded — saturation, errors, drops, or no self-check data)", ""]
         out += [f"- {v}" for v in voids] + [""]
 
     (RUN / "report.md").write_text("\n".join(out))

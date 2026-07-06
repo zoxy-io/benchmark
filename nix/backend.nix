@@ -22,6 +22,18 @@ in
     enable = true;
     recommendedTlsSettings = false;
     recommendedProxySettings = false;
+    # The NixOS module emits no worker_processes directive, and nginx's default
+    # is ONE worker — a single-core origin whose saturation the whole-host CPU
+    # self-check would never see (1 of 4 cores busy = 25% "idle" host). Use
+    # every core, and raise the connection/file limits so upstream keep-alive
+    # pools from an 8-core proxy never queue on the origin.
+    appendConfig = ''
+      worker_processes auto;
+      worker_rlimit_nofile 1048576;
+    '';
+    eventsConfig = ''
+      worker_connections 65535;
+    '';
     appendHttpConfig = ''
       access_log off;
       keepalive_requests 100000000;   # don't GOAWAY mid-run
@@ -39,4 +51,7 @@ in
       '';
     };
   };
+
+  # worker_rlimit_nofile above needs the service's own rlimit to match.
+  systemd.services.nginx.serviceConfig.LimitNOFILE = 1048576;
 }

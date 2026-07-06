@@ -5,9 +5,11 @@
 # of that peak, `repeats` times.
 #
 # COST/TIME WARNING: as written this is 5×3×4×2 = 120 cells. Each cell is a
-# peak search (several short rate points) plus fractions×repeats latency runs.
-# Expect a few hours on the default fleet. Trim `proxies`, `bodies`, or
-# `backend_counts` for a faster pass; `make bench PROXIES="zoxy haproxy"` overrides.
+# peak search (~8-11 rate points at 15s each, plus a few bisection probes)
+# and fractions×repeats latency runs (9 × 30s), plus ssh/collect overhead —
+# realistically ~8-10 min per cell, i.e. 15-20 HOURS for the full matrix.
+# Trim `proxies`, `bodies`, or `backend_counts` for a faster pass;
+# `make bench PROXIES="zoxy haproxy"` overrides.
 
 proxies: [zoxy, haproxy, envoy, traefik, caddy]
 
@@ -19,13 +21,16 @@ protocols: [h1, h1-tls, h2]
 bodies: [64, 1k, 10k, 100k]     # request paths /64 /1k /10k /100k on the origin
 
 backend_counts: [1, 3]          # 1 = single origin; 3 = exercise the LB path
+                                # (terraform backend_count must be >= 3; run.sh checks)
 
 load:
   warmup: "10s"                 # discarded before every measured run
+  settle: 5                     # seconds to drain backlogs/TIME_WAIT after the saturating peak search
   peak_duration: "15s"          # each rate point during the peak search
   measure_duration: "30s"       # each measured latency run
   repeats: 3                    # per fraction; bump to >=5 for publishable numbers
   latency_fractions: [0.5, 0.8, 0.95]
+  max_error_rate: 0.001         # non-2xx / socket-error fraction above this voids the cell
 
   peak_search:
     start_rate: 5000            # aggregate req/s across ALL generators
