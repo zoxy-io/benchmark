@@ -17,8 +17,20 @@ role_ext_ips()  { local h; for h in $(hosts_of_role "$1"); do ext_ip "$h"; done;
 # "bench@<control_external_ip>"; empty => everything is direct.
 BASTION="${BASTION:-}"
 
+# SSH identity. Set SSH_KEY to the private key that matches terraform's
+# ssh_public_key; defaults to ~/.ssh/zoxy_bench (the README's keygen path). If
+# neither is present, ssh falls back to your agent / default keys. The same key
+# authorizes `bench` on every host (terraform injects it fleet-wide), so it
+# works for both the control hop and the jumped-to internal hosts.
+SSH_KEY="${SSH_KEY:-}"
+if [ -z "$SSH_KEY" ] && [ -f "$HOME/.ssh/zoxy_bench" ]; then SSH_KEY="$HOME/.ssh/zoxy_bench"; fi
+[ -n "$SSH_KEY" ] && SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+# BatchMode=yes: never prompt. A missing/wrong key fails fast (clear error)
+# instead of silently dropping to an interactive password prompt.
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
-          -o ConnectTimeout=10 -o LogLevel=ERROR)
+          -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
+[ -n "$SSH_KEY" ] && SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 
 # _jump <host> -> emits "-J <bastion>" (one token per line) unless <host> IS the
 # bastion. The same key options apply to both hops via SSH_OPTS.

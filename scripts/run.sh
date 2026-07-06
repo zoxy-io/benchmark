@@ -58,6 +58,23 @@ for nb in "${BACKEND_COUNTS[@]}"; do
     exit 1
   fi
 done
+# --- preflight: prove SSH works before anything else, with actionable hints ---
+_pre=$(mktemp)
+if ! sshx "$CONTROL_EXT" true 2>"$_pre"; then
+  log "FATAL: cannot SSH to control ($CONTROL_EXT) as 'bench'."
+  log "  ssh: $(tail -1 "$_pre")"
+  log "  Point SSH_KEY at the private key matching terraform's ssh_public_key, e.g."
+  log "    SSH_KEY=~/.ssh/zoxy_bench make bench     (or: ssh-add ~/.ssh/zoxy_bench)"
+  rm -f "$_pre"; exit 1
+fi
+if ! sshx "$PROXY_INT" true 2>"$_pre"; then
+  log "FATAL: SSH to control works, but the jump to proxy ($PROXY_INT) fails."
+  log "  ssh: $(tail -1 "$_pre")"
+  log "  The same key must authorize 'bench' on every host (terraform sets it fleet-wide)."
+  rm -f "$_pre"; exit 1
+fi
+rm -f "$_pre"
+
 NPROC=$(sshx "$PROXY_INT" nproc | tr -d '[:space:]')
 WRK_THREADS=$NPROC
 log "fleet: proxy=$PROXY_INT control=$CONTROL_INT backends=[${BACKEND_INT[*]}] loadgens=[${LOADGEN_INT[*]}] nproc=$NPROC"

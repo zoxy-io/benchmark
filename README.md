@@ -119,7 +119,10 @@ zoxy-benchmark/
 - A Yandex Cloud account with a **service account** key, a cloud/folder id, and
   an Object Storage bucket for the image. Copy `terraform/terraform.tfvars.example`
   to `terraform/terraform.tfvars` and fill it in.
-- An SSH keypair; its public key goes to `var.ssh_public_key`.
+- An SSH keypair. Its **public** key goes in `var.ssh_public_key` (terraform
+  injects it for `bench` on every host); point `SSH_KEY` at the matching
+  **private** key when running `bench`. Defaults to `~/.ssh/zoxy_bench`, so
+  `ssh-keygen -t ed25519 -f ~/.ssh/zoxy_bench` needs no extra config.
 
 ## Run it
 
@@ -146,6 +149,12 @@ make bench      # e.g. make bench PROXIES="zoxy haproxy"
 make report
 make down
 ```
+
+> The orchestrator SSHes as `bench` using `$SSH_KEY` (default `~/.ssh/zoxy_bench`,
+> else your agent/default keys) and jumps through `control` to the internal hosts.
+> It runs with `BatchMode=yes`, so a missing/wrong key stops the run immediately
+> with a hint — it never falls back to a password prompt. Fix:
+> `SSH_KEY=~/.ssh/yourkey bench` (or `ssh-add ~/.ssh/yourkey`).
 
 `make bench` is the interesting one. Per proxy it:
 

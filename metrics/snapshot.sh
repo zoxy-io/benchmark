@@ -8,7 +8,14 @@ set -euo pipefail
 
 CTRL=$1 DEST=$2   # CTRL = bench@<control_external_ip> (the sole public host)
 mkdir -p "$DEST"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+
+# Same SSH identity handling as scripts/lib.sh (this runs as a child of run.sh).
+SSH_KEY="${SSH_KEY:-}"
+if [ -z "$SSH_KEY" ] && [ -f "$HOME/.ssh/zoxy_bench" ]; then SSH_KEY="$HOME/.ssh/zoxy_bench"; fi
+[ -n "$SSH_KEY" ] && SSH_KEY="${SSH_KEY/#\~/$HOME}"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR -o BatchMode=yes)
+[ -n "$SSH_KEY" ] && SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 
 name=$(ssh "${SSH_OPTS[@]}" "$CTRL" 'curl -sf -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot' \
        | jq -r '.data.name')
