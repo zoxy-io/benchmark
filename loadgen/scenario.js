@@ -31,8 +31,9 @@ export const options = {
       rate: RATE,
       timeUnit: '1s',
       duration: DURATION,
-      // start with enough for ~2ms latency; grow to the MAX_VUS guardrail if needed
-      preAllocatedVUs: Math.min(MAX_VUS, Math.max(64, Math.ceil(RATE / 500))),
+      // preallocate generously so k6 doesn't grow the VU pool mid-test (pool
+      // growth itself causes transient dropped iterations); MAX_VUS is the hard cap.
+      preAllocatedVUs: Math.min(MAX_VUS, Math.max(256, Math.ceil(RATE / 100))),
       maxVUs: MAX_VUS,
     },
   },

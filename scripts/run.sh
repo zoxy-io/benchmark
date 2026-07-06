@@ -44,6 +44,7 @@ MAX_RATE=$(m '.load.peak_search.max_rate')
 KEEPUP=$(m '.load.peak_search.keepup_ratio')
 SETTLE=$(m '.load.settle // 5')
 ERRMAX=$(m '.load.max_error_rate // 0.001')
+DROPMAX=$(m '.load.max_drop_rate // 0.005')   # dropped-iteration FRACTION that voids a cell
 WRK_CONNS=$(m '.wrk2.connections')
 MAXVUS=1000   # per-generator VU/connection guardrail (see loadgen/scenario.js)
 
@@ -162,17 +163,18 @@ run_cell() {
   for p in "${pids[@]}"; do wait "$p" || true; done
   end=$(date +%s)
 
-  local total=0 j=0 r e d maxerr=0 dropped=0 gstart="" gend="" bs be
+  local total=0 j=0 r e d rc maxerr=0 dropped=0 reqcount=0 gstart="" gend="" bs be
   for lg in "${LOADGEN_INT[@]}"; do
     scp_from "$lg" "/tmp/cell_${tag}_$j.json" "$dir/gen_$j.json" 2>/dev/null || echo '{}' > "$dir/gen_$j.json"
     if [ "$tool" = wrk2 ]; then
       r=$(jq -r '.achieved_rps // 0' "$dir/gen_$j.json")
       e=$(jq -r '.error_fraction // 0' "$dir/gen_$j.json")
-      d=0
+      d=0; rc=0
     else
       r=$(jq -r '.metrics.http_reqs.rate // 0' "$dir/gen_$j.json")
       e=$(jq -r '.metrics.http_req_failed.value // 0' "$dir/gen_$j.json")
       d=$(jq -r '.metrics.dropped_iterations.count // 0' "$dir/gen_$j.json")
+      rc=$(jq -r '.metrics.http_reqs.count // 0' "$dir/gen_$j.json")
     fi
     bs=$(jq -r '.bench_start // empty' "$dir/gen_$j.json")
     be=$(jq -r '.bench_end // empty' "$dir/gen_$j.json")
@@ -181,13 +183,14 @@ run_cell() {
     total=$(awk -v a="$total" -v b="$r" 'BEGIN{printf "%.0f", a+b}')
     maxerr=$(awk -v a="$maxerr" -v b="$e" 'BEGIN{print (b>a)?b:a}')
     dropped=$(awk -v a="$dropped" -v b="$d" 'BEGIN{printf "%.0f", a+b}')
+    reqcount=$(awk -v a="$reqcount" -v b="$rc" 'BEGIN{printf "%.0f", a+b}')
     j=$((j+1))
   done
   local verdict=ok
   if awk -v e="$maxerr" -v m="$ERRMAX" 'BEGIN{exit !(e>m)}'; then
     verdict="void:error-rate($maxerr)"
-  elif [ "$dropped" -gt 0 ]; then
-    verdict="void:dropped-iterations($dropped)"
+  elif awk -v dr="$dropped" -v rc="$reqcount" -v m="$DROPMAX" 'BEGIN{t=rc+dr; exit !(t>0 && dr/t>m)}'; then
+    verdict="void:dropped-iterations($dropped/$((reqcount+dropped)))"
   fi
   echo "$total ${gstart:-$start} ${gend:-$end} $verdict"
 }
