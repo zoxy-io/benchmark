@@ -9,6 +9,7 @@ terraform/.terraform.lock.hcl
 terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/terraform.tfvars
+terraform/image.auto.tfvars
 terraform/inventory.json
 
 # secrets / creds

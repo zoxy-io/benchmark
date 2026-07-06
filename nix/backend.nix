@@ -37,7 +37,7 @@ in
     '';
     appendHttpConfig = ''
       access_log off;
-      server_tokens off;
+      # (server_tokens is already emitted by the NixOS nginx module — don't repeat it)
       keepalive_requests 100000000;   # don't GOAWAY mid-run
       keepalive_timeout 3600s;
       sendfile on;
