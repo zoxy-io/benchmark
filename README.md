@@ -47,20 +47,30 @@ These are the controls that decide whether the numbers mean anything:
   ulimits alone cap a fast proxy far below its ceiling.
 - **Thread parity.** Each proxy is told to use every vCPU, and we record the
   knob: `haproxy nbthread=N`, `envoy --concurrency N`, `GOMAXPROCS=N`
-  (Caddy/Traefik), zoxy auto thread-per-core (`SO_REUSEPORT`). We run both
-  *out-of-box defaults* and *tuned-to-N* so neither framing is cherry-picked.
-- **The backend is never the bottleneck.** `N` origin hosts serve a canned,
-  in-memory 200. Every run runs a **saturation self-check**: if a generator or a
+  (Caddy/Traefik), zoxy auto thread-per-core (`SO_REUSEPORT`). The exact binary
+  versions under test are recorded into `results/<ts>/versions.txt`.
+- **The backend is never the bottleneck.** `N` origin hosts run nginx with
+  `worker_processes auto` (the distro default of ONE worker would cap the origin
+  at a single core) serving a canned, in-memory 200. Every run runs a
+  **saturation self-check** against both the host-average CPU *and the busiest
+  single core* (a lone hot thread hides in the average): if a generator or a
   backend saturates before the proxy does, the run is **void** and discarded
-  automatically (the fleet-scale version of the `zoxy CPU %` check in
-  `zoxy/bench/run.sh`).
+  automatically. The check **fails closed** — no Prometheus answer also voids.
+- **Errors and drops can't fake a peak.** Cells are voided when the error
+  fraction (non-2xx + socket errors) exceeds `load.max_error_rate`, or when k6
+  drops iterations (`maxVUs` exhausted ⇒ latency would be CO-biased).
 - **A single generator can't saturate a fast proxy.** Load is aggregated across
-  `M` generator hosts, each running the same self-check.
+  `M` generator hosts (default 2), each running the same self-check.
 - **Open-loop load.** k6's constant-arrival-rate executor measures true peak
   req/s at saturation and coordinated-omission-free p99/p999 under a held rate —
-  not the closed-loop `conns/latency` figure that conflates the two.
-- **Discipline.** Warm-up discarded, ≥5 repeats per cell, median + spread
-  reported. Plaintext **and** TLS (so zoxy's kTLS path is exercised).
+  not the closed-loop `conns/latency` figure that conflates the two. h1/h2 cells
+  are driven by k6 and h1-tls by wrk2, so compare proxies *within* a protocol;
+  a **wrk2 cross-check replays each k6-found h1 peak** to expose tool skew.
+- **Discipline.** Warm-up discarded, settle pause after each saturating peak
+  search, 3 repeats per cell by default (raise `load.repeats` to ≥5 for
+  publishable numbers), median + spread reported. Plaintext **and** TLS (so
+  zoxy's kTLS path is exercised). Peaks are bracketed geometrically, then
+  bisected to ~10%.
 
 ## Repository layout
 
@@ -151,8 +161,11 @@ make down
 
 - Instances are **on-demand, not preemptible** — a preemptible VM reclaimed
   mid-run would silently corrupt a cell. `make down` (and the `trap` in
-  `scripts/run.sh`) always destroys the fleet; a full matrix is on the order of
-  an hour of a handful of small VMs.
+  `scripts/run.sh`) always destroys the fleet. Budget realistically: the full
+  default matrix (120 cells × peak search + 9 measured runs each) is on the
+  order of **15–20 hours** of a handful of small VMs — trim
+  `scenarios/matrix.yaml` or use `make bench PROXIES="zoxy haproxy"` for
+  shorter passes.
 - Nothing here targets anything you don't own: it stands up your own VMs in your
   own folder and load-tests your own proxy. Do not point the generators at hosts
   outside the fleet.

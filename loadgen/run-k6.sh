@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs one k6 arrival-rate cell on THIS loadgen host. Writes a local summary
-# JSON and (if a Prometheus remote-write URL is given) streams native histograms
-# to the control node for cross-host aggregation.
+# JSON — stamped with this host's start/end epoch, so the orchestrator's
+# Prometheus windows use fleet clocks and exclude ssh/jump overhead — and (if a
+# Prometheus remote-write URL is given) streams native histograms to the
+# control node for cross-host aggregation.
 #
 #   run-k6.sh TARGET REQ_PATH RATE DURATION MAX_VUS OUT_JSON [PROM_RW_URL]
 set -euo pipefail
@@ -22,4 +24,14 @@ if [ -n "$PROM" ]; then
   args+=(--out experimental-prometheus-rw)
 fi
 
-exec k6 "${args[@]}" "$here/scenario.js"
+start=$(date +%s)
+rc=0
+k6 "${args[@]}" "$here/scenario.js" || rc=$?
+end=$(date +%s)
+
+# stamp the measured window into the summary for the orchestrator/self-check
+if [ -s "$OUT" ]; then
+  jq --argjson s "$start" --argjson e "$end" \
+    '. + {bench_start: $s, bench_end: $e}' "$OUT" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+fi
+exit "$rc"

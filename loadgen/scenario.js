@@ -3,8 +3,9 @@
 // The orchestrator runs this on all M loadgen hosts at RATE/M each and sums.
 //
 // Latency here is coordinated-omission-free *as long as maxVUs is never
-// exhausted* — if it is, k6 reports `dropped_iterations` and the self-check
-// voids the cell. Aggregate percentiles across the M hosts come from Prometheus
+// exhausted* — if it is, k6 reports `dropped_iterations` and run_cell (see
+// scripts/run.sh) voids the cell, as it does when the error rate exceeds
+// load.max_error_rate. Aggregate percentiles across the M hosts come from Prometheus
 // (each k6 remote-writes native histograms); the local summary is a backup.
 import http from 'k6/http';
 import { check } from 'k6';

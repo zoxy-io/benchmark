@@ -61,8 +61,8 @@ variable "proxy_memory" {
 
 variable "loadgen_count" {
   type        = number
-  default     = 1
-  description = "Number of generator hosts. Bump this if the self-check voids high-rate cells (one generator may not saturate a fast proxy)."
+  default     = 2
+  description = "Number of generator hosts. k6 burns far more CPU per request than a fast proxy spends serving it, so ONE equal-sized generator cannot saturate haproxy/envoy/zoxy — keep >=2, and bump further if the self-check voids high-rate cells."
 }
 variable "loadgen_cores" {
   type    = number
@@ -75,8 +75,8 @@ variable "loadgen_memory" {
 
 variable "backend_count" {
   type        = number
-  default     = 2
-  description = "Origins. Aggregate backend capacity must exceed the proxy's; the self-check voids cells where a backend saturates first."
+  default     = 3
+  description = "Origins. Must be >= the largest backend_counts entry in scenarios/matrix.yaml (run.sh fails fast otherwise), and aggregate backend capacity must exceed the proxy's; the self-check voids cells where a backend saturates first."
 }
 variable "backend_cores" {
   type    = number
