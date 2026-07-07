@@ -161,7 +161,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"zoxy|haproxy|envoy|traefik|caddy\"}[15s]))",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"$proxy\"}[15s]))",
           "legendFormat": "{{name}}"
         }
       ]
@@ -189,7 +189,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (name) (container_memory_working_set_bytes{name=~\"zoxy|haproxy|envoy|traefik|caddy\"})",
+          "expr": "max by (name) (container_memory_working_set_bytes{name=~\"$proxy\"})",
           "legendFormat": "{{name}}"
         }
       ]
