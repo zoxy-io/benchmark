@@ -189,7 +189,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (name) (container_memory_working_set_bytes{name=~\"$proxy\"})",
+          "expr": "max by (name) (last_over_time(container_memory_working_set_bytes{name=~\"$proxy\"}[15s]))",
           "legendFormat": "{{name}}"
         }
       ]
