@@ -197,7 +197,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Host CPU busy % by role (validity: loadgen/backend must have headroom)",
+      "title": "Host CPU busy % by role (excl. iowait; validity: loadgen/backend must have headroom)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -218,7 +218,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * (1 - avg by (role) (rate(node_cpu_seconds_total{mode=\"idle\"}[30s])))",
+          "expr": "100 * (1 - avg by (role) (rate(node_cpu_seconds_total{mode=~\"idle|iowait\"}[30s])))",
           "legendFormat": "{{role}}"
         }
       ]
