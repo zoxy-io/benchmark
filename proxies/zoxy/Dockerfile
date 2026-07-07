@@ -45,7 +45,8 @@ RUN if [ "$BUILDARCH" = "$TARGETARCH" ]; then \
 FROM debian:bookworm-slim
 COPY --from=build /src/zig-out/bin/zoxy /usr/local/bin/zoxy
 COPY --from=build /zoxy-commit /etc/zoxy/zoxy-commit
-COPY entrypoint.sh /entrypoint.sh
-# zoxy config takes literal IPv4 endpoints (src/config.zig: Ip4Address, no
-# DNS); the entrypoint resolves the `backend` hostname once and renders it in.
-ENTRYPOINT ["/entrypoint.sh"]
+# zoxy resolves hostname endpoints itself, once at parse time (startup /
+# SIGHUP reload) — `backend:9000` works like it does for the other proxies.
+# NOTE: with ZOXY_REF=main the git clone layer is cached; rebuild with
+# --no-cache (or pin a commit sha) to pick up new upstream commits.
+ENTRYPOINT ["/usr/local/bin/zoxy", "/etc/zoxy/config.json"]

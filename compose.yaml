@@ -77,7 +77,7 @@ services:
         hard: 1048576
       memlock: -1 # zoxy pins io_uring registered buffers at startup
     volumes:
-      - ./proxies/zoxy/config.tmpl.json:/etc/zoxy/config.tmpl.json:ro
+      - ./proxies/zoxy/config.json:/etc/zoxy/config.json:ro
     ports:
       - "8080:8080"
 
