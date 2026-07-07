@@ -344,9 +344,11 @@ CSS = """
 * { box-sizing:border-box; margin:0 }
 body { background:var(--page); color:var(--ink);
   font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; padding:28px; }
+@media (max-width: 480px) { body { padding:12px } .card { padding:12px } }
 h1 { font-size:22px; margin-bottom:4px }
 .meta { color:var(--ink-2); margin-bottom:24px; font-size:13px }
-.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:20px }
+/* min(420px, 100%) — a hard 420px minimum would overflow phone viewports */
+.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr)); gap:20px }
 .card { background:var(--surface-1); border:1px solid var(--ring); border-radius:10px; padding:18px }
 .card h2 { font-size:15px; font-weight:600 }
 .card .sub { color:var(--muted); font-size:12.5px; margin-bottom:8px }
@@ -372,7 +374,9 @@ svg { width:100%; height:auto; display:block }
 .tooltip .trow { display:flex; justify-content:space-between; gap:14px }
 .tooltip .tname { display:flex; align-items:center; gap:6px; color:var(--ink-2) }
 .tooltip .tval { font-variant-numeric:tabular-nums }
-table { border-collapse:collapse; width:100%; font-size:13.5px }
+/* the 8-column summary scrolls inside its card; the page never scrolls sideways */
+.tablewrap { overflow-x:auto }
+table { border-collapse:collapse; width:100%; min-width:640px; font-size:13.5px }
 th,td { text-align:right; padding:7px 12px; border-bottom:1px solid var(--grid);
   font-variant-numeric:tabular-nums }
 th:first-child,td:first-child { text-align:left }
@@ -509,11 +513,13 @@ body {html.escape(meta["req_path"])} · proxy box: {html.escape(str(meta["proxy_
 <section class="card" style="margin-bottom:20px">
   <h2>Summary — max sustained req/s (last clean 15s window before the knee)</h2>
   <p class="sub">saturation = 2 consecutive windows with achieved&lt;{KEEPUP:.0%} of offered, errors&gt;{ERR_MAX:.0%}, or dropped iterations</p>
+  <div class="tablewrap">
   <table>
     <tr><th>proxy</th><th>max sustained</th><th>saturated by</th><th>p99@50% (ms)</th>
         <th>p99@80% (ms)</th><th>req/s per core</th><th>mem @ peak</th><th>validity</th></tr>
     {"".join(rows)}
   </table>
+  </div>
 </section>
 <div class="grid2">{"".join(cards)}</div>
 <footer>Vertical dashed lines mark each proxy's saturation point. All proxies ran the identical
