@@ -44,12 +44,13 @@ EOF
 done
 
 # --- cloud .env: user's .env + the deployment facts ---------------------------
-grep -vE '^(PROM_TARGETS|BACKEND_IP|PROXY_IP|PROXY_CPUSET)=' .env 2>/dev/null > .env.cloud || true
+grep -vE '^(PROM_TARGETS|BACKEND_IP|PROXY_IP|PROXY_CPUSET|PROM_URL)=' .env 2>/dev/null > .env.cloud || true
 cat >> .env.cloud <<EOF
 PROM_TARGETS=cloud
 BACKEND_IP=$BACKEND_PRIV
 PROXY_IP=$PROXY_PRIV
 PROXY_CPUSET=$PROXY_CPUSET
+PROM_URL=http://$LOADGEN_PUB:9090
 EOF
 
 # --- ship the repo -------------------------------------------------------------

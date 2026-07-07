@@ -167,6 +167,9 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # datasource url (see provisioning/datasources/prometheus.yml); local
+      # default here, cloud-run.sh overrides via .env with the loadgen address.
+      PROM_URL: ${PROM_URL:-http://prometheus:9090}
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro

@@ -32,6 +32,13 @@ REMOTE_DIR=${REMOTE_DIR:-bench}
 
 RESULTS="results/$RUNID"
 mkdir -p "$RESULTS"
+# cloud: k6 runs on the loadgen VM and writes its per-run summary into the
+# results/$RUNID bind mount there. k6's handleSummary does not create the
+# directory, and the mkdir above only made it on this driver host — so create
+# it on the loadgen too, or the end-of-test summary write fails (ENOENT).
+if [[ $MODE == cloud ]]; then
+    ssh -o BatchMode=yes "$LOADGEN_SSH" "mkdir -p $REMOTE_DIR/results/$RUNID"
+fi
 
 # ---- mode plumbing -----------------------------------------------------------
 compose_proxy() { # compose command on the machine hosting the proxy

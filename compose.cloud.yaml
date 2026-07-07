@@ -62,6 +62,11 @@ services:
     command:
       - --port=8081
       - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+    environment:
+      # the image's built-in HEALTHCHECK probes $CADVISOR_HEALTHCHECK_URL,
+      # which defaults to :8080 — repoint it at the moved port or `up --wait`
+      # marks cadvisor unhealthy forever and aborts the run.
+      CADVISOR_HEALTHCHECK_URL: http://localhost:8081/healthz
 
   node_exporter:
     <<: *host-net
