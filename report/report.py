@@ -15,6 +15,7 @@ import html
 import json
 import math
 import os
+import statistics
 import sys
 import urllib.parse
 import urllib.request
@@ -89,11 +90,21 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     if not achieved or all(v == 0 for _, v in achieved):
         return None
 
-    # Ramp origin from the data itself: first sample where the ramp scenario
-    # actually produced requests (k6 init/VU-prealloc time makes start+30s lie).
-    t0 = next(ts for ts, v in achieved if v > 0) - STEP
+    # Ramp origin from the data itself. Two systematic offsets make naive
+    # "first nonzero sample" wrong: k6 init time AND the ~WINDOW/2 lag baked
+    # into rate() (each point averages the previous WINDOW). At steep slopes
+    # (100k over 8m ≈ 208 rps/s) those add up to >2% of offered at low rates
+    # and fake a knee. Fitting t0 against the KNOWN slope with the same lagged
+    # series the keep-up check uses absorbs both: on the early clean segment
+    # achieved(ts) = slope * (ts - t0), so t0 = ts - achieved/slope.
     ramp_s = duration_to_seconds(meta["ramp_duration"])
     max_rate = meta["max_rate"]
+    slope = max_rate / ramp_s
+    fit = [ts - v / slope for ts, v in achieved if 0.05 * max_rate <= v <= 0.30 * max_rate]
+    if fit:
+        t0 = statistics.median(fit)
+    else:  # saturated almost immediately — fall back to the first sample
+        t0 = next(ts for ts, v in achieved if v > 0) - STEP
 
     def offered(ts):
         return max_rate * (ts - t0) / ramp_s
@@ -122,48 +133,47 @@ def fetch_run(prom, runid, proxy, start, end, meta):
 
 
 def detect_saturation(data, max_rate):
-    """First offered rate where 2 consecutive SAT_WINDOW buckets are bad.
-    Bad: achieved < KEEPUP*offered, or errors > ERR_MAX, or drops > 0."""
+    """max sustained = achieved in the best CLEAN bucket; knee = the first
+    2-consecutive-bad streak past that bucket. Anchoring the knee to the best
+    clean bucket (instead of "first bad streak anywhere") makes an isolated
+    early wobble harmless — a knee only counts if the proxy never kept up at
+    a higher rate. Bad: drops > 0, errors > ERR_MAX, or achieved below
+    KEEPUP*offered (keep-up only checked above a floor that scales with the
+    ramp: at low offered rates 2% is a handful of requests)."""
+    floor = max(OFFERED_FLOOR, 0.02 * max_rate)
 
-    # bucket by offered-rate slices of SAT_WINDOW seconds worth of ramp
     slice_w = max_rate * SAT_WINDOW / _ramp_len(data)
-    buckets = {}
+    grouped = {}
     for key in ("achieved", "errors", "dropped"):
         for x, v in data[key]:
-            buckets.setdefault(int(x // slice_w), {}).setdefault(key, []).append(v)
+            grouped.setdefault(int(x // slice_w), {}).setdefault(key, []).append(v)
 
-    bad_reasons, consec, first_bad = {}, 0, None
-    last_good_achieved = None
-    for i in sorted(buckets):
-        b = buckets[i]
+    buckets = []
+    for i in sorted(grouped):
+        b = grouped[i]
         offered_mid = (i + 0.5) * slice_w
         ach = sum(b.get("achieved", [0])) / max(len(b.get("achieved", [1])), 1)
         err = max(b.get("errors", [0]))
         drop = max(b.get("dropped", [0]))
         bad = None
-        if offered_mid > OFFERED_FLOOR:
-            if drop > 0:
-                bad = "dropped iterations"
-            elif err > ERR_MAX:
-                bad = f"errors>{ERR_MAX:.0%}"
-            elif ach < KEEPUP * offered_mid:
-                bad = f"achieved<{KEEPUP:.0%} of offered"
-        if bad:
-            consec += 1
-            if first_bad is None:
-                first_bad = (offered_mid - 0.5 * slice_w, bad)
-            if consec >= 2:
-                return {
-                    "saturated": True,
-                    "offered": first_bad[0],
-                    "reason": first_bad[1],
-                    "max_sustained": last_good_achieved or 0,
-                }
-        else:
-            consec, first_bad = 0, None
-            last_good_achieved = ach
+        if drop > 0:
+            bad = "dropped iterations"
+        elif err > ERR_MAX:
+            bad = f"errors>{ERR_MAX:.0%}"
+        elif offered_mid > floor and ach < KEEPUP * offered_mid:
+            bad = f"achieved<{KEEPUP:.0%} of offered"
+        buckets.append((offered_mid, ach, bad))
+
+    clean = [(off, ach) for off, ach, bad in buckets if bad is None]
+    best_off, best_ach = max(clean, key=lambda c: c[1], default=(0, 0))
+
+    for k in range(len(buckets) - 1):
+        off, _, bad = buckets[k]
+        if bad and buckets[k + 1][2] and off > best_off:
+            return {"saturated": True, "offered": off - 0.5 * slice_w,
+                    "reason": bad, "max_sustained": best_ach}
     return {"saturated": False, "offered": None, "reason": None,
-            "max_sustained": last_good_achieved or 0}
+            "max_sustained": best_ach}
 
 
 def _ramp_len(data):
