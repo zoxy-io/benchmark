@@ -32,7 +32,7 @@ OFFERED_FLOOR = 200  # ignore keepup checks below this offered rate (startup noi
 M_REQS = "k6_http_reqs_total"
 M_FAILED = "k6_http_req_failed_rate"
 M_DROPPED = "k6_dropped_iterations_total"
-M_DUR = "k6_http_req_duration_p{q}"  # via K6_PROMETHEUS_RW_TREND_STATS
+M_DUR = "k6_http_req_duration_p{q}"  # via K6_PROMETHEUS_RW_TREND_STATS; SECONDS
 
 # dataviz reference palette, fixed slot per entity (never re-assigned by rank).
 # "direct" is the backend-calibration baseline, not a competitor => muted.
@@ -486,9 +486,9 @@ def build_html(meta, runs):
         chart_card("Achieved vs offered req/s", "the knee = saturation; dashed gray = perfect keep-up",
                    "rps", achieved, present, "si", "req/s", sat_marks),
         chart_card("p50 latency", "median request duration through the proxy",
-                   "p50", serieses("p50"), present, "si", "ms", sat_marks),
+                   "p50", serieses("p50"), present, "si", "s", sat_marks),
         chart_card("p99 latency", "tail — where saturation shows first",
-                   "p99", serieses("p99"), present, "si", "ms", sat_marks),
+                   "p99", serieses("p99"), present, "si", "s", sat_marks),
         chart_card("Proxy CPU", "container cores consumed (cAdvisor working counter)",
                    "cpu", serieses("cpu", False), [p for p in present if p != "direct"],
                    "si", "cores", sat_marks),
@@ -511,8 +511,8 @@ def build_html(meta, runs):
   <td><span class="swatch s-{p}"></span> {p}</td>
   <td>{fmt_si(peak)}</td>
   <td>{html.escape(sat["reason"] or "not saturated (raise MAX_RATE)")}</td>
-  <td>{f"{p99_50:.1f}" if p99_50 is not None else "—"}</td>
-  <td>{f"{p99_80:.1f}" if p99_80 is not None else "—"}</td>
+  <td>{f"{p99_50 * 1000:.1f}" if p99_50 is not None else "—"}</td>
+  <td>{f"{p99_80 * 1000:.1f}" if p99_80 is not None else "—"}</td>
   <td>{fmt_si(peak / cpus) if cpus and peak else "—"}</td>
   <td>{fmt_bytes(mem_peak) if mem_peak is not None else "—"}</td>
   <td>{'<span class="flag">' + "; ".join(r["hostcpu_flags"]) + "</span>" if r["hostcpu_flags"] else '<span class="ok">clean</span>'}</td>

@@ -70,7 +70,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Latency (k6 trend stats, ms)",
+      "title": "Latency (k6 trend stats)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -83,7 +83,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "s"
         },
         "overrides": []
       },
