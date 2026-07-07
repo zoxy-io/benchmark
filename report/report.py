@@ -32,6 +32,7 @@ OFFERED_FLOOR = 200  # ignore keepup checks below this offered rate (startup noi
 M_REQS = "k6_http_reqs_total"
 M_FAILED = "k6_http_req_failed_rate"
 M_DROPPED = "k6_dropped_iterations_total"
+M_CHECKS = "k6_checks_rate"  # fraction of `status is 200` checks passing (0..1)
 M_DUR = "k6_http_req_duration_p{q}"  # via K6_PROMETHEUS_RW_TREND_STATS; SECONDS
 
 # dataviz reference palette, fixed slot per entity (never re-assigned by rank).
@@ -86,17 +87,22 @@ def sel(runid, proxy, extra=""):
 def fetch_run(prom, runid, proxy, start, end, meta):
     """All series for one proxy's window, re-based to offered rate."""
     s = sel(runid, proxy)
-    achieved = prom_query_range(prom, f"sum(rate({M_REQS}{{{s}}}[{WINDOW}]))", start, end)
-    if not achieved or all(v == 0 for _, v in achieved):
+    # Offered axis from RAW request rate (total, incl. failures): even a proxy
+    # rejecting most connections has k6 churning attempts at ~the offered rate,
+    # so raw tracks offered and anchors t0 correctly. Displayed throughput is
+    # SUCCESSFUL rps (raw x 2xx-check fraction) so a fast-rejecting proxy isn't
+    # credited with work it never served; "shed" (raw x non-2xx) is the rejected
+    # load. Clean proxies: raw == successful, shed == 0.
+    raw = prom_query_range(prom, f"sum(rate({M_REQS}{{{s}}}[{WINDOW}]))", start, end)
+    if not raw or all(v == 0 for _, v in raw):
         return None
 
     # Ramp origin from the data itself. Two systematic offsets make naive
     # "first nonzero sample" wrong: k6 init time AND the ~WINDOW/2 lag baked
     # into rate() (each point averages the previous WINDOW). At steep slopes
     # (100k over 8m ≈ 208 rps/s) those add up to >2% of offered at low rates
-    # and fake a knee. Fitting t0 against the KNOWN slope with the same lagged
-    # series the keep-up check uses absorbs both: on the early clean segment
-    # achieved(ts) = slope * (ts - t0), so t0 = ts - achieved/slope.
+    # and fake a knee. Fitting t0 against the KNOWN slope on raw (which tracks
+    # offered) absorbs both: raw(ts) = slope * (ts - t0), so t0 = ts - raw/slope.
     ramp_s = duration_to_seconds(meta["ramp_duration"])
     max_rate = meta["max_rate"]
     slope = max_rate / ramp_s
@@ -104,14 +110,21 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     # [5%,30%] band (e.g. envoy tops out ~22k of a 100k ramp) would otherwise
     # flood the fit with plateau samples whose (ts - v/slope) drifts ever later,
     # dragging the median t0 into the plateau and collapsing the offered axis to
-    # a flat line. Excluding v > 0.9*peak keeps the clean segment achieved≈offered.
-    peak = max((v for _, v in achieved), default=0)
-    fit = [ts - v / slope for ts, v in achieved
-           if 0.05 * max_rate <= v <= 0.30 * max_rate and v <= 0.9 * peak]
+    # a flat line. Excluding v > 0.9*peak keeps the clean segment raw≈offered.
+    peak = max((v for _, v in raw), default=0)
+    # Fit only the RISING EDGE — samples up to the first time achieved reaches
+    # its peak. After that it's a plateau (envoy) or a collapse/oscillation
+    # (traefik under overload drops 14k->~300; zoxy congestion-collapses),
+    # whose samples fall back into the fit band at LATE timestamps and drag the
+    # median t0 off, shifting/compressing the whole offered axis.
+    t_peak = next((ts for ts, v in raw if v >= 0.95 * peak), None)
+    fit = [ts - v / slope for ts, v in raw
+           if (t_peak is None or ts <= t_peak)
+           and 0.05 * max_rate <= v <= 0.30 * max_rate]
     if fit:
         t0 = statistics.median(fit)
     else:  # saturated almost immediately — fall back to the first sample
-        t0 = next(ts for ts, v in achieved if v > 0) - STEP
+        t0 = next(ts for ts, v in raw if v > 0) - STEP
 
     def offered(ts):
         return max_rate * (ts - t0) / ramp_s
@@ -119,8 +132,12 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     def series(q):
         return [(offered(ts), v) for ts, v in prom_query_range(prom, q, start, end) if ts >= t0]
 
+    chk = f"(max({M_CHECKS}{{{s}}}) or vector(1))"  # 2xx fraction; 1.0 if absent
     data = {
-        "achieved": [(offered(ts), v) for ts, v in achieved if ts >= t0],
+        # successful (2xx) throughput — what the proxy actually served
+        "achieved": series(f"sum(rate({M_REQS}{{{s}}}[{WINDOW}])) * {chk}"),
+        # shed: requests answered with a non-2xx / reset — load thrown away
+        "shed": series(f"sum(rate({M_REQS}{{{s}}}[{WINDOW}])) * (1 - {chk})"),
         "errors": series(f"max({M_FAILED}{{{s}}})"),
         "dropped": series(f"sum(rate({M_DROPPED}{{{s}}}[{WINDOW}]))"),
         "p50": series(f"max({M_DUR.format(q=50)}{{{s}}})"),
@@ -482,9 +499,15 @@ def build_html(meta, runs):
     xmax = max(x for _, _, pts, _ in achieved for x, _ in pts)
     achieved.append(("offered", ("#c3c2b7", "#383835"), [(0, 0), (xmax, xmax)], True))
 
+    shed = serieses("shed")
+    if shed:
+        shed.append(("offered", ("#c3c2b7", "#383835"), [(0, 0), (xmax, xmax)], True))
+
     cards = [
-        chart_card("Achieved vs offered req/s", "the knee = saturation; dashed gray = perfect keep-up",
+        chart_card("Successful req/s vs offered", "2xx only (failures/rejections excluded); knee = saturation; dashed gray = perfect keep-up",
                    "rps", achieved, present, "si", "req/s", sat_marks),
+        chart_card("Shed (rejected) req/s vs offered", "non-2xx / reset responses — load the proxy rejects under overload (flat ~0 = sheds via client backpressure instead; climbing toward the dashed line = rejecting nearly everything)",
+                   "shed", shed, present, "si", "req/s", sat_marks),
         chart_card("p50 latency", "median request duration through the proxy",
                    "p50", serieses("p50"), present, "si", "s", sat_marks),
         chart_card("p99 latency", "tail — where saturation shows first",
@@ -532,7 +555,7 @@ ramp 0→{fmt_si(meta["max_rate"])} req/s over {html.escape(meta["ramp_duration"
 body {html.escape(meta["req_path"])} · proxy box: {html.escape(str(meta["proxy_cpus"]))} cpus /
 {html.escape(meta["proxy_mem"])} · {html.escape(mode_note)}</p>
 <section class="card" style="margin-bottom:20px">
-  <h2>Summary — max sustained req/s (last clean 15s window before the knee)</h2>
+  <h2>Summary — max sustained successful req/s (last clean 15s window before the knee)</h2>
   <p class="sub">saturation = 2 consecutive windows with achieved&lt;{KEEPUP:.0%} of offered, errors&gt;{ERR_MAX:.0%}, or dropped iterations</p>
   <div class="tablewrap">
   <table>
