@@ -1,6 +1,6 @@
 {
   "uid": "proxy-bench-live",
-  "title": "Proxy bench \u2014 live run",
+  "title": "Proxy bench — live run",
   "description": "Watch a ramp as it runs. Cross-proxy comparison lives in the HTML report (make report), not here.",
   "schemaVersion": 39,
   "editable": true,
@@ -223,5 +223,37 @@
         }
       ]
     }
-  ]
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "name": "Proxy pass",
+        "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\"}[1m])) by (proxy)",
+        "step": "15s",
+        "tagKeys": "proxy",
+        "titleFormat": "{{proxy}}",
+        "textFormat": "{{proxy}} pass",
+        "useValueForTime": false
+      }
+    ]
+  }
 }
