@@ -77,6 +77,45 @@ probe_url_for() {
     fi
 }
 
+zoxy_state() { # echo zoxy's container State ("" if absent); never errors
+    compose_proxy ps -a --format json zoxy 2>/dev/null \
+        | jq -r 'if type=="array" then (.[0].State // "") else (.State // "") end' 2>/dev/null || true
+}
+bring_up() { # proxy — start it; retry zoxy's parse-time DNS race
+    local p=$1
+    if [[ $p != zoxy ]]; then
+        compose_proxy --profile "$p" up -d --wait
+        return
+    fi
+    # zoxy resolves upstream hostnames once at config-parse time and, on a miss,
+    # logs HostnameLookupFailed and *exits* ~2-3s later — the same startup race
+    # haproxy hits (fixed there with a runtime resolver), but zoxy has no such
+    # knob. backend is already gated healthy by compose depends_on, so a miss is
+    # a transient DNS-registration blip: retry a few times, then let the fatal
+    # check below report a genuine failure. `up --wait` only proves zoxy
+    # *started*, so settle on the authoritative signal — does it serve 200 —
+    # and treat the (stable) HostnameLookupFailed log line as the retry trigger.
+    local url i j
+    url=$(probe_url_for zoxy)
+    for i in 1 2 3 4 5; do
+        compose_proxy --profile zoxy up -d --wait || true
+        for j in $(seq 1 20); do # ~10s ceiling; healthy zoxy serves in <1s
+            probe "$url" 2>/dev/null && return 0
+            compose_proxy logs zoxy 2>&1 | grep -q 'HostnameLookupFailed' && break
+            [[ "$(zoxy_state)" == running ]] || break # exited w/o DNS error
+            sleep 0.5
+        done
+        compose_proxy logs zoxy 2>&1 | grep -q 'HostnameLookupFailed' || return 0
+        echo ">>> [zoxy] HostnameLookupFailed (parse-time DNS race) — retry $i/5" >&2
+        compose_proxy --profile zoxy rm -sf zoxy >/dev/null 2>&1 || true
+        sleep 1
+    done
+    echo "fatal: zoxy could not resolve its upstream after 5 retries." >&2
+    echo "  zoxy resolves hostnames once at parse time and has no runtime resolver;" >&2
+    echo "  ensure backend is up and DNS-ready before zoxy starts." >&2
+    exit 1
+}
+
 # ---- run metadata ------------------------------------------------------------
 jq -n \
     --arg runid "$RUNID" --arg mode "$MODE" --arg req_path "$REQ_PATH" \
@@ -108,7 +147,7 @@ echo ">>> runid=$RUNID mode=$MODE proxies=[$PROXIES] ramp=0->${MAX_RATE:-20000}r
 for p in $PROXIES; do
     echo ">>> [$p] starting"
     if [[ $p != direct ]]; then
-        compose_proxy --profile "$p" up -d --wait
+        bring_up "$p"
     fi
 
     # zoxy's data path is io_uring and it has no fallback: with a broken
@@ -116,7 +155,9 @@ for p in $PROXIES; do
     # io_uring) the workers die at init while the process keeps running.
     # Fail loudly rather than benchmark a corpse.
     if [[ $p == zoxy ]]; then
-        state=$(compose_proxy ps --format json zoxy | jq -r 'if type=="array" then .[0].State else .State end')
+        # bring_up already retried (and fatally reported) a parse-time DNS miss,
+        # so a non-running zoxy here is a seccomp/io_uring problem.
+        state=$(zoxy_state)
         [[ $state == running ]] || { echo "fatal: zoxy is '$state' — check seccomp-iouring.json wiring" >&2; exit 1; }
         if compose_proxy logs zoxy 2>&1 | grep -q 'worker io init'; then
             echo "fatal: zoxy workers failed io_uring init. Causes: seccomp profile" >&2
