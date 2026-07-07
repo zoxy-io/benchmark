@@ -80,7 +80,11 @@ implementation. Iterating never rebuilds an image — edit, rerun `cloud-bench`.
   `io_uring_*` since engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the
   default profile *plus* those three syscalls — not `unconfined`, so zoxy keeps
   the same syscall-filter overhead as everyone else. The driver fails the run
-  if zoxy dies at startup (the symptom of a missing profile).
+  loudly if zoxy's workers can't init io_uring.
+- **zoxy needs a real x86_64 docker host**: upstream's vendored OpenSSL is
+  x86_64-only, and Rosetta/qemu emulation cannot do io_uring — on an ARM
+  laptop `make smoke PROXIES="haproxy caddy envoy traefik"` covers the rest
+  and zoxy gets its numbers from the (x86_64) cloud fleet.
 - **Origin headroom**: backend gets 2× the proxy's cores; run `direct` once per
   environment to prove the origin saturates above `MAX_RATE`.
 
