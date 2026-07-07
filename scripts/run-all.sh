@@ -111,19 +111,33 @@ for p in $PROXIES; do
         compose_proxy --profile "$p" up -d --wait
     fi
 
-    url=$(probe_url_for "$p")
-    for i in $(seq 1 30); do
-        if probe "$url"; then break; fi
-        [[ $i == 30 ]] && { echo "fatal: [$p] never served 200 at $url" >&2; exit 1; }
-        sleep 1
-    done
-
-    # zoxy's data path is io_uring; if the seccomp profile is wrong it dies at
-    # startup (io_uring_setup -> EPERM). Fail loudly rather than benchmark a corpse.
+    # zoxy's data path is io_uring and it has no fallback: with a broken
+    # seccomp profile (or under Rosetta/qemu emulation, which cannot do
+    # io_uring) the workers die at init while the process keeps running.
+    # Fail loudly rather than benchmark a corpse.
     if [[ $p == zoxy ]]; then
         state=$(compose_proxy ps --format json zoxy | jq -r 'if type=="array" then .[0].State else .State end')
         [[ $state == running ]] || { echo "fatal: zoxy is '$state' — check seccomp-iouring.json wiring" >&2; exit 1; }
+        if compose_proxy logs zoxy 2>&1 | grep -q 'worker io init'; then
+            echo "fatal: zoxy workers failed io_uring init. Causes: seccomp profile" >&2
+            echo "  not applied, kernel too old, or an emulated x86_64 container on an" >&2
+            echo "  ARM host (Rosetta/qemu cannot do io_uring) — benchmark zoxy on the" >&2
+            echo "  x86_64 cloud fleet instead: make cloud-up cloud-bench" >&2
+            exit 1
+        fi
     fi
+
+    url=$(probe_url_for "$p")
+    for i in $(seq 1 30); do
+        if probe "$url"; then break; fi
+        if [[ $i == 30 ]]; then
+            echo "fatal: [$p] never served 200 at $url — last log lines:" >&2
+            [[ $p != direct ]] && compose_proxy --profile "$p" logs --tail 10 "$p" >&2 || true
+            exit 1
+        fi
+        sleep 1
+    done
+
 
     record_version "$p"
 

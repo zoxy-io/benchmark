@@ -318,6 +318,19 @@ CSS = """
   --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
   --c-traefik:#008300; --c-caddy:#9085e9; --c-direct:#898781;
 } }
+/* explicit theme toggles (e.g. hosted viewers) must beat the media query */
+:root[data-theme="dark"] {
+  --surface-1:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7;
+  --muted:#898781; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
+  --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
+  --c-traefik:#008300; --c-caddy:#9085e9; --c-direct:#898781;
+}
+:root[data-theme="light"] {
+  --surface-1:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
+  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
+  --c-zoxy:#2a78d6; --c-haproxy:#1baf7a; --c-envoy:#eda100;
+  --c-traefik:#008300; --c-caddy:#4a3aa7; --c-direct:#898781;
+}
 * { box-sizing:border-box; margin:0 }
 body { background:var(--page); color:var(--ink);
   font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; padding:28px; }
