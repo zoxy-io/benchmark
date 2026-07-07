@@ -8,3 +8,10 @@ cloud/terraform.tfstate*
 cloud/terraform.tfvars
 cloud/sa-key.json
 .DS_Store
+
+# devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
