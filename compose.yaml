@@ -36,8 +36,13 @@ services:
     profiles: [backend]
     cpus: ${BACKEND_CPUS:-4}
     mem_limit: ${BACKEND_MEM:-1g}
+    environment:
+      # the image's envsubst hook renders the template into /etc/nginx at
+      # start; BACKEND_CPUS must be an integer (it becomes worker_processes)
+      BACKEND_CPUS: ${BACKEND_CPUS:-4}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
     volumes:
-      - ./backend/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./backend/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
     tmpfs:
       - /srv/bodies # canned 64B/1k/10k/100k responses live in RAM

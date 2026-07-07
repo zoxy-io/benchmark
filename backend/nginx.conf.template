@@ -1,0 +1,48 @@
+# The origin. Exists only to NOT be the bottleneck: canned fixed-size bodies
+# served from tmpfs (page cache), no logging on the hot path, no GOAWAY
+# mid-run, fds of the 4 bodies cached.
+#
+# This is an envsubst template (official-image mechanism): worker count comes
+# from BACKEND_CPUS so it matches the container's cpu quota — `auto` would
+# count HOST cores and oversubscribe the cgroup. Same explicit-thread-parity
+# rule the proxies follow (nbthread / --concurrency / GOMAXPROCS).
+worker_processes ${BACKEND_CPUS};
+worker_cpu_affinity auto;
+worker_rlimit_nofile 262144;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 65536;
+    use epoll;       # auto-detected on Linux, explicit for documentation
+    multi_accept on; # drain the accept queue in one wakeup under bursts
+}
+
+http {
+    access_log off;
+    log_not_found off;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 300s;
+    keepalive_requests 100000000; # no mid-run connection churn from the origin
+    reset_timedout_connection on;
+
+    # The same 4 files are opened millions of times per ramp — cache the fds
+    # so the hot path never open()/stat()s.
+    open_file_cache max=64 inactive=300s;
+    open_file_cache_valid 300s;
+    open_file_cache_min_uses 1;
+    open_file_cache_errors on;
+
+    # gzip stays off (default): compression would change transfer sizes and
+    # spend backend CPU — bodies must be byte-identical for every proxy.
+
+    server {
+        listen 9000 backlog=65535 reuseport;
+        root /srv/bodies; # /64 /1k /10k /100k generated at container start
+
+        location = /healthz {
+            return 200 "ok\n";
+        }
+    }
+}
