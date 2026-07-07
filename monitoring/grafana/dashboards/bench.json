@@ -1,18 +1,24 @@
 {
   "uid": "proxy-bench-live",
-  "title": "Proxy bench — live run",
+  "title": "Proxy bench \u2014 live run",
   "description": "Watch a ramp as it runs. Cross-proxy comparison lives in the HTML report (make report), not here.",
   "schemaVersion": 39,
   "editable": true,
   "refresh": "5s",
-  "time": { "from": "now-15m", "to": "now" },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
         "name": "testid",
         "label": "run",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
         "query": "label_values(k6_http_reqs_total, testid)",
         "refresh": 2,
         "sort": 4
@@ -21,7 +27,10 @@
         "name": "proxy",
         "label": "proxy",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
         "query": "label_values(k6_http_reqs_total{testid=~\"$testid\"}, proxy)",
         "refresh": 2,
         "includeAll": true,
@@ -34,9 +43,22 @@
       "id": 1,
       "type": "timeseries",
       "title": "Achieved req/s (per proxy)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -49,23 +71,36 @@
       "id": 2,
       "type": "timeseries",
       "title": "Latency (k6 trend stats, ms)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (proxy) (k6_http_req_duration_p50{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "max by (proxy) (last_over_time(k6_http_req_duration_p50{testid=~\"$testid\", proxy=~\"$proxy\"}[15s]))",
           "legendFormat": "{{proxy}} p50"
         },
         {
           "refId": "B",
-          "expr": "max by (proxy) (k6_http_req_duration_p95{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "max by (proxy) (last_over_time(k6_http_req_duration_p95{testid=~\"$testid\", proxy=~\"$proxy\"}[15s]))",
           "legendFormat": "{{proxy}} p95"
         },
         {
           "refId": "C",
-          "expr": "max by (proxy) (k6_http_req_duration_p99{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "max by (proxy) (last_over_time(k6_http_req_duration_p99{testid=~\"$testid\", proxy=~\"$proxy\"}[15s]))",
           "legendFormat": "{{proxy}} p99"
         }
       ]
@@ -74,13 +109,26 @@
       "id": 3,
       "type": "timeseries",
       "title": "Errors & dropped iterations (saturation signals)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (proxy) (k6_http_req_failed_rate{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "max by (proxy) (last_over_time(k6_http_req_failed_rate{testid=~\"$testid\", proxy=~\"$proxy\"}[15s]))",
           "legendFormat": "{{proxy}} error ratio"
         },
         {
@@ -94,9 +142,22 @@
       "id": 4,
       "type": "timeseries",
       "title": "Proxy container CPU (cores)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -109,9 +170,22 @@
       "id": 5,
       "type": "timeseries",
       "title": "Proxy container memory (working set)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -124,9 +198,23 @@
       "id": 6,
       "type": "timeseries",
       "title": "Host CPU busy % by role (validity: loadgen/backend must have headroom)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
