@@ -100,7 +100,14 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     ramp_s = duration_to_seconds(meta["ramp_duration"])
     max_rate = meta["max_rate"]
     slope = max_rate / ramp_s
-    fit = [ts - v / slope for ts, v in achieved if 0.05 * max_rate <= v <= 0.30 * max_rate]
+    # Fit on the RISING EDGE only. A proxy that plateaus at a rate inside the
+    # [5%,30%] band (e.g. envoy tops out ~22k of a 100k ramp) would otherwise
+    # flood the fit with plateau samples whose (ts - v/slope) drifts ever later,
+    # dragging the median t0 into the plateau and collapsing the offered axis to
+    # a flat line. Excluding v > 0.9*peak keeps the clean segment achieved≈offered.
+    peak = max((v for _, v in achieved), default=0)
+    fit = [ts - v / slope for ts, v in achieved
+           if 0.05 * max_rate <= v <= 0.30 * max_rate and v <= 0.9 * peak]
     if fit:
         t0 = statistics.median(fit)
     else:  # saturated almost immediately — fall back to the first sample
@@ -139,7 +146,9 @@ def detect_saturation(data, max_rate):
     early wobble harmless — a knee only counts if the proxy never kept up at
     a higher rate. Bad: drops > 0, errors > ERR_MAX, or achieved below
     KEEPUP*offered (keep-up only checked above a floor that scales with the
-    ramp: at low offered rates 2% is a handful of requests)."""
+    ramp: at low offered rates 2% is a handful of requests). If NO bucket ever
+    keeps up (achieved lags the ramp from the start — a slow-warming proxy, not
+    one stuck at ~0), fall back to the peak achieved throughput."""
     floor = max(OFFERED_FLOOR, 0.02 * max_rate)
 
     slice_w = max_rate * SAT_WINDOW / _ramp_len(data)
@@ -165,7 +174,19 @@ def detect_saturation(data, max_rate):
         buckets.append((offered_mid, ach, bad))
 
     clean = [(off, ach) for off, ach, bad in buckets if bad is None]
-    best_off, best_ach = max(clean, key=lambda c: c[1], default=(0, 0))
+    if not clean:
+        # No bucket ever kept up with the ramp — the achieved rate lagged the
+        # (steep) offered ramp from the very first bucket. That's a slow-warming
+        # proxy (e.g. envoy's STRICT_DNS cluster ramps its connection pool over
+        # the first ~minute), NOT one stuck at ~0. "Best clean bucket" is
+        # undefined, so report the peak throughput it actually held and anchor
+        # the knee where that plateau begins.
+        peak_ach = max((ach for _, ach, _ in buckets), default=0)
+        knee_off = next((off for off, ach, _ in buckets if ach >= 0.95 * peak_ach), None)
+        return {"saturated": peak_ach > 0, "offered": knee_off,
+                "reason": "achieved lagged the ramp (slow warmup)",
+                "max_sustained": peak_ach}
+    best_off, best_ach = max(clean, key=lambda c: c[1])
 
     for k in range(len(buckets) - 1):
         off, _, bad = buckets[k]
