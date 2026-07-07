@@ -53,9 +53,14 @@ export const options = {
     },
   },
   thresholds: {
-    // dead-proxy valve ONLY (see header) — saturation is found post-hoc
+    // dead-proxy valve ONLY (see header) — saturation is found post-hoc. The
+    // bar is deliberately near-total failure: a proxy shedding/degrading under
+    // load (e.g. rejecting excess connections) is NOT dead, and aborting it
+    // would (a) discard its post-knee shape and (b) make the abort point
+    // ramp-slope-dependent (the valve fires on wall-clock, so a steeper ramp is
+    // further up the offered axis at 120s). Only a corpse trips this.
     'http_req_failed{phase:ramp}': [
-      { threshold: 'rate<0.25', abortOnFail: true, delayAbortEval: '120s' },
+      { threshold: 'rate<0.98', abortOnFail: true, delayAbortEval: '120s' },
     ],
   },
 };
