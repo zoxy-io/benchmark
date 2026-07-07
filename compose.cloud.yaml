@@ -1,0 +1,73 @@
+# Cloud overlay: docker compose -f compose.yaml -f compose.cloud.yaml ...
+#
+# Same services, three changes for VM deployment:
+#  1. network_mode: host — no bridge NAT/conntrack on the measured path
+#     (ports/networks !reset because they conflict with host networking).
+#  2. cpuset pinning — proxy gets dedicated cores; on a dedicated VM this also
+#     makes thread autodetection agree with the cpu limit.
+#  3. peer addressing via env: proxy configs always dial the hostname
+#     `backend`; here extra_hosts maps it to the backend VM's private IP
+#     (cloud-run.sh writes BACKEND_IP/PROXY_IP into .env from terraform).
+
+x-host-net: &host-net
+  network_mode: host
+  ports: !reset []
+
+services:
+  backend:
+    <<: *host-net
+
+  zoxy:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
+  haproxy:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
+  envoy:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
+  traefik:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
+  caddy:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
+  prometheus:
+    <<: *host-net
+
+  grafana:
+    <<: *host-net
+
+  cadvisor:
+    <<: *host-net
+    # host networking would collide with the proxy on :8080 — move cadvisor
+    # (cloud-run.sh writes the prometheus targets with :8081 to match).
+    # The override replaces the whole command: keep the disable_metrics list
+    # identical to compose.yaml.
+    command:
+      - --port=8081
+      - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+
+  node_exporter:
+    <<: *host-net
+
+  k6:
+    <<: *host-net
+    environment:
+      # k6 runs on the loadgen VM next to prometheus (both host-net)
+      K6_PROMETHEUS_RW_SERVER_URL: http://127.0.0.1:9090/api/v1/write
