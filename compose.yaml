@@ -14,7 +14,8 @@
 # needed); they are the fairness mechanism that replaces v1's "identical VMs".
 
 # Every proxy gets the same box. PROXY_CPUS must match the thread knobs below
-# (nbthread / --concurrency / GOMAXPROCS) — we do NOT trust cgroup autodetection.
+# (nbthread / --concurrency / GOMAXPROCS / zoxy config "workers") — we do NOT
+# trust cgroup autodetection.
 x-proxy-common: &proxy-common
   cpus: ${PROXY_CPUS:-2}
   mem_limit: ${PROXY_MEM:-512m}
@@ -81,6 +82,12 @@ services:
         soft: 1048576
         hard: 1048576
       memlock: -1 # zoxy pins io_uring registered buffers at startup
+    # config.json pins "workers" (= PROXY_CPUS, thread parity) and per-worker
+    # "connections_max" so workers*connections_max comfortably exceeds MAX_VUS —
+    # otherwise zoxy rejects (RST) every connection past its static pool while
+    # the other proxies queue, and the run collapses at the knee. Both keys need
+    # a zoxy new enough to know them (upstream PRs #17/#19); rebuild --no-cache
+    # when ZOXY_REF is a moving ref like main so a stale image doesn't reject them.
     volumes:
       - ./proxies/zoxy/config.json:/etc/zoxy/config.json:ro
     ports:

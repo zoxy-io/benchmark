@@ -1,6 +1,8 @@
 {
   "listen": "0.0.0.0:8080",
   "admin": "0.0.0.0:9901",
+  "workers": 2,
+  "connections_max": 2048,
   "routes": [{ "cluster": "origin" }],
   "clusters": [{ "name": "origin", "endpoints": ["backend:9000"] }]
 }
