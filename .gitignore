@@ -1,30 +1,10 @@
-# build artifacts
-result
-result-*
-*.qcow2
-
-# terraform
-terraform/.terraform/
-terraform/.terraform.lock.hcl
-terraform/*.tfstate
-terraform/*.tfstate.*
-terraform/terraform.tfvars
-terraform/image.auto.tfvars
-terraform/inventory.json
-
-# secrets / creds
-*.pem
-!proxies/**/*.pem
-key.json
-sa-key.json
-
-# results (keep the dir, ignore the runs — commit summaries by hand if wanted)
-/results/*
-!/results/.gitkeep
-
-.direnv
+.env
+.env.cloud
+results/
+monitoring/targets/cloud/
+cloud/.terraform/
+cloud/.terraform.lock.hcl
+cloud/terraform.tfstate*
+cloud/terraform.tfvars
+cloud/sa-key.json
 .DS_Store
-
-# devenv (keep devenv.lock — it pins inputs)
-.devenv*
-devenv.local.nix

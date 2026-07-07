@@ -1,48 +1,53 @@
-# zoxy-benchmark — one-shot multi-host proxy benchmark on Yandex Cloud.
+# proxy-bench v2 — one linear ramp per proxy, local or Yandex Cloud.
 #
-#   make image   build the NixOS qcow2 and push it to Yandex Object Storage
-#   make up      terraform apply: VPC + loadgen/proxy/backend/control VMs
-#   make bench   run the full matrix against each proxy, collect metrics
-#   make report  render tables + plots from the latest results/<ts>/
-#   make down    terraform destroy
-#   make fmt     format tofu + nix
+#   make up          local: start backend + prometheus + grafana (grafana :3000)
+#   make bench       local: full run — every proxy through the identical ramp
+#   make smoke       local: 2-minute mini-ramp on haproxy+caddy (plumbing check)
+#   make report      render results/latest -> report.html (set PROM_URL for cloud)
+#   make down        local: stop everything
+#   make cloud-up    terraform apply the 3-VM fleet
+#   make cloud-bench rsync + run the full ramp on the fleet
+#   make cloud-down  terraform destroy
 #
-# All heavy lifting lives in scripts/ so the targets stay declarative.
+# Knobs live in .env (copy .env.example); PROXIES/MAX_RATE/RAMP_DURATION can be
+# overridden per-invocation: make bench PROXIES="zoxy haproxy"
 
 SHELL := bash
 .ONESHELL:
 .SHELLFLAGS := -euo pipefail -c
 
-TF        ?= tofu
-TF_DIR    := terraform
-PROXIES   ?= zoxy haproxy envoy traefik caddy
+TF ?= tofu
 
-.PHONY: all image up bench report down fmt clean help
+.PHONY: help up bench smoke report down cloud-up cloud-bench cloud-down clean
 
 help:
 	@sed -n '3,12p' $(MAKEFILE_LIST)
 
-image:
-	./scripts/build-image.sh          # nix build .#image + aws s3 cp to the bucket
-
 up:
-	$(TF) -chdir=$(TF_DIR) init -input=false
-	$(TF) -chdir=$(TF_DIR) apply -auto-approve
-	$(TF) -chdir=$(TF_DIR) output -json > $(TF_DIR)/inventory.json
-	@echo "fleet up — inventory written to $(TF_DIR)/inventory.json"
+	docker compose --profile monitoring --profile backend up -d --wait
+	@echo "grafana: http://localhost:3000  prometheus: http://localhost:9090"
 
-bench:
-	./scripts/run.sh --proxies "$(PROXIES)"
+bench: up
+	./scripts/run-all.sh
+
+smoke: up
+	MAX_RATE=2000 RAMP_DURATION=2m COOLDOWN=5 PROXIES="$${PROXIES:-haproxy caddy}" ./scripts/run-all.sh
 
 report:
-	./scripts/report.py results/latest
+	python3 report/report.py results/latest
 
 down:
-	$(TF) -chdir=$(TF_DIR) destroy -auto-approve
+	docker compose --profile '*' down
 
-fmt:
-	$(TF) -chdir=$(TF_DIR) fmt
-	nix fmt 2>/dev/null || true
+cloud-up:
+	$(TF) -chdir=cloud init -input=false
+	$(TF) -chdir=cloud apply -auto-approve
+
+cloud-bench:
+	./scripts/cloud-run.sh
+
+cloud-down:
+	$(TF) -chdir=cloud destroy -auto-approve
 
 clean:
-	rm -rf result result-* $(TF_DIR)/inventory.json
+	rm -rf results/* .env.cloud monitoring/targets/cloud

@@ -1,0 +1,218 @@
+# zoxy-benchmark v2 — containers ARE the deploy spec.
+#
+# One file describes every role; compose profiles pick what runs where:
+#   monitoring  prometheus + grafana            (local: always; cloud: loadgen VM)
+#   backend     nginx origin                    (local: always; cloud: backend VM)
+#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|caddy)
+#   loadgen     the k6 service, started only via `docker compose run k6`
+# cadvisor + node_exporter carry every profile so each docker host exports
+# per-container CPU/mem and host metrics no matter which role it plays.
+#
+# Local:  docker compose --profile monitoring --profile backend --profile haproxy up -d
+# Cloud:  the same file + compose.cloud.yaml (host networking, cpuset, peer IPs).
+# Resource limits are ENFORCED here (service-level cpus/mem_limit — no swarm
+# needed); they are the fairness mechanism that replaces v1's "identical VMs".
+
+# Every proxy gets the same box. PROXY_CPUS must match the thread knobs below
+# (nbthread / --concurrency / GOMAXPROCS) — we do NOT trust cgroup autodetection.
+x-proxy-common: &proxy-common
+  cpus: ${PROXY_CPUS:-2}
+  mem_limit: ${PROXY_MEM:-512m}
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  restart: "no"
+  depends_on:
+    backend:
+      condition: service_healthy
+      required: false # cloud: backend runs on another VM, service absent there
+
+services:
+  # ---------------------------------------------------------------- origin --
+  backend:
+    image: nginx:1.27-alpine
+    container_name: backend
+    profiles: [backend]
+    cpus: ${BACKEND_CPUS:-4}
+    mem_limit: ${BACKEND_MEM:-1g}
+    volumes:
+      - ./backend/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
+    tmpfs:
+      - /srv/bodies # canned 64B/1k/10k/100k responses live in RAM
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/64"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # ------------------------------------------------------- proxies under test --
+  # All five: listen :8080 (h1 plaintext), upstream = backend:9000, keep-alive
+  # both hops, no access logs. container_name == service name == the `name`
+  # label cAdvisor exports, which is how the report joins CPU/mem to a proxy.
+  zoxy:
+    <<: *proxy-common
+    build:
+      context: ./proxies/zoxy
+      args:
+        ZOXY_REF: ${ZOXY_REF:-main}
+    image: zoxy-bench/zoxy:${ZOXY_REF:-main}
+    container_name: zoxy
+    profiles: [zoxy]
+    # zoxy's vendored OpenSSL builds x86_64-only (x86 asm, no arm_arch.h);
+    # cloud VMs are x86_64 anyway — on an ARM laptop this runs via
+    # Rosetta/qemu, which is fine for the smoke tier.
+    platform: linux/amd64
+    # Docker's default seccomp profile denies io_uring_* since engine 25.0.
+    # This is the default profile PLUS the three io_uring syscalls — NOT
+    # unconfined, so zoxy keeps the same syscall-filter overhead as the rest.
+    security_opt:
+      - seccomp=./proxies/zoxy/seccomp-iouring.json
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      memlock: -1 # zoxy pins io_uring registered buffers at startup
+    volumes:
+      - ./proxies/zoxy/config.tmpl.json:/etc/zoxy/config.tmpl.json:ro
+    ports:
+      - "8080:8080"
+
+  haproxy:
+    <<: *proxy-common
+    image: haproxy:3.0-alpine
+    container_name: haproxy
+    profiles: [haproxy]
+    environment:
+      NBTHREAD: ${PROXY_CPUS:-2}
+    volumes:
+      - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8080:8080"
+
+  envoy:
+    <<: *proxy-common
+    image: envoyproxy/envoy:v1.33-latest
+    container_name: envoy
+    profiles: [envoy]
+    command:
+      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "${PROXY_CPUS:-2}"]
+    volumes:
+      - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8080:8080"
+
+  traefik:
+    <<: *proxy-common
+    image: traefik:v3.3
+    container_name: traefik
+    profiles: [traefik]
+    environment:
+      GOMAXPROCS: ${PROXY_CPUS:-2}
+    volumes:
+      - ./proxies/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./proxies/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    ports:
+      - "8080:8080"
+
+  caddy:
+    <<: *proxy-common
+    image: caddy:2.9
+    container_name: caddy
+    profiles: [caddy]
+    environment:
+      GOMAXPROCS: ${PROXY_CPUS:-2}
+    volumes:
+      - ./proxies/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8080:8080"
+
+  # ------------------------------------------------------------- monitoring --
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: prometheus
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver # k6 pushes its metrics here
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # local/ ships in-repo; cloud-run.sh generates cloud/ from terraform IPs
+      - ./monitoring/targets/${PROM_TARGETS:-local}:/etc/prometheus/targets:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    profiles: [monitoring]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+
+  # ------------------------------------------- per-host exporters (all roles) --
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: cadvisor
+    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, caddy]
+    # Disk metrics off — only cpu/memory/network matter here. NOTE: the
+    # docker host must run the classic overlay2 graphdriver
+    # ({"features":{"containerd-snapshotter":false}} in daemon.json — see
+    # cloud/cloud-init.yaml.tftpl); under the containerd image store
+    # cAdvisor's docker handler breaks and every container loses its name
+    # label. Keep this list in sync with compose.cloud.yaml (the override
+    # replaces command wholesale).
+    command:
+      - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8081:8080"
+
+  node_exporter:
+    image: quay.io/prometheus/node-exporter:v1.9.0
+    container_name: node_exporter
+    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, caddy]
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+
+  # ----------------------------------------------------------------- loadgen --
+  # Run-once, never `up`ed:  docker compose run --rm k6  (driven by run-all.sh)
+  k6:
+    image: grafana/k6:1.0.0
+    container_name: k6
+    profiles: [loadgen]
+    user: "0" # the image's k6 user can't write summaries into the bind mount
+    environment:
+      K6_PROMETHEUS_RW_SERVER_URL: ${K6_PROMETHEUS_RW_SERVER_URL:-http://prometheus:9090/api/v1/write}
+      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),max
+      MAX_RATE: ${MAX_RATE:-20000}
+      RAMP_DURATION: ${RAMP_DURATION:-8m}
+      WARM_RATE: ${WARM_RATE:-100}
+      MAX_VUS: ${MAX_VUS:-2000}
+      REQ_PATH: ${REQ_PATH:-/1k}
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+
+volumes:
+  prom-data:

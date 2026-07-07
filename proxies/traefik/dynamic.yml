@@ -1,0 +1,12 @@
+http:
+  routers:
+    r-plain:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [plain]
+      service: origin
+  services:
+    origin:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://backend:9000"

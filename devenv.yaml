@@ -1,5 +1,0 @@
-# devenv.sh inputs. Pin nixpkgs to the same channel the flake uses so the tool
-# versions match what the image is built against.
-inputs:
-  nixpkgs:
-    url: github:nixos/nixpkgs/nixos-unstable

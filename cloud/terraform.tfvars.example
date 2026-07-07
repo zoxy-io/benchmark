@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+service_account_key_file = "sa-key.json" # yc iam key create ... --output sa-key.json
+cloud_id                 = "b1gxxxxxxxxxxxxxxxxx"
+folder_id                = "b1gxxxxxxxxxxxxxxxxx"
+zone                     = "ru-central1-a"
+
+ssh_public_key = "ssh-ed25519 AAAA... you@host"
+allowed_cidr   = "0.0.0.0/0" # narrow to YOUR.IP/32
+
+# proxy 4c/8g, backend 8c/8g, loadgen 16c/16g by default — see variables.tf

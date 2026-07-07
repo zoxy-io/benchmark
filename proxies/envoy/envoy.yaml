@@ -1,0 +1,44 @@
+# h1 plaintext :8080 -> backend:9000. Worker count comes from --concurrency in
+# the compose command (= PROXY_CPUS). STRICT_DNS because the upstream is a
+# hostname (compose service locally, extra_hosts entry in cloud). No access log.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9902 }
+
+static_resources:
+  listeners:
+    - name: plain
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_plain
+                codec_type: AUTO
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: all
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: origin }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: origin
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: origin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: backend, port_value: 9000 }
