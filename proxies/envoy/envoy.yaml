@@ -1,6 +1,8 @@
-# h1 plaintext :8080 -> backend:9000. Worker count comes from --concurrency in
-# the compose command (= PROXY_CPUS). STRICT_DNS because the upstream is a
-# hostname (compose service locally, extra_hosts entry in cloud). No access log.
+# L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
+# build — every proxy relays bytes, nobody parses HTTP). Worker count comes
+# from --concurrency in the compose command (= PROXY_CPUS). STRICT_DNS because
+# the upstream is a hostname (compose service locally, extra_hosts entry in
+# cloud). No access log. idle_timeout 60s matches haproxy/zoxy.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9902 }
@@ -12,23 +14,12 @@ static_resources:
         socket_address: { address: 0.0.0.0, port_value: 8080 }
       filter_chains:
         - filters:
-            - name: envoy.filters.network.http_connection_manager
+            - name: envoy.filters.network.tcp_proxy
               typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
                 stat_prefix: ingress_plain
-                codec_type: AUTO
-                route_config:
-                  name: local
-                  virtual_hosts:
-                    - name: all
-                      domains: ["*"]
-                      routes:
-                        - match: { prefix: "/" }
-                          route: { cluster: origin }
-                http_filters:
-                  - name: envoy.filters.http.router
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                cluster: origin
+                idle_timeout: 60s
 
   clusters:
     - name: origin

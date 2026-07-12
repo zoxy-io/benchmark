@@ -1,5 +1,7 @@
 # Static config. GOMAXPROCS (= PROXY_CPUS) comes from compose env — explicit
-# thread parity. accessLog omitted => disabled.
+# thread parity. accessLog omitted => disabled. The router is a TCP (L4)
+# catch-all — see dynamic.yml; no ping endpoint, the TCP router would shadow
+# HTTP on the same entrypoint anyway (the driver probes through the tunnel).
 entryPoints:
   plain:
     address: ":8080"
@@ -14,6 +16,3 @@ log:
 
 api:
   dashboard: false
-
-ping:
-  entryPoint: plain

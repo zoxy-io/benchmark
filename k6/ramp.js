@@ -17,6 +17,14 @@
 // responses (coordinated-omission-free); when the proxy stalls, k6 drops
 // iterations (k6_dropped_iterations in Prometheus) instead of opening
 // unbounded connections and DoSing the fleet.
+//
+// VU CEILING: warmup maxVUs (200) + MAX_VUS must stay BELOW 1024. Every VU
+// holds its keep-alive connection for the VU's lifetime, and through an L4
+// proxy that connection is a held tunnel; zoxy (libxev) has a compile-time
+// pool of 1024 relay buffers, one per open tunnel, and sheds (immediate
+// close -> client EOF) past it — at ANY offered rate. A too-large VU pool
+// therefore poisons the whole zoxy run with a loadgen artifact instead of
+// measuring saturation.
 import http from 'k6/http';
 import { check } from 'k6';
 
@@ -25,7 +33,7 @@ const REQ_PATH = __ENV.REQ_PATH || '/1k';
 const MAX_RATE = parseInt(__ENV.MAX_RATE || '20000', 10);
 const RAMP_DURATION = __ENV.RAMP_DURATION || '8m';
 const WARM_RATE = parseInt(__ENV.WARM_RATE || '100', 10);
-const MAX_VUS = parseInt(__ENV.MAX_VUS || '2000', 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '800', 10);
 
 export const options = {
   discardResponseBodies: true,

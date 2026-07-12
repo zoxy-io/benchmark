@@ -1,10 +1,16 @@
-# h1 plaintext :8080 -> backend:9000. GOMAXPROCS (= PROXY_CPUS) from compose
+# L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
+# build — every proxy relays bytes, nobody parses HTTP). Needs the layer4 app
+# (mholt/caddy-l4), which is NOT in the stock image — the Dockerfile next to
+# this file bakes it in with xcaddy. GOMAXPROCS (= PROXY_CPUS) from compose
 # env. Admin API off to keep it off the measured path.
 {
 	admin off
 	auto_https off
-}
-
-:8080 {
-	reverse_proxy backend:9000
+	layer4 {
+		:8080 {
+			route {
+				proxy backend:9000
+			}
+		}
+	}
 }

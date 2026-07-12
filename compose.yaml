@@ -14,10 +14,12 @@
 # needed); they are the fairness mechanism that replaces v1's "identical VMs".
 
 # Every proxy gets the same box. PROXY_CPUS must match the thread knobs below
-# (nbthread / --concurrency / GOMAXPROCS / zoxy config "workers") — we do NOT
-# trust cgroup autodetection.
+# (nbthread / --concurrency / GOMAXPROCS) — we do NOT trust cgroup
+# autodetection. Default is 1: zoxy (libxev) is single-threaded by design
+# with no thread knob, so one core each makes the face-off per-core fair;
+# with PROXY_CPUS>1 zoxy still runs one event loop on one core.
 x-proxy-common: &proxy-common
-  cpus: ${PROXY_CPUS:-2}
+  cpus: ${PROXY_CPUS:-1}
   mem_limit: ${PROXY_MEM:-512m}
   ulimits:
     nofile:
@@ -56,40 +58,43 @@ services:
       retries: 15
 
   # ------------------------------------------------------- proxies under test --
-  # All five: listen :8080 (h1 plaintext), upstream = backend:9000, keep-alive
-  # both hops, no access logs. container_name == service name == the `name`
-  # label cAdvisor exports, which is how the report joins CPU/mem to a proxy.
+  # All five: listen :8080, L4 TCP passthrough (zoxy's libxev build is
+  # L4-only, so EVERY proxy relays bytes — nobody parses HTTP), upstream =
+  # backend:9000, no access logs. k6 still speaks h1 end-to-end; nginx is the
+  # HTTP endpoint. container_name == service name == the `name` label cAdvisor
+  # exports, which is how the report joins CPU/mem to a proxy.
   zoxy:
     <<: *proxy-common
     build:
       context: ./proxies/zoxy
       args:
-        ZOXY_REF: ${ZOXY_REF:-main}
-    image: zoxy-bench/zoxy:${ZOXY_REF:-main}
+        ZOXY_REF: ${ZOXY_REF:-libxev}
+    image: zoxy-bench/zoxy:${ZOXY_REF:-libxev}
     container_name: zoxy
     profiles: [zoxy]
-    # zoxy's vendored OpenSSL builds x86_64-only (x86 asm, no arm_arch.h);
-    # cloud VMs are x86_64 anyway — on an ARM laptop this runs via
-    # Rosetta/qemu, which is fine for the smoke tier.
-    platform: linux/amd64
     # Docker's default seccomp profile denies io_uring_* since engine 25.0.
     # This is the default profile PLUS the three io_uring syscalls — NOT
     # unconfined, so zoxy keeps the same syscall-filter overhead as the rest.
+    # (libxev's Linux backend is io_uring; there is no epoll fallback.)
     security_opt:
       - seccomp=./proxies/zoxy/seccomp-iouring.json
     ulimits:
       nofile:
         soft: 1048576
         hard: 1048576
-      memlock: -1 # zoxy pins io_uring registered buffers at startup
-    # config.json pins "workers" (= PROXY_CPUS, thread parity) and per-worker
-    # "connections_max" so workers*connections_max comfortably exceeds MAX_VUS —
-    # otherwise zoxy rejects (RST) every connection past its static pool while
-    # the other proxies queue, and the run collapses at the knee. Both keys need
-    # a zoxy new enough to know them (upstream PRs #17/#19); rebuild --no-cache
-    # when ZOXY_REF is a moving ref like main so a stale image doesn't reject them.
+      memlock: -1 # io_uring ring memory counts against memlock on kernels <5.12
+    # zoxy (libxev) has NO thread/connection knobs: one event loop regardless
+    # of PROXY_CPUS (it gets the same box but can only spend one core), and
+    # concurrency is hard-capped at 1024 relay buffers (constants.zig), one
+    # held per open tunnel for its LIFETIME — hence the MAX_VUS<=800 ceiling
+    # (k6 keep-alive conns are held idle by VUs; past 1024 zoxy sheds with an
+    # immediate close and the run drowns in EOFs at any offered rate).
+    # It also does no DNS — endpoints must be IP literals, so the entrypoint
+    # resolves `backend` (env below) once at start and renders the template.
+    environment:
+      BACKEND: backend:9000
     volumes:
-      - ./proxies/zoxy/config.json:/etc/zoxy/config.json:ro
+      - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:
       - "8080:8080"
 
@@ -99,7 +104,10 @@ services:
     container_name: haproxy
     profiles: [haproxy]
     environment:
-      NBTHREAD: ${PROXY_CPUS:-2}
+      NBTHREAD: ${PROXY_CPUS:-1}
+      # hostname locally (bridge DNS + runtime resolver); the cloud overlay
+      # replaces it with an IP literal because 127.0.0.11 doesn't exist there
+      BACKEND_ADDR: backend:9000
     volumes:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
@@ -111,7 +119,7 @@ services:
     container_name: envoy
     profiles: [envoy]
     command:
-      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "${PROXY_CPUS:-2}"]
+      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "${PROXY_CPUS:-1}"]
     volumes:
       - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
@@ -123,7 +131,7 @@ services:
     container_name: traefik
     profiles: [traefik]
     environment:
-      GOMAXPROCS: ${PROXY_CPUS:-2}
+      GOMAXPROCS: ${PROXY_CPUS:-1}
     volumes:
       - ./proxies/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./proxies/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
@@ -132,11 +140,14 @@ services:
 
   caddy:
     <<: *proxy-common
-    image: caddy:2.9
+    # stock caddy has no L4 app — built locally with the layer4 plugin
+    build:
+      context: ./proxies/caddy
+    image: zoxy-bench/caddy-l4:2.11
     container_name: caddy
     profiles: [caddy]
     environment:
-      GOMAXPROCS: ${PROXY_CPUS:-2}
+      GOMAXPROCS: ${PROXY_CPUS:-1}
     volumes:
       - ./proxies/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
@@ -223,7 +234,8 @@ services:
       MAX_RATE: ${MAX_RATE:-20000}
       RAMP_DURATION: ${RAMP_DURATION:-8m}
       WARM_RATE: ${WARM_RATE:-100}
-      MAX_VUS: ${MAX_VUS:-2000}
+      # default must stay below zoxy's 1024-tunnel bound (see .env.example)
+      MAX_VUS: ${MAX_VUS:-800}
       REQ_PATH: ${REQ_PATH:-/1k}
     volumes:
       - ./k6:/scripts:ro

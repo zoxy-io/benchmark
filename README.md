@@ -6,11 +6,17 @@ stops keeping up, and the output is one HTML report overlaying **latency, CPU,
 memory and achieved req/s against offered load** — plus a live Grafana view
 while a run is in flight.
 
+zoxy's libxev build is **L4-only**, so every proxy runs as an **L4 TCP
+passthrough** (`mode tcp`, `tcp_proxy`, TCP router, `layer4`) — the same job
+for everyone: relay bytes, parse nothing. k6 still speaks HTTP end-to-end;
+nginx is the HTTP endpoint and the proxies are transparent tunnels, so the
+k6-side metrics (latency, achieved rate, errors) are unchanged.
+
 ```
             0 ──────── linear ramp ────────► MAX_RATE
    k6  ─────────────► proxy-under-test ─────────────► nginx origin
- (open loop,          (2 cpus, 512 MiB,               (canned 64B..100k
-  arrival rate)        ONE at a time)                  bodies, 2x cpus)
+ (open loop,          (1 cpu, 512 MiB,                (canned 64B..100k
+  arrival rate)        ONE at a time)                  bodies, 4x cpus)
         │                     │ cAdvisor: cpu/mem per container
         └── remote-write ──► Prometheus ◄── scrape ───┘
                                 │
@@ -69,23 +75,42 @@ implementation. Iterating never rebuilds an image — edit, rerun `cloud-bench`.
 
 ## Fairness rules (what makes the numbers comparable)
 
+- **Same job for every proxy**: all five are L4 TCP passthroughs — HAProxy
+  `mode tcp`, Envoy `tcp_proxy`, Traefik TCP router, Caddy `layer4` (stock
+  Caddy is HTTP-only, so `proxies/caddy/Dockerfile` bakes in the
+  `mholt/caddy-l4` plugin with xcaddy), zoxy natively. Nobody pays for HTTP
+  parsing that others skip.
 - **Same box for every proxy**: `PROXY_CPUS` / `PROXY_MEM` enforced by cgroups,
   identical per proxy; thread counts are set *explicitly* to match
   (`nbthread`, `--concurrency`, `GOMAXPROCS`) — container runtimes lie to
-  autodetection.
+  autodetection. **`PROXY_CPUS` defaults to 1**: zoxy (libxev) is
+  single-threaded by design with no thread knob, so a one-core box is the
+  per-core-fair comparison. Raising `PROXY_CPUS` turns the run into a
+  multi-core scaling probe where zoxy keeps one event loop on one core — a
+  property of the contender that shows up honestly in the CPU panel.
 - **Same ramp for every proxy**: never compare runs with different `MAX_RATE`
   or `RAMP_DURATION` — the shared x-axis depends on it. Recorded per run in
   `results/<runid>/runs.json` together with image versions.
 - **zoxy runs io_uring**: Docker's default seccomp profile has denied
   `io_uring_*` since engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the
   default profile *plus* those three syscalls — not `unconfined`, so zoxy keeps
-  the same syscall-filter overhead as everyone else. The driver fails the run
-  loudly if zoxy's workers can't init io_uring.
-- **zoxy needs a real x86_64 docker host**: upstream's vendored OpenSSL is
-  x86_64-only, and Rosetta/qemu emulation cannot do io_uring — on an ARM
-  laptop `make smoke PROXIES="haproxy caddy envoy traefik"` covers the rest
-  and zoxy gets its numbers from the (x86_64) cloud fleet.
-- **Origin headroom**: backend gets 2× the proxy's cores; run `direct` once per
+  the same syscall-filter overhead as everyone else. If io_uring init fails,
+  zoxy exits at startup and the driver fails the run loudly. (The libxev
+  rewrite dropped the vendored OpenSSL, so zoxy also builds and runs on ARM
+  hosts natively now — io_uring just can't be *emulated*.)
+- **zoxy does no DNS**: config endpoints must be IP literals, structurally.
+  The container entrypoint resolves the `backend` hostname once at start
+  (compose DNS locally, `extra_hosts` in cloud) and renders the literal into
+  the config — which also kills the parse-time DNS startup race the old
+  driver had to retry around.
+- **zoxy holds one relay buffer per open tunnel, pool = 1024, compile-time**:
+  connections beyond it get an immediate close. Every k6 VU holds a keep-alive
+  connection — a held tunnel — for the VU's lifetime, so the VU pool itself
+  must fit: warmup (200) + `MAX_VUS` (800) ≤ 1000 < 1024. With a larger pool
+  zoxy drowns in shed-EOFs at *any* offered rate (measured: ~40% failures at
+  500 req/s with the old `MAX_VUS=2000`) — a loadgen artifact, not saturation.
+  Do not raise `MAX_VUS` above 800 while zoxy is a contender.
+- **Origin headroom**: backend gets several times the proxy's cores; run `direct` once per
   environment to prove the origin saturates above `MAX_RATE`.
 
 ## Layout
