@@ -12,7 +12,15 @@ cd "$(dirname "$0")/.."
 TF=${TF:-tofu}
 SSH_USER=${SSH_USER:-ubuntu}
 REMOTE_DIR=${REMOTE_DIR:-bench}
+# .env provides defaults but must NOT clobber explicit overrides — the same
+# save/restore run-all.sh does (e.g. `PROXIES="zoxy haproxy" make cloud-bench`)
+KNOBS=(PROXIES MAX_RATE RAMP_DURATION WARM_RATE MAX_VUS REQ_PATH COOLDOWN PROXY_CPUS PROXY_MEM)
+for k in "${KNOBS[@]}"; do [[ -n ${!k+x} ]] && eval "_saved_$k=\${$k}"; done
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
+for k in "${KNOBS[@]}"; do
+    saved="_saved_$k"
+    [[ -n ${!saved+x} ]] && eval "export $k=\${$saved}"
+done
 
 inv=$($TF -chdir=cloud output -json inventory)
 ip() { echo "$inv" | jq -r ".$1.$2"; }
@@ -23,7 +31,7 @@ LOADGEN_PRIV=$(ip loadgen internal_ip)
 PROXY_PRIV=$(ip proxy internal_ip)
 BACKEND_PRIV=$(ip backend internal_ip)
 
-PROXY_CPUS=${PROXY_CPUS:-2}
+PROXY_CPUS=${PROXY_CPUS:-1}
 PROXY_CPUSET="0-$((PROXY_CPUS - 1))"
 
 echo ">>> fleet: loadgen=$LOADGEN_PUB proxy=$PROXY_PUB backend=$BACKEND_PUB"
@@ -43,8 +51,21 @@ for f in cadvisor:8081 node:9100; do
 EOF
 done
 
-# --- cloud .env: user's .env + the deployment facts ---------------------------
-grep -vE '^(PROM_TARGETS|BACKEND_IP|PROXY_IP|PROXY_CPUSET|PROM_URL)=' .env 2>/dev/null > .env.cloud || true
+# --- cloud .env: user's .env + explicit knob overrides + deployment facts -----
+# The loadgen VM's k6 and the proxy VM's compose read THIS file (rsynced to
+# bench/.env), NOT the driver's shell — so an explicit override like
+# `MAX_RATE=250000 make cloud-bench` must be written in here or it silently
+# runs the file's default remotely while the driver banner shows the override
+# (a split-brain that produced a mislabeled run once). Strip every knob we may
+# re-inject, then append the ones currently set to a clean, comment-free value
+# so there's exactly one definition and no last-wins ambiguity.
+strip_re="^(PROM_TARGETS|BACKEND_IP|PROXY_IP|PROXY_CPUSET|PROM_URL"
+for k in "${KNOBS[@]}"; do strip_re+="|$k"; done
+strip_re+=")="
+grep -vE "$strip_re" .env 2>/dev/null > .env.cloud || true
+for k in "${KNOBS[@]}"; do
+    [[ -n ${!k+x} ]] && printf '%s=%s\n' "$k" "${!k}" >> .env.cloud
+done
 cat >> .env.cloud <<EOF
 PROM_TARGETS=cloud
 BACKEND_IP=$BACKEND_PRIV

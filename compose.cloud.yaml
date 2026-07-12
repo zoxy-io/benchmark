@@ -8,6 +8,8 @@
 #  3. peer addressing via env: proxy configs always dial the hostname
 #     `backend`; here extra_hosts maps it to the backend VM's private IP
 #     (cloud-run.sh writes BACKEND_IP/PROXY_IP into .env from terraform).
+#     zoxy itself does no DNS — its entrypoint resolves `backend` (via this
+#     same extra_hosts entry) and renders the IP literal into its config.
 
 x-host-net: &host-net
   network_mode: host
@@ -28,6 +30,10 @@ services:
     cpuset: ${PROXY_CPUSET:-}
     extra_hosts:
       - "backend:${BACKEND_IP}"
+    environment:
+      # IP literal: haproxy skips runtime DNS for numeric addresses, keeping
+      # the (bridge-only) 127.0.0.11 resolvers section inert under host net
+      BACKEND_ADDR: ${BACKEND_IP}:9000
 
   envoy:
     <<: *host-net

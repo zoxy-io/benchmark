@@ -1,12 +1,15 @@
-http:
+# L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
+# build — every proxy relays bytes, nobody parses HTTP). HostSNI(`*`) is the
+# only rule that matches non-TLS TCP connections — it's the L4 catch-all, not
+# actual SNI inspection.
+tcp:
   routers:
     r-plain:
-      rule: "PathPrefix(`/`)"
+      rule: "HostSNI(`*`)"
       entryPoints: [plain]
       service: origin
   services:
     origin:
       loadBalancer:
-        passHostHeader: true
         servers:
-          - url: "http://backend:9000"
+          - address: "backend:9000"

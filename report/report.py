@@ -24,9 +24,9 @@ from datetime import datetime, timezone
 STEP = 5  # query_range resolution, seconds
 WINDOW = "15s"  # rate() window
 SAT_WINDOW = 15  # saturation-check bucket, seconds
-KEEPUP = 0.98  # achieved/offered below this => saturated
-ERR_MAX = 0.01  # error ratio above this => saturated
-OFFERED_FLOOR = 200  # ignore keepup checks below this offered rate (startup noise)
+ERR_MAX = 0.01  # error ratio above this => the knee reason is "errors", not a plateau
+KNEE_FRAC = 0.97  # achieved within this fraction of its OWN peak => on the plateau (knee)
+PLATEAU_MARGIN = 0.90  # peak sustained achieved below this fraction of max_rate => saturated
 
 # k6 experimental-prometheus-rw naming (k6 auto-tags `scenario`; ours is "ramp")
 M_REQS = "k6_http_reqs_total"
@@ -157,20 +157,25 @@ def fetch_run(prom, runid, proxy, start, end, meta):
 
 
 def detect_saturation(data, max_rate):
-    """max sustained = achieved in the best CLEAN bucket; knee = the first
-    2-consecutive-bad streak past that bucket. Anchoring the knee to the best
-    clean bucket (instead of "first bad streak anywhere") makes an isolated
-    early wobble harmless — a knee only counts if the proxy never kept up at
-    a higher rate. Bad: drops > 0, errors > ERR_MAX, or achieved below
-    KEEPUP*offered (keep-up only checked above a floor that scales with the
-    ramp: at low offered rates 2% is a handful of requests). If NO bucket ever
-    keeps up (achieved lags the ramp from the start — a slow-warming proxy, not
-    one stuck at ~0), fall back to the peak achieved throughput."""
-    floor = max(OFFERED_FLOOR, 0.02 * max_rate)
+    """max sustained = the proxy's PEAK 15s-sustained achieved throughput (its
+    real ceiling); knee = the offered rate where achieved first reaches that
+    peak and plateaus. A proxy is "saturated" only if the plateau sits
+    materially (>PLATEAU_MARGIN) below the offered ceiling — i.e. it could NOT
+    follow the ramp to the top; one that tracks the ramp to ~max_rate has no
+    knee.
 
+    Why plateau, not the old "achieved<98% of offered / dropped>0" triggers:
+    k6's open-loop arrival-rate executor drops a few percent of arrivals at
+    cloud RTT (~10ms) from LOW load onward — a loadgen artifact, not proxy
+    saturation. That baseline (measured 7-9% early in cloud runs) tripped both
+    old triggers and pinned the reported knee far below the true ceiling. The
+    achieved-plateau is immune to it: it reads where the proxy's own served
+    throughput stops rising, wherever the loadgen's drop baseline sits.
+    Errors>ERR_MAX still override the reason (a proxy failing, not just
+    topping out)."""
     slice_w = max_rate * SAT_WINDOW / _ramp_len(data)
     grouped = {}
-    for key in ("achieved", "errors", "dropped"):
+    for key in ("achieved", "errors"):
         for x, v in data[key]:
             grouped.setdefault(int(x // slice_w), {}).setdefault(key, []).append(v)
 
@@ -180,38 +185,25 @@ def detect_saturation(data, max_rate):
         offered_mid = (i + 0.5) * slice_w
         ach = sum(b.get("achieved", [0])) / max(len(b.get("achieved", [1])), 1)
         err = max(b.get("errors", [0]))
-        drop = max(b.get("dropped", [0]))
-        bad = None
-        if drop > 0:
-            bad = "dropped iterations"
-        elif err > ERR_MAX:
-            bad = f"errors>{ERR_MAX:.0%}"
-        elif offered_mid > floor and ach < KEEPUP * offered_mid:
-            bad = f"achieved<{KEEPUP:.0%} of offered"
-        buckets.append((offered_mid, ach, bad))
+        buckets.append((offered_mid, ach, err))
 
-    clean = [(off, ach) for off, ach, bad in buckets if bad is None]
-    if not clean:
-        # No bucket ever kept up with the ramp — the achieved rate lagged the
-        # (steep) offered ramp from the very first bucket. That's a slow-warming
-        # proxy (e.g. envoy's STRICT_DNS cluster ramps its connection pool over
-        # the first ~minute), NOT one stuck at ~0. "Best clean bucket" is
-        # undefined, so report the peak throughput it actually held and anchor
-        # the knee where that plateau begins.
-        peak_ach = max((ach for _, ach, _ in buckets), default=0)
-        knee_off = next((off for off, ach, _ in buckets if ach >= 0.95 * peak_ach), None)
-        return {"saturated": peak_ach > 0, "offered": knee_off,
-                "reason": "achieved lagged the ramp (slow warmup)",
-                "max_sustained": peak_ach}
-    best_off, best_ach = max(clean, key=lambda c: c[1])
+    if not buckets:
+        return {"saturated": False, "offered": None, "reason": None, "max_sustained": 0}
 
-    for k in range(len(buckets) - 1):
-        off, _, bad = buckets[k]
-        if bad and buckets[k + 1][2] and off > best_off:
-            return {"saturated": True, "offered": off - 0.5 * slice_w,
-                    "reason": bad, "max_sustained": best_ach}
-    return {"saturated": False, "offered": None, "reason": None,
-            "max_sustained": best_ach}
+    peak_ach = max(ach for _, ach, _ in buckets)
+    # knee = first offered slice where achieved reaches the top of its own curve
+    # (the plateau's leading edge). achieved climbs with offered until the proxy
+    # tops out, so this is where it stops keeping pace.
+    knee_off = next((off for off, ach, _ in buckets if ach >= KNEE_FRAC * peak_ach), None)
+    # Saturated only if that ceiling is well under the offered ramp's top — else
+    # it kept up (its peak IS ~the offered ceiling) and there's no knee.
+    saturated = peak_ach < PLATEAU_MARGIN * max_rate
+    reason = None
+    if saturated:
+        post = [err for off, _, err in buckets if knee_off is None or off >= knee_off]
+        reason = f"errors>{ERR_MAX:.0%}" if post and max(post) > ERR_MAX else "throughput plateau"
+    return {"saturated": saturated, "offered": knee_off if saturated else None,
+            "reason": reason, "max_sustained": peak_ach}
 
 
 def _ramp_len(data):
@@ -555,8 +547,8 @@ ramp 0→{fmt_si(meta["max_rate"])} req/s over {html.escape(meta["ramp_duration"
 body {html.escape(meta["req_path"])} · proxy box: {html.escape(str(meta["proxy_cpus"]))} cpus /
 {html.escape(meta["proxy_mem"])} · {html.escape(mode_note)}</p>
 <section class="card" style="margin-bottom:20px">
-  <h2>Summary — max sustained successful req/s (last clean 15s window before the knee)</h2>
-  <p class="sub">saturation = 2 consecutive windows with achieved&lt;{KEEPUP:.0%} of offered, errors&gt;{ERR_MAX:.0%}, or dropped iterations</p>
+  <h2>Summary — peak sustained successful req/s (throughput ceiling)</h2>
+  <p class="sub">max sustained = peak 15s-averaged 2xx throughput; knee = where achieved plateaus below the offered ramp (loadgen dropped-iteration baseline ignored); errors&gt;{ERR_MAX:.0%} flagged as the reason when present</p>
   <div class="tablewrap">
   <table>
     <tr><th>proxy</th><th>max sustained</th><th>saturated by</th><th>p99@50% (ms)</th>
