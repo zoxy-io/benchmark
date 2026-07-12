@@ -47,11 +47,21 @@ services:
     extra_hosts:
       - "backend:${BACKEND_IP}"
 
-  caddy:
+  nginx:
+    <<: *host-net
+    cpuset: ${PROXY_CPUSET:-}
+    extra_hosts:
+      # nginx stream resolves `backend` once at startup via getaddrinfo, which
+      # reads this /etc/hosts entry — no runtime resolver needed (like pingora)
+      - "backend:${BACKEND_IP}"
+
+  pingora:
     <<: *host-net
     cpuset: ${PROXY_CPUSET:-}
     extra_hosts:
       - "backend:${BACKEND_IP}"
+    # pingora resolves `backend` at startup via getaddrinfo, which reads this
+    # extra_hosts /etc/hosts entry — no runtime resolver needed (unlike haproxy)
 
   prometheus:
     <<: *host-net

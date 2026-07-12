@@ -24,7 +24,7 @@ for k in "${KNOBS[@]}"; do
 done
 
 MODE=${MODE:-local}
-PROXIES=${PROXIES:-"zoxy haproxy envoy traefik caddy"}
+PROXIES=${PROXIES:-"zoxy haproxy envoy traefik nginx pingora"}
 COOLDOWN=${COOLDOWN:-60}
 REQ_PATH=${REQ_PATH:-/1k}
 RUNID=${RUNID:-$(date -u +%Y%m%d-%H%M%S)}

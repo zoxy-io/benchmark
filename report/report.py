@@ -42,10 +42,11 @@ PALETTE = {
     "haproxy": ("#1baf7a", "#199e70"),
     "envoy": ("#eda100", "#c98500"),
     "traefik": ("#008300", "#008300"),
-    "caddy": ("#4a3aa7", "#9085e9"),
+    "nginx": ("#4a3aa7", "#9085e9"),
+    "pingora": ("#d9481f", "#e2662c"),  # Cloudflare-ish orange, clear of envoy amber
     "direct": ("#898781", "#898781"),
 }
-PROXY_ORDER = ["zoxy", "haproxy", "envoy", "traefik", "caddy", "direct"]
+PROXY_ORDER = ["zoxy", "haproxy", "envoy", "traefik", "nginx", "pingora", "direct"]
 
 
 def prom_query_range(prom, query, start, end):
@@ -350,26 +351,26 @@ CSS = """
   --surface-1:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
   --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
   --c-zoxy:#2a78d6; --c-haproxy:#1baf7a; --c-envoy:#eda100;
-  --c-traefik:#008300; --c-caddy:#4a3aa7; --c-direct:#898781;
+  --c-traefik:#008300; --c-nginx:#4a3aa7; --c-pingora:#d9481f; --c-direct:#898781;
 }
 @media (prefers-color-scheme: dark) { :root {
   --surface-1:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7;
   --muted:#898781; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
   --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
-  --c-traefik:#008300; --c-caddy:#9085e9; --c-direct:#898781;
+  --c-traefik:#008300; --c-nginx:#9085e9; --c-pingora:#e2662c; --c-direct:#898781;
 } }
 /* explicit theme toggles (e.g. hosted viewers) must beat the media query */
 :root[data-theme="dark"] {
   --surface-1:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7;
   --muted:#898781; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
   --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
-  --c-traefik:#008300; --c-caddy:#9085e9; --c-direct:#898781;
+  --c-traefik:#008300; --c-nginx:#9085e9; --c-pingora:#e2662c; --c-direct:#898781;
 }
 :root[data-theme="light"] {
   --surface-1:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
   --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
   --c-zoxy:#2a78d6; --c-haproxy:#1baf7a; --c-envoy:#eda100;
-  --c-traefik:#008300; --c-caddy:#4a3aa7; --c-direct:#898781;
+  --c-traefik:#008300; --c-nginx:#4a3aa7; --c-pingora:#d9481f; --c-direct:#898781;
 }
 * { box-sizing:border-box; margin:0 }
 body { background:var(--page); color:var(--ink);
@@ -394,7 +395,8 @@ svg { width:100%; height:auto; display:block }
 .line.s-haproxy,.satmark.s-haproxy { stroke:var(--c-haproxy) } .swatch.s-haproxy { background:var(--c-haproxy) }
 .line.s-envoy,.satmark.s-envoy { stroke:var(--c-envoy) } .swatch.s-envoy { background:var(--c-envoy) }
 .line.s-traefik,.satmark.s-traefik { stroke:var(--c-traefik) } .swatch.s-traefik { background:var(--c-traefik) }
-.line.s-caddy,.satmark.s-caddy { stroke:var(--c-caddy) } .swatch.s-caddy { background:var(--c-caddy) }
+.line.s-nginx,.satmark.s-nginx { stroke:var(--c-nginx) } .swatch.s-nginx { background:var(--c-nginx) }
+.line.s-pingora,.satmark.s-pingora { stroke:var(--c-pingora) } .swatch.s-pingora { background:var(--c-pingora) }
 .line.s-direct,.satmark.s-direct { stroke:var(--c-direct) } .swatch.s-direct { background:var(--c-direct) }
 .line.s-offered { stroke:var(--axis) }
 .chartwrap { position:relative }

@@ -1,16 +1,17 @@
 # proxy-bench
 
-Compares **zoxy** against **HAProxy**, **Envoy**, **Traefik** and **Caddy**:
-every proxy gets the *identical* linearly-growing open-loop load ramp until it
-stops keeping up, and the output is one HTML report overlaying **latency, CPU,
-memory and achieved req/s against offered load** — plus a live Grafana view
-while a run is in flight.
+Compares **zoxy** against **HAProxy**, **Envoy**, **Traefik**, **nginx** and
+**Pingora**: every proxy gets the *identical* linearly-growing open-loop load
+ramp until it stops keeping up, and the output is one HTML report overlaying
+**latency, CPU, memory and achieved req/s against offered load** — plus a live
+Grafana view while a run is in flight.
 
 zoxy's libxev build is **L4-only**, so every proxy runs as an **L4 TCP
-passthrough** (`mode tcp`, `tcp_proxy`, TCP router, `layer4`) — the same job
-for everyone: relay bytes, parse nothing. k6 still speaks HTTP end-to-end;
-nginx is the HTTP endpoint and the proxies are transparent tunnels, so the
-k6-side metrics (latency, achieved rate, errors) are unchanged.
+passthrough** (`mode tcp`, `tcp_proxy`, TCP router, nginx `stream`, and a small
+Rust binary on Cloudflare's Pingora framework) — the same job for everyone:
+relay bytes, parse nothing. k6 still speaks HTTP end-to-end; the origin nginx is
+the HTTP endpoint and the proxies are transparent tunnels, so the k6-side
+metrics (latency, achieved rate, errors) are unchanged.
 
 ```
             0 ──────── linear ramp ────────► MAX_RATE
@@ -49,7 +50,7 @@ Needs docker + docker compose v2, jq, python3.
 
 ```sh
 cp .env.example .env       # knobs: MAX_RATE, RAMP_DURATION, PROXY_CPUS, PROXIES...
-make smoke                 # 2-min mini-ramp on haproxy+caddy — checks the plumbing
+make smoke                 # 2-min mini-ramp on haproxy+nginx — checks the plumbing
 make bench                 # the real thing: every proxy, identical ramp (~10 min each)
 make report                # -> results/<runid>/report.html
 open results/latest/report.html
@@ -75,11 +76,12 @@ implementation. Iterating never rebuilds an image — edit, rerun `cloud-bench`.
 
 ## Fairness rules (what makes the numbers comparable)
 
-- **Same job for every proxy**: all five are L4 TCP passthroughs — HAProxy
-  `mode tcp`, Envoy `tcp_proxy`, Traefik TCP router, Caddy `layer4` (stock
-  Caddy is HTTP-only, so `proxies/caddy/Dockerfile` bakes in the
-  `mholt/caddy-l4` plugin with xcaddy), zoxy natively. Nobody pays for HTTP
-  parsing that others skip.
+- **Same job for every proxy**: all six are L4 TCP passthroughs — HAProxy
+  `mode tcp`, Envoy `tcp_proxy`, Traefik TCP router, nginx `stream` (the
+  official image ships the stream module compiled in — no custom build),
+  Pingora (a ~60-line Rust binary on Cloudflare's framework — `proxies/pingora`,
+  since Pingora is a library, not a ready-made proxy), zoxy natively. Nobody
+  pays for HTTP parsing that others skip.
 - **Same box for every proxy**: `PROXY_CPUS` / `PROXY_MEM` enforced by cgroups,
   identical per proxy; thread counts are set *explicitly* to match
   (`nbthread`, `--concurrency`, `GOMAXPROCS`) — container runtimes lie to

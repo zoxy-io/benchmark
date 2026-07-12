@@ -3,7 +3,7 @@
 # One file describes every role; compose profiles pick what runs where:
 #   monitoring  prometheus + grafana            (local: always; cloud: loadgen VM)
 #   backend     nginx origin                    (local: always; cloud: backend VM)
-#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|caddy)
+#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|nginx|pingora)
 #   loadgen     the k6 service, started only via `docker compose run k6`
 # cadvisor + node_exporter carry every profile so each docker host exports
 # per-container CPU/mem and host metrics no matter which role it plays.
@@ -58,10 +58,11 @@ services:
       retries: 15
 
   # ------------------------------------------------------- proxies under test --
-  # All five: listen :8080, L4 TCP passthrough (zoxy's libxev build is
+  # All six: listen :8080, L4 TCP passthrough (zoxy's libxev build is
   # L4-only, so EVERY proxy relays bytes — nobody parses HTTP), upstream =
-  # backend:9000, no access logs. k6 still speaks h1 end-to-end; nginx is the
-  # HTTP endpoint. container_name == service name == the `name` label cAdvisor
+  # backend:9000, no access logs. k6 still speaks h1 end-to-end; the backend
+  # nginx is the HTTP endpoint (an nginx proxy relays it at L4, same as the
+  # rest). container_name == service name == the `name` label cAdvisor
   # exports, which is how the report joins CPU/mem to a proxy.
   zoxy:
     <<: *proxy-common
@@ -138,18 +139,37 @@ services:
     ports:
       - "8080:8080"
 
-  caddy:
+  nginx:
     <<: *proxy-common
-    # stock caddy has no L4 app — built locally with the layer4 plugin
-    build:
-      context: ./proxies/caddy
-    image: zoxy-bench/caddy-l4:2.11
-    container_name: caddy
-    profiles: [caddy]
+    # nginx does L4 natively via the stream module — the official image ships
+    # it compiled in (--with-stream), so unlike Caddy no custom build is
+    # needed. The image's envsubst hook renders the template into /etc/nginx
+    # at start; PROXY_CPUS becomes worker_processes (explicit thread parity).
+    image: nginx:1.27-alpine
+    container_name: nginx
+    profiles: [nginx]
     environment:
-      GOMAXPROCS: ${PROXY_CPUS:-1}
+      PROXY_CPUS: ${PROXY_CPUS:-1}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
     volumes:
-      - ./proxies/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    ports:
+      - "8080:8080"
+
+  pingora:
+    <<: *proxy-common
+    # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a
+    # tiny L4 TCP-passthrough binary on it (src/main.rs). THREADS (= PROXY_CPUS)
+    # is the thread-parity knob; UPSTREAM is resolved once at startup.
+    build:
+      context: ./proxies/pingora
+    image: zoxy-bench/pingora-l4:0.5
+    container_name: pingora
+    profiles: [pingora]
+    environment:
+      THREADS: ${PROXY_CPUS:-1}
+      LISTEN: 0.0.0.0:8080
+      UPSTREAM: backend:9000
     ports:
       - "8080:8080"
 
@@ -191,7 +211,7 @@ services:
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.52.1
     container_name: cadvisor
-    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, caddy]
+    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, nginx, pingora]
     # Disk metrics off — only cpu/memory/network matter here. NOTE: the
     # docker host must run the classic overlay2 graphdriver
     # ({"features":{"containerd-snapshotter":false}} in daemon.json — see
@@ -213,7 +233,7 @@ services:
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.9.0
     container_name: node_exporter
-    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, caddy]
+    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, nginx, pingora]
     command: ["--path.rootfs=/host"]
     pid: host
     volumes:

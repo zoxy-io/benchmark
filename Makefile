@@ -2,7 +2,7 @@
 #
 #   make up          local: start backend + prometheus + grafana (grafana :3000)
 #   make bench       local: full run — every proxy through the identical ramp
-#   make smoke       local: 2-minute mini-ramp on haproxy+caddy (plumbing check)
+#   make smoke       local: 2-minute mini-ramp on haproxy+nginx (plumbing check)
 #   make report      render results/latest -> report.html (set PROM_URL for cloud)
 #   make down        local: stop everything
 #   make cloud-up    terraform apply the 3-VM fleet
@@ -31,7 +31,7 @@ bench: up
 	./scripts/run-all.sh
 
 smoke: up
-	MAX_RATE=2000 RAMP_DURATION=2m COOLDOWN=5 PROXIES="$${PROXIES:-haproxy caddy}" ./scripts/run-all.sh
+	MAX_RATE=2000 RAMP_DURATION=2m COOLDOWN=5 PROXIES="$${PROXIES:-haproxy nginx}" ./scripts/run-all.sh
 
 report:
 	python3 report/report.py results/latest
