@@ -131,7 +131,7 @@ def build_html(meta, ns, data, present):
         card("Throughput vs concurrency", "successful req/s at each fixed connection count — the peak is each proxy's sweet spot",
              line_chart("tput", ns, serieses("throughput"), "si", "req/s")),
         card("p99 latency vs concurrency", "tail latency climbs as a proxy is pushed past its sweet spot",
-             line_chart("p99", ns, serieses("p99"), "ms", "s")),
+             line_chart("p99", ns, serieses("p99"), "ms", "")),
         card("Proxy CPU vs concurrency", "cores consumed; flat-below-1.0 = not CPU-bound (loop/serialization limited)",
              line_chart("cpu", ns, [(p, [data[p][n].get("cpu") for n in ns]) for p in present if p != "direct"], "si", "cores")),
         card("Error ratio vs concurrency", "volume-weighted failed/total (e.g. connection shedding past a cap)",

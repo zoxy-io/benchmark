@@ -297,7 +297,11 @@ def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
     def Y(y):
         return H - MB - (H - MB - MT) * y / ymaxt
 
-    fmt = fmt_bytes if yfmt == "bytes" else (lambda v: f"{v * 100:g}%") if yfmt == "pct" else fmt_si
+    # latency series are in SECONDS; "ms" scales the tick labels to milliseconds
+    # (the tick POSITIONS stay in seconds, so nice round seconds like 0.01 map to
+    # nice round ms like 10 — no tiny 0.0050-style labels).
+    fmt = fmt_bytes if yfmt == "bytes" else (lambda v: f"{v * 100:g}%") if yfmt == "pct" \
+        else (lambda v: fmt_si(v * 1000)) if yfmt == "ms" else fmt_si
     out = [f'<svg viewBox="0 0 {W} {H}" role="img">']
     for t in yticks:
         out.append(f'<line class="grid" x1="{ML}" y1="{Y(t):.1f}" x2="{W - MR}" y2="{Y(t):.1f}"/>')
@@ -436,6 +440,9 @@ function fmt(v, kind) {
   if (kind === 'bytes') { const u=[['GiB',2**30],['MiB',2**20],['KiB',1024]];
     for (const [n,d] of u) if (v>=d) return (v/d).toFixed(1)+n; return v.toFixed(0)+'B'; }
   if (kind === 'pct') return (v*100).toFixed(2)+'%';
+  // latency series carry SECONDS; render the tooltip in ms (or s past 1000ms)
+  if (kind === 'ms') { const m=v*1000; return m>=1000 ? (m/1000).toFixed(2)+'s'
+    : m>=10 ? m.toFixed(0)+'ms' : m.toFixed(1)+'ms'; }
   if (v>=1e6) return (v/1e6).toFixed(2)+'M';
   if (v>=1e3) return (v/1e3).toFixed(1)+'k';
   return v>=10 ? v.toFixed(0) : v.toFixed(2);
@@ -514,9 +521,9 @@ def build_html(meta, runs):
         chart_card("Shed (rejected) req/s vs offered", "non-2xx / reset responses — load the proxy rejects under overload (flat ~0 = sheds via client backpressure instead; climbing toward the dashed line = rejecting nearly everything)",
                    "shed", shed, present, "si", "req/s", sat_marks),
         chart_card("p50 latency", "median request duration through the proxy",
-                   "p50", serieses("p50"), present, "si", "s", sat_marks),
+                   "p50", serieses("p50"), present, "ms", "ms", sat_marks),
         chart_card("p99 latency", "tail — where saturation shows first",
-                   "p99", serieses("p99"), present, "si", "s", sat_marks),
+                   "p99", serieses("p99"), present, "ms", "ms", sat_marks),
         chart_card("Proxy CPU", "container cores consumed (cAdvisor working counter)",
                    "cpu", serieses("cpu", False), [p for p in present if p != "direct"],
                    "si", "cores", sat_marks),
