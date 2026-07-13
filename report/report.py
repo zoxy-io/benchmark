@@ -133,13 +133,21 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     def series(q):
         return [(offered(ts), v) for ts, v in prom_query_range(prom, q, start, end) if ts >= t0]
 
-    chk = f"(max({M_CHECKS}{{{s}}}) or vector(1))"  # 2xx fraction; 1.0 if absent
+    # Success/failure come from the request COUNTER, split by k6's
+    # expected_response tag ("true" = got the expected 2xx/3xx; "false" = a
+    # transport error or bad status). Do NOT use k6_http_req_failed_rate: k6
+    # remote-writes it as one series PER error type (EOF, reset, timeout, ...),
+    # each trivially =1.0, so max()/avg() of it reads ~100% the instant a single
+    # request fails — not weighted by volume/offered load. Count-based is exact.
+    tot = f"sum(rate({M_REQS}{{{s}}}[{WINDOW}]))"
+    ok = f"sum(rate({M_REQS}{{{s}, expected_response=\"true\"}}[{WINDOW}]))"
     data = {
         # successful (2xx) throughput — what the proxy actually served
-        "achieved": series(f"sum(rate({M_REQS}{{{s}}}[{WINDOW}])) * {chk}"),
-        # shed: requests answered with a non-2xx / reset — load thrown away
-        "shed": series(f"sum(rate({M_REQS}{{{s}}}[{WINDOW}])) * (1 - {chk})"),
-        "errors": series(f"max({M_FAILED}{{{s}}})"),
+        "achieved": series(ok),
+        # shed/failed req/s: transport errors or non-2xx — load thrown away
+        "shed": series(f"({tot}) - ({ok})"),
+        # volume-weighted failure fraction: failed requests / all requests
+        "errors": series(f"1 - ({ok}) / ({tot})"),
         "dropped": series(f"sum(rate({M_DROPPED}{{{s}}}[{WINDOW}]))"),
         "p50": series(f"max({M_DUR.format(q=50)}{{{s}}})"),
         "p95": series(f"max({M_DUR.format(q=95)}{{{s}}})"),

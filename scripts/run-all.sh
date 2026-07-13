@@ -38,6 +38,7 @@ mkdir -p "$RESULTS"
 # it on the loadgen too, or the end-of-test summary write fails (ENOENT).
 if [[ $MODE == cloud ]]; then
     ssh -o BatchMode=yes "$LOADGEN_SSH" "mkdir -p $REMOTE_DIR/results/$RUNID"
+    [[ -n ${LOADGEN2_SSH:-} ]] && ssh -o BatchMode=yes "$LOADGEN2_SSH" "mkdir -p $REMOTE_DIR/results/$RUNID"
 fi
 
 # ---- mode plumbing -----------------------------------------------------------
@@ -56,6 +57,15 @@ compose_loadgen() { # compose command on the machine hosting k6/prometheus
     else
         docker compose "$@"
     fi
+}
+# One k6 on one loadgen VM (cloud, multi-loadgen fan-out). Args: ssh_host lg
+# rate prom_url. Reads loop vars $p / $RUNID / $K6_TARGET. Values are all
+# shell-safe tokens (URLs, numbers, service names) so no remote quoting needed.
+launch_k6() {
+    # shellcheck disable=SC2029
+    ssh -o BatchMode=yes "$1" "cd $REMOTE_DIR && docker compose -f compose.yaml -f compose.cloud.yaml run --rm \
+-e TARGET=$K6_TARGET -e RUNID=$RUNID -e PROXY=$p -e LG=$2 -e MAX_RATE=$3 -e K6_PROMETHEUS_RW_SERVER_URL=$4 \
+k6 run --out experimental-prometheus-rw --tag testid=$RUNID --tag proxy=$p --tag lg=$2 /scripts/ramp.js"
 }
 probe() { # HTTP 200 check, executed where k6 will run
     if [[ $MODE == cloud ]]; then
@@ -102,7 +112,7 @@ if [[ ! -f $RESULTS/runs.json ]]; then
     jq -n \
         --arg runid "$RUNID" --arg mode "$MODE" --arg req_path "$REQ_PATH" \
         --arg max_rate "${MAX_RATE:-20000}" --arg ramp "${RAMP_DURATION:-8m}" \
-        --arg warm_rate "${WARM_RATE:-100}" --arg max_vus "${MAX_VUS:-800}" \
+        --arg warm_rate "${WARM_RATE:-100}" --arg max_vus "${MAX_VUS:-1000}" \
         --arg cpus "${PROXY_CPUS:-1}" --arg mem "${PROXY_MEM:-512m}" \
         '{runid:$runid, mode:$mode, req_path:$req_path,
           max_rate:($max_rate|tonumber), ramp_duration:$ramp,
@@ -166,10 +176,24 @@ for p in $PROXIES; do
     echo ">>> [$p] ramping (warmup 30s + ${RAMP_DURATION:-8m})"
     start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     aborted=false
-    compose_loadgen run --rm \
-        -e TARGET="$(target_for "$p")" -e RUNID="$RUNID" -e PROXY="$p" \
-        k6 run --out experimental-prometheus-rw \
-        --tag "testid=$RUNID" --tag "proxy=$p" /scripts/ramp.js || aborted=true
+    K6_TARGET="$(target_for "$p")"
+    if [[ $MODE == cloud && -n ${LOADGEN2_SSH:-} ]]; then
+        # Fan out across two loadgens: each ramps to MAX_RATE/2 so the COMBINED
+        # offered rate is MAX_RATE (report axis), each holds its own MAX_VUS pool
+        # (=600, from .env), distinct lg tag. loadgen2's k6 remote-writes to the
+        # primary's prometheus (LOADGEN_PRIV); the primary's writes to localhost.
+        lg_rate=$(( ${MAX_RATE:-20000} / 2 ))
+        echo ">>> [$p] 2 loadgens x ${lg_rate}req/s (combined ${MAX_RATE:-20000})"
+        launch_k6 "$LOADGEN_SSH"  1 "$lg_rate" "http://127.0.0.1:9090/api/v1/write" & pid1=$!
+        launch_k6 "$LOADGEN2_SSH" 2 "$lg_rate" "http://$LOADGEN_PRIV:9090/api/v1/write" & pid2=$!
+        wait "$pid1" || aborted=true
+        wait "$pid2" || aborted=true
+    else
+        compose_loadgen run --rm \
+            -e TARGET="$K6_TARGET" -e RUNID="$RUNID" -e PROXY="$p" -e LG=1 \
+            k6 run --out experimental-prometheus-rw \
+            --tag "testid=$RUNID" --tag "proxy=$p" --tag "lg=1" /scripts/ramp.js || aborted=true
+    fi
     end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     record_run "$p" "$start" "$end" "$aborted"
     $aborted && echo ">>> [$p] k6 aborted early (dead-proxy valve or error) — window recorded anyway"
@@ -183,9 +207,11 @@ for p in $PROXIES; do
     sleep "$COOLDOWN"
 done
 
-# cloud mode: k6 wrote its summaries on the loadgen VM; pull them next to runs.json
+# cloud mode: k6 wrote its summaries on each loadgen VM; pull them next to
+# runs.json (each loadgen has only its own lg<N> files, so both merge cleanly)
 if [[ $MODE == cloud ]]; then
     rsync -a "$LOADGEN_SSH:$REMOTE_DIR/results/$RUNID/" "$RESULTS/" || true
+    [[ -n ${LOADGEN2_SSH:-} ]] && rsync -a "$LOADGEN2_SSH:$REMOTE_DIR/results/$RUNID/" "$RESULTS/" || true
 fi
 
 ln -sfn "$RUNID" results/latest

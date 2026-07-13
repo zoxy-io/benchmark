@@ -10,10 +10,16 @@
 # Docker's default seccomp profile denies io_uring_* since engine 25.0, and
 # zoxy's event loop (libxev's Linux backend) is io_uring.
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS build
-ARG ZOXY_REF=libxev
+ARG ZOXY_REF=main
 ARG ZIG_VERSION=0.16.0
 ARG BUILDARCH
 ARG TARGETARCH
+# Benchmark-only override of zoxy's compile-time relay-buffer pool (the L4
+# concurrency cap). Empty = upstream default (1024). Patched at build time so
+# no zoxy fork is needed; the image tag carries the value. Ceiling ~1634: past
+# it the comptime assert in_flight_ops_max <= completion_queue_entries (8192)
+# fails, because the io_uring ring is pre-budgeted (relay_buffers_max*5 ops).
+ARG RELAY_BUFFERS_MAX=
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils \
@@ -33,6 +39,15 @@ RUN git clone https://github.com/zoxy-io/zoxy /src \
     && git -C /src rev-parse HEAD > /zoxy-commit
 
 WORKDIR /src
+# Benchmark override: bump the relay-buffer pool (only the declaration line,
+# not the formula/assert references). Fail loudly if the line moved.
+RUN if [ -n "$RELAY_BUFFERS_MAX" ]; then \
+        grep -qE 'relay_buffers_max: u32 = [0-9]+' src/constants.zig \
+          || { echo "relay_buffers_max decl not found — constants.zig changed" >&2; exit 1; }; \
+        sed -i -E "s/(relay_buffers_max: u32 = )[0-9]+/\1${RELAY_BUFFERS_MAX}/" src/constants.zig; \
+        echo "patched: $(grep -E 'pub const relay_buffers_max' src/constants.zig)"; \
+    fi
+
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for
 # quotable numbers.

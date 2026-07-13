@@ -18,13 +18,16 @@
 // iterations (k6_dropped_iterations in Prometheus) instead of opening
 // unbounded connections and DoSing the fleet.
 //
-// VU CEILING: warmup maxVUs (200) + MAX_VUS must stay BELOW 1024. Every VU
-// holds its keep-alive connection for the VU's lifetime, and through an L4
-// proxy that connection is a held tunnel; zoxy (libxev) has a compile-time
-// pool of 1024 relay buffers, one per open tunnel, and sheds (immediate
-// close -> client EOF) past it — at ANY offered rate. A too-large VU pool
-// therefore poisons the whole zoxy run with a loadgen artifact instead of
-// measuring saturation.
+// VU POOL: MAX_VUS=1000 sits JUST under zoxy's 1024 relay-buffer cap — the
+// largest pool that never makes zoxy shed a tunnel, and bigger than the old
+// 800. Each VU holds one keep-alive connection (an L4 tunnel) for its lifetime;
+// when active VUs = arrival_rate x latency exhausts the pool, k6 drops arrivals
+// (false saturation). At ~12ms fleet latency the loadgen tops out ~82k/0.012
+// ~= 1000 active VUs, so 1000 already covers the loadgen ceiling — the pool is
+// NOT the binding limit. To measure a proxy whose ceiling exceeds what 1000
+// VUs / one loadgen can offer, raise zoxy's relay_buffers_max AND add loadgen
+// VMs (a separate decision) — do NOT just push MAX_VUS past 1024, which only
+// makes zoxy shed.
 import http from 'k6/http';
 import { check } from 'k6';
 
@@ -33,7 +36,7 @@ const REQ_PATH = __ENV.REQ_PATH || '/1k';
 const MAX_RATE = parseInt(__ENV.MAX_RATE || '20000', 10);
 const RAMP_DURATION = __ENV.RAMP_DURATION || '8m';
 const WARM_RATE = parseInt(__ENV.WARM_RATE || '100', 10);
-const MAX_VUS = parseInt(__ENV.MAX_VUS || '800', 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '1000', 10);
 
 export const options = {
   discardResponseBodies: true,
@@ -82,8 +85,9 @@ export default function () {
 export function handleSummary(data) {
   const runid = __ENV.RUNID || 'adhoc';
   const proxy = __ENV.PROXY || 'unknown';
+  const lg = __ENV.LG || '1'; // one file per loadgen (multi-loadgen fan-out)
   return {
-    [`/results/${runid}/${proxy}.summary.json`]: JSON.stringify(data, null, 2),
-    stdout: `\nramp done: proxy=${proxy} runid=${runid} max_rate=${MAX_RATE} duration=${RAMP_DURATION}\n`,
+    [`/results/${runid}/${proxy}.summary.lg${lg}.json`]: JSON.stringify(data, null, 2),
+    stdout: `\nramp done: proxy=${proxy} lg=${lg} runid=${runid} max_rate=${MAX_RATE} duration=${RAMP_DURATION}\n`,
   };
 }

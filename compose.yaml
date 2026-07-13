@@ -69,8 +69,11 @@ services:
     build:
       context: ./proxies/zoxy
       args:
-        ZOXY_REF: ${ZOXY_REF:-libxev}
-    image: zoxy-bench/zoxy:${ZOXY_REF:-libxev}
+        ZOXY_REF: ${ZOXY_REF:-main}
+        RELAY_BUFFERS_MAX: ${RELAY_BUFFERS_MAX:-}
+    # tag carries the relay-buffer override so a bumped build is a distinct
+    # image (forces rebuild; recorded in runs.json versions)
+    image: zoxy-bench/zoxy:${ZOXY_REF:-main}${RELAY_BUFFERS_MAX:+-rb${RELAY_BUFFERS_MAX}}
     container_name: zoxy
     profiles: [zoxy]
     # Docker's default seccomp profile denies io_uring_* since engine 25.0.
@@ -87,9 +90,10 @@ services:
     # zoxy (libxev) has NO thread/connection knobs: one event loop regardless
     # of PROXY_CPUS (it gets the same box but can only spend one core), and
     # concurrency is hard-capped at 1024 relay buffers (constants.zig), one
-    # held per open tunnel for its LIFETIME — hence the MAX_VUS<=800 ceiling
-    # (k6 keep-alive conns are held idle by VUs; past 1024 zoxy sheds with an
-    # immediate close and the run drowns in EOFs at any offered rate).
+    # held per open tunnel for its LIFETIME — so MAX_VUS defaults to 1000, just
+    # under that cap (past 1024 zoxy sheds tunnels with a client EOF). Raising
+    # zoxy's relay_buffers_max is what would let a bigger pool measure a higher
+    # ceiling; every other proxy has no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
     # resolves `backend` (env below) once at start and renders the template.
     environment:
@@ -254,8 +258,9 @@ services:
       MAX_RATE: ${MAX_RATE:-20000}
       RAMP_DURATION: ${RAMP_DURATION:-8m}
       WARM_RATE: ${WARM_RATE:-100}
-      # default must stay below zoxy's 1024-tunnel bound (see .env.example)
-      MAX_VUS: ${MAX_VUS:-800}
+      # just under zoxy's 1024-tunnel cap: max pool that doesn't shed zoxy and
+      # still covers the loadgen ceiling (~1000 active VUs); see .env.example
+      MAX_VUS: ${MAX_VUS:-1000}
       REQ_PATH: ${REQ_PATH:-/1k}
     volumes:
       - ./k6:/scripts:ro

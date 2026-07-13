@@ -58,10 +58,14 @@ data "yandex_compute_image" "ubuntu" {
 }
 
 locals {
+  # Two loadgens (loadgen = primary, hosts prometheus/grafana; loadgen2 = extra
+  # k6 only) so aggregate k6 CPU exceeds a single 16-core box's ~82k wall. Both
+  # carry role="loadgen" so the report's host-CPU validity check sees both.
   hosts = {
-    loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory }
-    proxy   = { cores = var.proxy_cores, memory = var.proxy_memory }
-    backend = { cores = var.backend_cores, memory = var.backend_memory }
+    loadgen  = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
+    loadgen2 = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
+    proxy    = { cores = var.proxy_cores, memory = var.proxy_memory, role = "proxy" }
+    backend  = { cores = var.backend_cores, memory = var.backend_memory, role = "backend" }
   }
 }
 
@@ -72,7 +76,7 @@ resource "yandex_compute_instance" "host" {
   hostname    = each.key
   platform_id = var.platform_id
   zone        = var.zone
-  labels      = { role = each.key }
+  labels      = { role = each.value.role }
 
   resources {
     cores         = each.value.cores
