@@ -122,7 +122,10 @@ def build_html(meta, ns, data, present):
         return "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)
 
     def serieses(key):
-        return [(p, [data[p][n].get(key) for n in ns]) for p in present if any(data[p][n].get(key) for n in ns)]
+        # keep a series if ANY point HAS a value — 0.0 is a real value (0%
+        # errors), not "missing"; truthiness would drop an all-clean error curve
+        return [(p, [data[p][n].get(key) for n in ns])
+                for p in present if any(data[p][n].get(key) is not None for n in ns)]
 
     charts = [
         card("Throughput vs concurrency", "successful req/s at each fixed connection count — the peak is each proxy's sweet spot",
