@@ -5,8 +5,10 @@
 #   make smoke       local: 2-minute mini-ramp on haproxy+nginx (plumbing check)
 #   make report      render results/latest -> report.html (set PROM_URL for cloud)
 #   make down        local: stop everything
-#   make cloud-up    terraform apply the 3-VM fleet
+#   make cloud-up    terraform apply the fleet
 #   make cloud-bench rsync + run the full ramp on the fleet
+#   make cloud-sweep rsync + run the closed-loop concurrency sweep on the fleet
+#   make sweep       local: closed-loop throughput-vs-concurrency sweep
 #   make cloud-down  terraform destroy
 #
 # Knobs live in .env (copy .env.example); PROXIES/MAX_RATE/RAMP_DURATION can be
@@ -18,7 +20,7 @@ SHELL := bash
 
 TF ?= tofu
 
-.PHONY: help up bench smoke report down cloud-up cloud-bench cloud-down clean
+.PHONY: help up bench smoke sweep report sweep-report down cloud-up cloud-bench cloud-sweep cloud-down clean
 
 help:
 	@sed -n '3,12p' $(MAKEFILE_LIST)
@@ -33,8 +35,14 @@ bench: up
 smoke: up
 	MAX_RATE=2000 RAMP_DURATION=2m COOLDOWN=5 PROXIES="$${PROXIES:-haproxy nginx}" ./scripts/run-all.sh
 
+sweep: up
+	./scripts/sweep.sh
+
 report:
 	python3 report/report.py results/latest
+
+sweep-report:
+	python3 report/sweep.py results/latest
 
 down:
 	docker compose --profile '*' down
@@ -45,6 +53,9 @@ cloud-up:
 
 cloud-bench:
 	./scripts/cloud-run.sh
+
+cloud-sweep:
+	DRIVER=sweep.sh ./scripts/cloud-run.sh
 
 cloud-down:
 	$(TF) -chdir=cloud destroy -auto-approve

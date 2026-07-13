@@ -17,6 +17,7 @@ const TARGET = __ENV.TARGET;
 const REQ_PATH = __ENV.REQ_PATH || '/1k';
 const VUS = parseInt(__ENV.VUS || '900', 10);
 const DURATION = __ENV.DURATION || '2m';
+const N = __ENV.N || String(VUS); // concurrency level tag for the sweep
 
 export const options = {
   discardResponseBodies: true,
@@ -40,9 +41,8 @@ export default function () {
 export function handleSummary(data) {
   const runid = __ENV.RUNID || 'adhoc';
   const proxy = __ENV.PROXY || 'unknown';
-  const lg = __ENV.LG || '0';
   return {
-    [`/results/${runid}/${proxy}.saturate.lg${lg}.json`]: JSON.stringify(data, null, 2),
-    stdout: `\nsaturate done: proxy=${proxy} lg=${lg} vus=${VUS} reqs=${data.metrics.http_reqs.values.count}\n`,
+    [`/results/${runid}/${proxy}.n${N}.json`]: JSON.stringify(data, null, 2),
+    stdout: `\nsweep point done: proxy=${proxy} n=${N} vus=${VUS} reqs=${data.metrics.http_reqs.values.count}\n`,
   };
 }

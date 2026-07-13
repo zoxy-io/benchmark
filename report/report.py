@@ -140,7 +140,8 @@ def fetch_run(prom, runid, proxy, start, end, meta):
     # each trivially =1.0, so max()/avg() of it reads ~100% the instant a single
     # request fails — not weighted by volume/offered load. Count-based is exact.
     tot = f"sum(rate({M_REQS}{{{s}}}[{WINDOW}]))"
-    ok = f"sum(rate({M_REQS}{{{s}, expected_response=\"true\"}}[{WINDOW}]))"
+    okd = f'{s}, expected_response="true"'  # served-request selector
+    ok = f"sum(rate({M_REQS}{{{okd}}}[{WINDOW}]))"
     data = {
         # successful (2xx) throughput — what the proxy actually served
         "achieved": series(ok),
@@ -149,9 +150,11 @@ def fetch_run(prom, runid, proxy, start, end, meta):
         # volume-weighted failure fraction: failed requests / all requests
         "errors": series(f"1 - ({ok}) / ({tot})"),
         "dropped": series(f"sum(rate({M_DROPPED}{{{s}}}[{WINDOW}]))"),
-        "p50": series(f"max({M_DUR.format(q=50)}{{{s}}})"),
-        "p95": series(f"max({M_DUR.format(q=95)}{{{s}}})"),
-        "p99": series(f"max({M_DUR.format(q=99)}{{{s}}})"),
+        # latency of SERVED requests only — the failed sub-series carries the
+        # ~5s connect-timeout duration, which max() would otherwise report.
+        "p50": series(f"max({M_DUR.format(q=50)}{{{okd}}})"),
+        "p95": series(f"max({M_DUR.format(q=95)}{{{okd}}})"),
+        "p99": series(f"max({M_DUR.format(q=99)}{{{okd}}})"),
     }
     if proxy != "direct":
         cname = f'name="{proxy}"'

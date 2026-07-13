@@ -103,6 +103,8 @@ echo ">>> grafana: http://$LOADGEN_PUB:3000  prometheus: http://$LOADGEN_PUB:909
 # LOADGEN2_SSH set => run-all.sh fans k6 across both loadgens (split rate, VU
 # pool each = MAX_VUS, distinct lg tag). LOADGEN_PRIV is where loadgen2's k6
 # points its remote-write (prometheus lives on the primary loadgen).
+# DRIVER selects the measurement: run-all.sh (the single ramp, default) or
+# sweep.sh (the closed-loop concurrency sweep). Both read the same handoff env.
 MODE=cloud \
     PROXY_SSH="$SSH_USER@$PROXY_PUB" \
     LOADGEN_SSH="$SSH_USER@$LOADGEN_PUB" \
@@ -111,7 +113,7 @@ MODE=cloud \
     PROXY_IP="$PROXY_PRIV" \
     BACKEND_IP="$BACKEND_PRIV" \
     REMOTE_DIR="$REMOTE_DIR" \
-    ./scripts/run-all.sh
+    "./scripts/${DRIVER:-run-all.sh}"
 
 echo ">>> render the report against the cloud prometheus:"
 echo "    PROM_URL=http://$LOADGEN_PUB:9090 make report"
