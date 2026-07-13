@@ -88,16 +88,20 @@ services:
         soft: 1048576
         hard: 1048576
       memlock: -1 # io_uring ring memory counts against memlock on kernels <5.12
-    # zoxy (libxev) has NO thread/connection knobs: one event loop regardless
-    # of PROXY_CPUS (it gets the same box but can only spend one core), and
-    # concurrency is hard-capped at relay_buffers_max (constants.zig; 1225 on
-    # current main), one held per open tunnel for its LIFETIME — past it zoxy
-    # sheds tunnels with a client EOF. The ramp's MAX_VUS (400) stays well under
-    # it; every other proxy has no such cap.
+    # zoxy (libxev) has NO thread knob: one event loop per PROCESS. To spend a
+    # multi-core box it runs ZOXY_WORKERS processes that share :8080 via
+    # SO_REUSEPORT (kernel spreads connections) — the entrypoint supervises them.
+    # ZOXY_WORKERS = PROXY_CPUS keeps thread parity with the others (nbthread /
+    # --concurrency / GOMAXPROCS); 1 core => 1 process, exactly as before.
+    # Concurrency is hard-capped at relay_buffers_max PER PROCESS (constants.zig;
+    # 1024 on current main), one held per open tunnel for its LIFETIME — past it
+    # zoxy sheds tunnels with a client EOF. N workers => N x that cap total; the
+    # ramp's MAX_VUS stays well under it. Every other proxy has no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
     # resolves `backend` (env below) once at start and renders the template.
     environment:
       BACKEND: backend:9000
+      ZOXY_WORKERS: ${PROXY_CPUS:-1}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:

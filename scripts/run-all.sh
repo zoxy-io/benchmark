@@ -104,7 +104,12 @@ zoxy_state() { # echo zoxy's container State ("" if absent); never errors
 bring_up() { # proxy — start it. No zoxy DNS special-case anymore: zoxy (libxev)
     # does no DNS at all; its container entrypoint resolves `backend` (with
     # retries) and renders the IP literal into the config before exec'ing zoxy.
-    compose_proxy --profile "$1" up -d --wait
+    # --build: the built proxies (zoxy, pingora) carry non-ARG source (entrypoint,
+    # main.rs) that the image TAG doesn't capture, so a plain `up` would silently
+    # reuse a stale image. --build is a fast cache-validation pass (no-op for the
+    # pulled images; only changed final layers rebuild) and guarantees the
+    # container matches the rsync'd build context — critical for benchmark trust.
+    compose_proxy --profile "$1" up -d --build --wait
 }
 
 # ---- run metadata ------------------------------------------------------------
