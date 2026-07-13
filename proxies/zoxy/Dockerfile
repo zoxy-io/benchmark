@@ -48,18 +48,25 @@ RUN if [ -n "$RELAY_BUFFERS_MAX" ]; then \
         echo "patched: $(grep -E 'pub const relay_buffers_max' src/constants.zig)"; \
     fi
 
+# Optimize mode. Default ReleaseFast for PARITY with the other proxies, which
+# all ship fully optimized (pingora `cargo build --release`, haproxy/nginx/envoy
+# release) — ReleaseSafe keeps Zig's bounds/overflow/alignment checks on the hot
+# path, a per-op CPU tax the others don't pay, which would handicap zoxy in a
+# performance comparison. Set ZOXY_OPTIMIZE=ReleaseSafe to bench zoxy's actual
+# TigerStyle ship configuration instead.
+ARG ZOXY_OPTIMIZE=ReleaseFast
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for
 # quotable numbers.
 RUN if [ "$BUILDARCH" = "$TARGETARCH" ]; then \
-        zig build -Doptimize=ReleaseSafe; \
+        zig build -Doptimize=$ZOXY_OPTIMIZE; \
     else \
         case "$TARGETARCH" in \
             amd64) ztarget=x86_64-linux-gnu ;; \
             arm64) ztarget=aarch64-linux-gnu ;; \
             *) echo "unsupported target arch: $TARGETARCH" >&2; exit 1 ;; \
         esac \
-        && zig build -Doptimize=ReleaseSafe -Dtarget="$ztarget"; \
+        && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget"; \
     fi
 
 FROM debian:bookworm-slim

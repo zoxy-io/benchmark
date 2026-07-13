@@ -18,16 +18,16 @@
 // iterations (k6_dropped_iterations in Prometheus) instead of opening
 // unbounded connections and DoSing the fleet.
 //
-// VU POOL: MAX_VUS=1000 sits JUST under zoxy's 1024 relay-buffer cap — the
-// largest pool that never makes zoxy shed a tunnel, and bigger than the old
-// 800. Each VU holds one keep-alive connection (an L4 tunnel) for its lifetime;
-// when active VUs = arrival_rate x latency exhausts the pool, k6 drops arrivals
-// (false saturation). At ~12ms fleet latency the loadgen tops out ~82k/0.012
-// ~= 1000 active VUs, so 1000 already covers the loadgen ceiling — the pool is
-// NOT the binding limit. To measure a proxy whose ceiling exceeds what 1000
-// VUs / one loadgen can offer, raise zoxy's relay_buffers_max AND add loadgen
-// VMs (a separate decision) — do NOT just push MAX_VUS past 1024, which only
-// makes zoxy shed.
+// VU POOL: MAX_VUS caps the concurrency the ramp reaches at saturation (each
+// VU holds one L4 tunnel; active VUs = arrival_rate x latency by Little's Law).
+// 400 is chosen from the concurrency SWEEP (report/sweep.py): every proxy peaks
+// around 100-200 connections, and serving that ~54k peak at ~5ms latency needs
+// only ~270 concurrent connections. 400 gives headroom to reach each proxy's
+// peak WITHOUT driving it into the high-concurrency collapse the sweep exposed
+// (haproxy/nginx crater from 54k->31k by N=800). So the ramp's "max sustained"
+// lines up with each proxy's true peak instead of an overloaded number. It's
+// also well under zoxy's relay-buffer cap (no shedding). The full throughput-
+// vs-concurrency story lives in the sweep; the ramp just needs the sweet spot.
 import http from 'k6/http';
 import { check } from 'k6';
 
@@ -36,7 +36,7 @@ const REQ_PATH = __ENV.REQ_PATH || '/1k';
 const MAX_RATE = parseInt(__ENV.MAX_RATE || '20000', 10);
 const RAMP_DURATION = __ENV.RAMP_DURATION || '8m';
 const WARM_RATE = parseInt(__ENV.WARM_RATE || '100', 10);
-const MAX_VUS = parseInt(__ENV.MAX_VUS || '1000', 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '400', 10);
 
 export const options = {
   discardResponseBodies: true,

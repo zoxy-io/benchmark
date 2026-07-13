@@ -14,7 +14,7 @@ SSH_USER=${SSH_USER:-ubuntu}
 REMOTE_DIR=${REMOTE_DIR:-bench}
 # .env provides defaults but must NOT clobber explicit overrides — the same
 # save/restore run-all.sh does (e.g. `PROXIES="zoxy haproxy" make cloud-bench`)
-KNOBS=(PROXIES MAX_RATE RAMP_DURATION WARM_RATE MAX_VUS REQ_PATH COOLDOWN PROXY_CPUS PROXY_MEM ZOXY_REF RELAY_BUFFERS_MAX)
+KNOBS=(PROXIES MAX_RATE RAMP_DURATION WARM_RATE MAX_VUS REQ_PATH COOLDOWN PROXY_CPUS PROXY_MEM ZOXY_REF ZOXY_OPTIMIZE RELAY_BUFFERS_MAX)
 for k in "${KNOBS[@]}"; do [[ -n ${!k+x} ]] && eval "_saved_$k=\${$k}"; done
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 for k in "${KNOBS[@]}"; do
