@@ -2,33 +2,40 @@
 // library LinearPacer (the CLI only does constant -rate). It offers a rate that
 // climbs 0 -> MAX_RATE over RAMP_SECONDS and, crucially, keeps offering at the
 // scheduled rate even when the target falls behind (true open loop, coordinated-
-// omission-safe), so a proxy's saturation shows as a latency/throughput knee
-// instead of the generator quietly throttling.
+// omission-safe), so a proxy's saturation shows as a sharp latency/throughput
+// knee instead of the generator quietly throttling.
 //
 // Output is a per-1s-window CSV whose offered-rate column is ANALYTIC
-// (offered = START + SLOPE*t), so the tipping point on the offered-load axis is
-// exact. report.py joins this with cAdvisor/node_exporter CPU from Prometheus.
+// (offered = start_rate + slope*t) — the source of record for report_vegeta.py.
+// It ALSO exports a Prometheus /metrics endpoint (gauges for the current window,
+// labeled proxy+testid) so the live Grafana dashboard has throughput/latency
+// while a ramp runs. The endpoint is up only for the lifetime of the process.
 //
 // Config via env:
 //   TARGET        full URL, e.g. http://10.10.0.34:8080/1k   (required)
 //   MAX_RATE      req/s at the end of the ramp                (default 200000)
 //   RAMP_SECONDS  ramp length                                 (default 120)
 //   START_RATE    req/s at t=0                                (default 200)
-//   CONNECTIONS   keep-alive pool size (MaxIdleConnsPerHost)  (default 20000)
-//   MAX_WORKERS   in-flight cap (open-loop guard, ~= max concurrency) (default 20000)
+//   CONNECTIONS   keep-alive pool (MaxIdleConnsPerHost)       (default 20000)
+//   MAX_WORKERS   in-flight cap (open-loop guard)             (default 20000)
 //   TIMEOUT_S     per-request response timeout, seconds       (default 5)
 //   OUT           CSV output path                             (default /results/ramp.csv)
-//   NAME          label for logs (proxy name)                 (default ramp)
+//   NAME          proxy label (logs + `proxy` metric label)   (default ramp)
+//   RUNID         `testid` metric label                       (default adhoc)
+//   METRICS_ADDR  Prometheus /metrics listen addr             (default :8090)
 package main
 
 import (
 	"bufio"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	vegeta "github.com/tsenart/vegeta/v12/lib"
 )
 
@@ -53,7 +60,7 @@ type window struct {
 	lat       []time.Duration // OK-request latencies for percentiles
 }
 
-func pct(sorted []time.Duration, p float64) float64 {
+func pctMs(sorted []time.Duration, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
 	}
@@ -78,6 +85,24 @@ func main() {
 	timeoutS := envi("TIMEOUT_S", 5)
 	outPath := env("OUT", "/results/ramp.csv")
 	name := env("NAME", "ramp")
+	runid := env("RUNID", "adhoc")
+	metricsAddr := env("METRICS_ADDR", ":8090")
+
+	// --- Prometheus /metrics (current-window gauges, proxy+testid labels) ------
+	labels := prometheus.Labels{"proxy": name, "testid": runid}
+	gOffered := prometheus.NewGauge(prometheus.GaugeOpts{Name: "vegeta_offered_rps", Help: "offered req/s (analytic ramp rate)", ConstLabels: labels})
+	gAchieved := prometheus.NewGauge(prometheus.GaugeOpts{Name: "vegeta_achieved_rps", Help: "successful req/s in the last window", ConstLabels: labels})
+	gErr := prometheus.NewGauge(prometheus.GaugeOpts{Name: "vegeta_errors_ratio", Help: "non-2xx / error ratio in the last window", ConstLabels: labels})
+	gLat := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "vegeta_latency_seconds", Help: "per-window latency percentile (seconds)", ConstLabels: labels}, []string{"quantile"})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(gOffered, gAchieved, gErr, gLat)
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			fmt.Fprintf(os.Stderr, "vegeta-ramp: metrics server: %v\n", err)
+		}
+	}()
 
 	slope := float64(maxRate-startRate) / float64(rampSecs) // hits/s per second
 	pacer := vegeta.LinearPacer{
@@ -93,18 +118,45 @@ func main() {
 		vegeta.Timeout(time.Duration(timeoutS)*time.Second),
 	)
 
-	fmt.Fprintf(os.Stderr, "vegeta-ramp[%s]: %s  0..%d rps over %ds (slope=%.0f/s), conns<=%d, maxWorkers=%d\n",
-		name, target, maxRate, rampSecs, slope, conns, maxWorkers)
+	fmt.Fprintf(os.Stderr, "vegeta-ramp[%s]: %s  0..%d rps over %ds (slope=%.0f/s), conns<=%d, maxWorkers=%d, metrics %s\n",
+		name, target, maxRate, rampSecs, slope, conns, maxWorkers, metricsAddr)
 
 	windows := map[int]*window{}
 	dur := time.Duration(rampSecs) * time.Second
 	start := time.Now()
-	lastLog := 0
+	lastSec := -1
+
+	// publish a completed window's stats to the live gauges (and log every 5s)
+	publish := func(sec int) {
+		w := windows[sec]
+		if w == nil {
+			return
+		}
+		sort.Slice(w.lat, func(i, j int) bool { return w.lat[i] < w.lat[j] })
+		offered := float64(startRate) + slope*float64(sec)
+		errRatio := float64(w.total-w.ok) / float64(max(w.total, 1))
+		gOffered.Set(offered)
+		gAchieved.Set(float64(w.ok))
+		gErr.Set(errRatio)
+		gLat.WithLabelValues("0.5").Set(pctMs(w.lat, 0.50) / 1000.0)
+		gLat.WithLabelValues("0.95").Set(pctMs(w.lat, 0.95) / 1000.0)
+		gLat.WithLabelValues("0.99").Set(pctMs(w.lat, 0.99) / 1000.0)
+		if sec%5 == 0 {
+			fmt.Fprintf(os.Stderr, "  t=%3ds offered=%7.0f achieved=%7d ok/s  p99=%6.1fms err=%4.1f%%\n",
+				sec, offered, w.ok, pctMs(w.lat, 0.99), 100*errRatio)
+		}
+	}
 
 	for res := range atk.Attack(targeter, pacer, dur, name) {
 		sec := int(res.Timestamp.Sub(start).Seconds())
 		if sec < 0 {
 			sec = 0
+		}
+		if sec > lastSec {
+			if lastSec >= 0 {
+				publish(lastSec) // the window that just closed
+			}
+			lastSec = sec
 		}
 		w := windows[sec]
 		if w == nil {
@@ -116,17 +168,6 @@ func main() {
 			w.ok++
 			w.bytesIn += res.BytesIn
 			w.lat = append(w.lat, res.Latency)
-		}
-		if sec >= lastLog+5 && sec > 0 {
-			lastLog = sec
-			offered := float64(startRate) + slope*float64(sec)
-			prev := windows[sec-1]
-			if prev != nil {
-				sort.Slice(prev.lat, func(i, j int) bool { return prev.lat[i] < prev.lat[j] })
-				fmt.Fprintf(os.Stderr, "  t=%3ds offered=%7.0f achieved=%7d ok/s  p99=%6.1fms err=%4.1f%%\n",
-					sec, offered, prev.ok, pct(prev.lat, 0.99),
-					100*float64(prev.total-prev.ok)/float64(max(prev.total, 1)))
-			}
 		}
 	}
 
@@ -145,15 +186,14 @@ func main() {
 	}
 	sort.Ints(secs)
 
-	peakAchieved, peakOffered := 0, 0.0
-	kneeOffered := 0.0 // first offered where achieved drops below 95% of offered
+	peakAchieved, peakOffered, kneeOffered := 0, 0.0, 0.0
 	for _, s := range secs {
 		w := windows[s]
 		sort.Slice(w.lat, func(i, j int) bool { return w.lat[i] < w.lat[j] })
 		offered := float64(startRate) + slope*float64(s)
 		errRatio := float64(w.total-w.ok) / float64(max(w.total, 1))
 		fmt.Fprintf(bw, "%d,%.0f,%d,%d,%d,%.4f,%.3f,%.3f,%d\n",
-			s, offered, w.total, w.ok, w.ok, errRatio, pct(w.lat, 0.50), pct(w.lat, 0.99), w.bytesIn)
+			s, offered, w.total, w.ok, w.ok, errRatio, pctMs(w.lat, 0.50), pctMs(w.lat, 0.99), w.bytesIn)
 		if w.ok > peakAchieved {
 			peakAchieved, peakOffered = w.ok, offered
 		}
