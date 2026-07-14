@@ -176,7 +176,8 @@ def build(meta, run_dir, prom):
     for p in sorted(present, key=lambda p: data[p]["sustained"], reverse=True):
         s = data[p]["sustained"]
         k = data[p]["knee"]
-        rows_html += (f"<tr><td>{html.escape(p)}</td><td>{fmt_si(s)}</td>"
+        cls = ' class="baseline"' if p == "direct" else ""
+        rows_html += (f"<tr{cls}><td>{html.escape(p)}</td><td>{fmt_si(s)}</td>"
                       f"<td>{fmt_si(k) if k else '—'}</td></tr>")
 
     legend = "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)

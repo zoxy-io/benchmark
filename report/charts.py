@@ -242,6 +242,8 @@ th:first-child,td:first-child { text-align:left }
 th { color:var(--amber); font-weight:500; font-size:.68rem; letter-spacing:.14em; text-transform:uppercase }
 tbody tr:hover td { background:rgba(233,239,250,.02) }
 td:first-child { color:var(--paper); font-weight:500 }
+/* direct = origin-calibration baseline, not a competitor — muted */
+tr.baseline td, tr.baseline td:first-child { color:var(--haze-dim); font-weight:400 }
 .flag { color:var(--alarm); font-size:12.5px }
 .ok { color:var(--nginx,#34d399) }
 .empty { color:var(--haze-dim) }
