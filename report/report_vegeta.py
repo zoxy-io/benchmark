@@ -102,25 +102,28 @@ def cpu_vs_offered(prom, proxy, run):
     """Proxy cores over the run, each sample mapped to the offered rate it was
     under: offered(t) = start_rate + slope*(ts - start).
 
-    If the run recorded `proxy_cpuset` (megabox mode — the proxy is pinned to and
-    the sole occupant of those cores), derive CPU from node_exporter's per-core
-    busy time on that cpuset. That's robust where cadvisor drops the container's
-    `name` label once it exits (and it also counts loopback softirq, which the
-    container metric misses). Otherwise use the cAdvisor container metric."""
+    PRIMARY = the cAdvisor CONTAINER metric — the proxy PROCESS's CPU, which is
+    what Grafana shows and the honest "proxy CPU" (it excludes the loopback
+    softirq that runs on the same cores). FALLBACK, only when cadvisor dropped
+    the container's `name` label (it does that once a container exits, so some
+    runs are missing it), = node_exporter per-core busy time on the recorded
+    `proxy_cpuset`; that reads a bit HIGH because it includes that softirq."""
     s, e = iso_to_epoch(run["start"]), iso_to_epoch(run["end"])
     slope = (run["max_rate"] - run["start_rate"]) / run["ramp_seconds"]
+
+    def series(q):
+        return [(run["start_rate"] + slope * (ts - s), cores)
+                for ts, cores in prom_query_range(prom, q, s, e)
+                if run["start_rate"] + slope * (ts - s) >= 0]
+
+    pts = series(f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[10s]))')
+    if pts:
+        return pts
     cpuset = run.get("proxy_cpuset")
     if cpuset:
         cpus = _expand_cpuset(cpuset)
-        q = (f'sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}"}}[10s])) '
-             f'- sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}",mode="idle"}}[10s]))')
-    else:
-        q = f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[10s]))'
-    pts = []
-    for ts, cores in prom_query_range(prom, q, s, e):
-        offered = run["start_rate"] + slope * (ts - s)
-        if offered >= 0:
-            pts.append((offered, cores))
+        pts = series(f'sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}"}}[10s])) '
+                     f'- sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}",mode="idle"}}[10s]))')
     return pts
 
 
