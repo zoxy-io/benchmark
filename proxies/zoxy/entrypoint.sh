@@ -47,13 +47,45 @@ pids=""
 term() { kill -TERM $pids 2>/dev/null || true; }
 trap term TERM INT
 
+# Pin one worker per core. A single event loop is latency-sensitive to being
+# migrated between cores or transiently sharing a core with another loop while a
+# third sits idle (that scheduler jitter, not SO_REUSEPORT imbalance, is what
+# left zoxy at ~1.5 of 2 cores). A fixed 1:1 loop→core assignment removes the
+# migration and keeps cache locality. We pin to the container's cpuSET (the
+# cores compose granted via `cpuset`), read from cgroup v2 (fallback: the
+# process affinity mask). If workers > cores we round-robin; if taskset is
+# missing we run unpinned. util-linux (taskset) is Essential in Debian.
+cpulist=$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null \
+          || awk '/Cpus_allowed_list/{print $2}' /proc/self/status 2>/dev/null)
+cpus=""                                   # expand "0-3,6" -> "0 1 2 3 6"
+oIFS=$IFS; IFS=','
+for part in $cpulist; do
+    case "$part" in
+        *-*) lo=${part%-*}; hi=${part#*-}; c=$lo
+             while [ "$c" -le "$hi" ]; do cpus="$cpus $c"; c=$((c + 1)); done ;;
+        ?*)  cpus="$cpus $part" ;;
+    esac
+done
+IFS=$oIFS
+set -- $cpus; ncpu=$#                      # positional params hold the cpu list
+have_taskset=false; command -v taskset >/dev/null 2>&1 && [ "$ncpu" -gt 0 ] && have_taskset=true
+
 i=1
 while [ "$i" -le "$workers" ]; do
-    /usr/local/bin/zoxy /etc/zoxy/config.json &
+    if $have_taskset; then
+        eval "cpu=\${$(( (i - 1) % ncpu + 1 ))}"   # round-robin over the cpuset
+        taskset -c "$cpu" /usr/local/bin/zoxy /etc/zoxy/config.json &
+    else
+        /usr/local/bin/zoxy /etc/zoxy/config.json &
+    fi
     pids="$pids $!"
     i=$((i + 1))
 done
-echo "zoxy-entrypoint: $workers workers on :8080 (SO_REUSEPORT), pids:$pids" >&2
+if $have_taskset; then
+    echo "zoxy-entrypoint: $workers workers on :8080 (SO_REUSEPORT), pinned to cpus:$cpus, pids:$pids" >&2
+else
+    echo "zoxy-entrypoint: $workers workers on :8080 (SO_REUSEPORT), UNPINNED (no taskset/cpuset), pids:$pids" >&2
+fi
 
 # dash's `wait` has no -n; poll for the first exit, then collapse the fleet.
 while true; do

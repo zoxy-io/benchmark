@@ -78,6 +78,10 @@ resource "yandex_compute_instance" "host" {
   zone        = var.zone
   labels      = { role = each.value.role }
 
+  # in-place stop→resize→start when cores/memory change, instead of destroy+
+  # recreate — preserves the external IP (no address-quota churn) and the disk.
+  allow_stopping_for_update = true
+
   resources {
     cores         = each.value.cores
     memory        = each.value.memory

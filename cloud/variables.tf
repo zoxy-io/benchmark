@@ -47,7 +47,9 @@ variable "disk_size" {
 # prometheus + grafana live there.
 variable "proxy_cores" {
   type    = number
-  default = 4
+  default = 8 # 8-core box so PROXY_CPUS=4 pins to cores 0-3 with 4-7 free for
+  # OS/monitoring/hypervisor-steal absorption (a saturated 4-core VM starved the
+  # single-loop proxies and inflated CPU steal — see multicore benchmark notes).
 }
 variable "proxy_memory" {
   type    = number
