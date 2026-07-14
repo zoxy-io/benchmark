@@ -50,8 +50,11 @@ def load_merged(run_dir, proxy, tags):
     for t in sorted(per):
         offered, total, ok, p50, p99 = per[t]
         err = (total - ok) / total if total else 0.0
+        # report.py's yfmt="ms" formatter expects the latency series in SECONDS
+        # (it scales x1000 for display, matching k6's second-valued series); the
+        # harness CSV is in ms, so convert ms -> s here.
         out.append({"t": t, "offered": offered, "achieved": ok,
-                    "err": err, "p50": p50, "p99": p99})
+                    "err": err, "p50": p50 / 1000.0, "p99": p99 / 1000.0})
     return out
 
 
