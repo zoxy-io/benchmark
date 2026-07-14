@@ -27,6 +27,7 @@ LG_PRIV=$(ip loadgen internal_ip)
 PROXY_PRIV=$(ip proxy internal_ip); BACKEND_PRIV=$(ip backend internal_ip)
 PROM="http://$LG:9090"; CPUSET="0-$((PROXY_CPUS - 1))"
 RESULTS="results/$RUNID"; mkdir -p "$RESULTS"
+ln -sfn "$RUNID" results/latest   # `make report` renders results/latest
 COMPOSE="docker compose -f compose.yaml -f compose.cloud.yaml"
 PENV="ZOXY_REF=$ZOXY_REF PROXY_CPUS=$PROXY_CPUS PROXY_CPUSET=$CPUSET BACKEND_IP=$BACKEND_PRIV"
 

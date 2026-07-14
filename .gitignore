@@ -16,6 +16,6 @@ devenv.local.nix
 # direnv
 .direnv
 
-# python bytecode (report/sweep.py imports report.py)
+# python bytecode (report_vegeta.py imports charts.py)
 __pycache__/
 *.pyc

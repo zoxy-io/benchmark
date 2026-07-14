@@ -1,4 +1,4 @@
-# scripts/cloud-run.sh consumes this: tofu -chdir=cloud output -json inventory
+# scripts/vegeta-bench.sh consumes this: tofu -chdir=cloud output -json inventory
 output "inventory" {
   value = {
     for name, inst in yandex_compute_instance.host : name => {

@@ -1,7 +1,7 @@
-# One Prometheus for the whole benchmark. k6 pushes its metrics in via
-# remote-write (the receiver is enabled in the compose command); cAdvisor and
-# node_exporter are scraped. Targets come from file_sd so local and cloud
-# differ only by the mounted targets directory (compose: PROM_TARGETS env).
+# One Prometheus for the whole benchmark. cAdvisor, node_exporter, and
+# vegeta-ramp's live /metrics are all scraped. Targets come from file_sd so
+# local and cloud differ only by the mounted targets directory (compose:
+# PROM_TARGETS env).
 global:
   scrape_interval: 5s
   scrape_timeout: 4s
@@ -16,7 +16,7 @@ scrape_configs:
       - files: ["/etc/prometheus/targets/node.yml"]
 
   # vegeta-ramp's live /metrics (up only while a ramp runs; "down" between
-  # proxies is expected). file_sd tolerates the file being absent for k6 runs.
+  # proxies is expected). file_sd tolerates the target file being absent.
   - job_name: vegeta
     file_sd_configs:
       - files: ["/etc/prometheus/targets/vegeta.yml"]

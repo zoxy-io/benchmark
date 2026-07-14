@@ -1,7 +1,7 @@
 # proxy-bench
 
 Compares **zoxy** against **HAProxy**, **Envoy**, **Traefik**, **nginx** and
-**Pingora**: every proxy gets the *identical* linearly-growing open-loop load
+**Pingora**: every proxy gets the *identical* linearly-growing **open-loop** load
 ramp until it stops keeping up, and the output is one HTML report overlaying
 **latency, CPU, memory and achieved req/s against offered load** — plus a live
 Grafana view while a run is in flight.
@@ -9,19 +9,20 @@ Grafana view while a run is in flight.
 zoxy's libxev build is **L4-only**, so every proxy runs as an **L4 TCP
 passthrough** (`mode tcp`, `tcp_proxy`, TCP router, nginx `stream`, and a small
 Rust binary on Cloudflare's Pingora framework) — the same job for everyone:
-relay bytes, parse nothing. k6 still speaks HTTP end-to-end; the origin nginx is
-the HTTP endpoint and the proxies are transparent tunnels, so the k6-side
-metrics (latency, achieved rate, errors) are unchanged.
+relay bytes, parse nothing. The generator still speaks HTTP end-to-end; the
+origin nginx is the HTTP endpoint and the proxies are transparent tunnels.
 
 ```
-            0 ──────── linear ramp ────────► MAX_RATE
-   k6  ─────────────► proxy-under-test ─────────────► nginx origin
- (open loop,          (1 cpu, 512 MiB,                (canned 64B..100k
-  arrival rate)        ONE at a time)                  bodies, 4x cpus)
-        │                     │ cAdvisor: cpu/mem per container
-        └── remote-write ──► Prometheus ◄── scrape ───┘
-                                │
-                     Grafana (live) + report.py (the artifact)
+             0 ──────── linear ramp ────────► MAX_RATE
+ vegeta-ramp ───────► proxy-under-test ───────────► nginx origin
+ (open loop,          (pinned cores, 512 MiB,       (canned 64B..100k
+  LinearPacer)         ONE at a time)                bodies, 8x cpus)
+      │                       │ cAdvisor: cpu/mem per container
+      ├── /metrics ──► Prometheus ◄── scrape ───────┘
+      │  (scraped)         │
+      └── per-1s CSV       └─► Grafana (live)
+             │
+             └─► report/report_vegeta.py  ── the artifact (report.html)
 ```
 
 ## The design in five sentences
@@ -29,103 +30,90 @@ metrics (latency, achieved rate, errors) are unchanged.
 **Containers are the deploy spec.** Each proxy is a compose service with a
 static config and the *same* enforced cpu/memory limits (service-level `cpus` /
 `mem_limit` — compose applies these without swarm); locally the whole stack is
-one compose project, in the cloud the very same `compose.yaml` runs across
-three VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset,
-peer IPs). **The measurement is one deterministic ramp** (k6
-`ramping-arrival-rate`, 0 → `MAX_RATE` over `RAMP_DURATION`) shared by every
-proxy, so elapsed time ≡ offered rate is the same mapping for every run and
-sequential runs overlay on a single x-axis. **Saturation is detected post-hoc**
-by `report.py` (2 consecutive 15s windows with achieved < 98% of offered,
-errors > 1%, or dropped iterations), not by aborting mid-run — the post-knee
-failure shape is data, not noise. **Runs are guarded**: open-loop arrivals are
-coordinated-omission-free, `MAX_VUS` caps connection storms, a `direct` pseudo
-proxy calibrates that the origin itself saturates above `MAX_RATE`, and the
-report flags any window where the loadgen/backend host ran out of CPU.
-**Local = correctness, cloud = numbers**: on macOS everything shares the Docker
-VM, so treat local results as a smoke test and quote the 3-VM cloud runs.
-
-## Run it locally
-
-Needs docker + docker compose v2, jq, python3.
-
-```sh
-cp .env.example .env       # knobs: MAX_RATE, RAMP_DURATION, PROXY_CPUS, PROXIES...
-make smoke                 # 2-min mini-ramp on haproxy+nginx — checks the plumbing
-make bench                 # the real thing: every proxy, identical ramp (~10 min each)
-make report                # -> results/<runid>/report.html
-open results/latest/report.html
-```
-
-Grafana live view: <http://localhost:3000> (dashboard "Proxy bench — live run").
-Run a subset with `make bench PROXIES="zoxy haproxy"`; add `direct` to PROXIES
-to run the origin-calibration ramp.
+one compose project, in the cloud the very same `compose.yaml` runs across three
+VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset, peer
+IPs). **The measurement is one deterministic open-loop ramp** —
+`loadgen/vegeta-ramp` (built on Vegeta's `LinearPacer`) offers `0 → MAX_RATE`
+over `RAMP_SECONDS`, and keeps offering at the scheduled rate even when the proxy
+falls behind (coordinated-omission safe), so the offered axis is analytic
+(`offered = start_rate + slope·t`) and the saturation knee is exact and sharp.
+**One loadgen is enough**: a single 16-core box saturates any proxy at ~25% CPU
+(it hits the proxy's concurrency-collapse wall long before its own limit), so
+there is no second loadgen and no VU/goroutine-heavy generator. **Runs are
+guarded**: `MAX_WORKERS` caps in-flight concurrency (the open-loop analogue of a
+VU pool — too high and past saturation it piles connections and collapses the
+path), and a `direct` pseudo-proxy calibrates that the origin itself saturates
+above the proxies. **Local = plumbing, cloud = numbers**: quote the 3-VM cloud
+runs.
 
 ## Run it in Yandex Cloud
 
 ```sh
 cd cloud && cp terraform.tfvars.example terraform.tfvars   # fill in creds
-make cloud-up              # 3 VMs: loadgen 16c / proxy 4c / backend 8c, core_fraction=100
-make cloud-bench           # rsync repo -> VMs, backend+monitoring up, ramp every proxy
-PROM_URL=http://<loadgen-ip>:9090 make report
+make cloud-up              # 3 VMs: loadgen 16c / proxy 8c / backend 8c, core_fraction=100
+make cloud-bench           # build vegeta-ramp, ramp every proxy, write CSVs + meta.json
+make report                # -> results/latest/report.html
 make cloud-down
 ```
 
-`cloud-bench` prints the Grafana URL. VMs run stock Ubuntu 24.04; cloud-init
-installs a **pinned** docker-ce so local and cloud execute the same compose
-implementation. Iterating never rebuilds an image — edit, rerun `cloud-bench`.
+`cloud-bench` (`scripts/vegeta-bench.sh`) reads the terraform inventory, ships
+the repo, brings up backend + monitoring, and for each proxy: brings it up,
+ramps it with `vegeta-ramp` on the loadgen, pulls the per-1s CSV, tears it down.
+Live Grafana: **http://\<loadgen-ip\>:3000** → "Proxy bench — live run (vegeta
+open-loop)". Run a subset with `make cloud-bench PROXIES="direct zoxy haproxy"`.
+
+Local `make up` / `make down` start/stop backend + prometheus + grafana for
+poking at the stack; the load driver itself is cloud-only.
 
 ## Fairness rules (what makes the numbers comparable)
 
-- **Same job for every proxy**: all six are L4 TCP passthroughs — HAProxy
+- **Same job for every proxy**: all are L4 TCP passthroughs — HAProxy
   `mode tcp`, Envoy `tcp_proxy`, Traefik TCP router, nginx `stream` (the
-  official image ships the stream module compiled in — no custom build),
-  Pingora (a ~60-line Rust binary on Cloudflare's framework — `proxies/pingora`,
-  since Pingora is a library, not a ready-made proxy), zoxy natively. Nobody
-  pays for HTTP parsing that others skip.
+  official image ships the stream module — no custom build), Pingora (a ~60-line
+  Rust binary on Cloudflare's framework — `proxies/pingora`), zoxy natively.
+  Nobody pays for HTTP parsing that others skip.
 - **Same box for every proxy**: `PROXY_CPUS` / `PROXY_MEM` enforced by cgroups,
-  identical per proxy; thread counts are set *explicitly* to match
-  (`nbthread`, `--concurrency`, `GOMAXPROCS`) — container runtimes lie to
-  autodetection. **`PROXY_CPUS` defaults to 1**: zoxy (libxev) is
-  single-threaded by design with no thread knob, so a one-core box is the
-  per-core-fair comparison. Raising `PROXY_CPUS` turns the run into a
-  multi-core scaling probe where zoxy keeps one event loop on one core — a
-  property of the contender that shows up honestly in the CPU panel.
-- **Same ramp for every proxy**: never compare runs with different `MAX_RATE`
-  or `RAMP_DURATION` — the shared x-axis depends on it. Recorded per run in
-  `results/<runid>/runs.json` together with image versions.
-- **zoxy runs io_uring**: Docker's default seccomp profile has denied
-  `io_uring_*` since engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the
-  default profile *plus* those three syscalls — not `unconfined`, so zoxy keeps
-  the same syscall-filter overhead as everyone else. If io_uring init fails,
-  zoxy exits at startup and the driver fails the run loudly. (The libxev
-  rewrite dropped the vendored OpenSSL, so zoxy also builds and runs on ARM
-  hosts natively now — io_uring just can't be *emulated*.)
-- **zoxy does no DNS**: config endpoints must be IP literals, structurally.
-  The container entrypoint resolves the `backend` hostname once at start
-  (compose DNS locally, `extra_hosts` in cloud) and renders the literal into
-  the config — which also kills the parse-time DNS startup race the old
-  driver had to retry around.
-- **zoxy holds one relay buffer per open tunnel, pool = 1024, compile-time**:
-  connections beyond it get an immediate close. Every k6 VU holds a keep-alive
-  connection — a held tunnel — for the VU's lifetime, so the VU pool itself
-  must fit: warmup (200) + `MAX_VUS` (800) ≤ 1000 < 1024. With a larger pool
-  zoxy drowns in shed-EOFs at *any* offered rate (measured: ~40% failures at
-  500 req/s with the old `MAX_VUS=2000`) — a loadgen artifact, not saturation.
-  Do not raise `MAX_VUS` above 800 while zoxy is a contender.
-- **Origin headroom**: backend gets several times the proxy's cores; run `direct` once per
-  environment to prove the origin saturates above `MAX_RATE`.
+  identical per proxy; thread counts set *explicitly* to match (`nbthread`,
+  `--concurrency`, `GOMAXPROCS`, `worker_processes`, pingora `threads`).
+  **zoxy has no thread knob** — one event loop per process — so to spend a
+  multi-core box it runs `PROXY_CPUS` worker processes sharing `:8080` via
+  `SO_REUSEPORT`, each `taskset`-pinned to its own core (`ZOXY_WORKERS`). The
+  proxy VM is 8 cores so `PROXY_CPUS=4` pins to cores `0–3` with `4–7` free for
+  the OS/monitoring (a saturated all-cores box starved the single-loop proxies).
+- **Same ramp for every proxy**: never compare runs with different `MAX_RATE`,
+  `RAMP_SECONDS` or `MAX_WORKERS` — the shared offered axis depends on it.
+  Recorded per run in `results/<runid>/meta.json`.
+- **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
+  engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
+  those three syscalls — not `unconfined`. If io_uring init fails zoxy exits at
+  startup and the driver fails the run loudly. (The libxev rewrite dropped the
+  vendored OpenSSL, so zoxy builds and runs on ARM natively — io_uring just
+  can't be *emulated*.)
+- **zoxy does no DNS**: endpoints must be IP literals. The entrypoint resolves
+  `backend` once at start (compose DNS locally, `extra_hosts` in cloud) and
+  renders the literal into the config.
+- **zoxy holds one relay buffer per open tunnel, pool = 1024 per process,
+  compile-time**: connections beyond it get an immediate close. With N worker
+  processes the cap is N×1024, so keep `MAX_WORKERS` under it. Past a proxy's
+  sweet-spot concurrency (~2000 connections) *every* proxy congestion-collapses
+  — throughput falls as latency climbs — so `MAX_WORKERS` is set at the plateau,
+  not maxed.
+- **Pin the zoxy build**: the Dockerfile caches its `git clone`, so `ZOXY_REF=main`
+  can silently be a stale commit. Pin a SHA for anything version-sensitive.
+- **Origin headroom**: backend gets several times the proxy's cores; `direct`
+  (in `PROXIES`) proves the origin saturates well above the proxies.
 
 ## Layout
 
 ```
-compose.yaml           every service, proxies behind profiles, limits enforced
-compose.cloud.yaml     host networking + cpuset + peer-IP overlay
-proxies/<p>/           one static config per proxy (upstream is always `backend`)
-backend/               nginx origin, canned bodies generated at start
-k6/ramp.js             warmup + the single linear ramp (open loop)
-scripts/run-all.sh     the driver: up -> probe -> ramp -> down -> cooldown
-scripts/cloud-run.sh   terraform IPs -> rsync -> remote compose -> run-all.sh
-monitoring/            prometheus (+file_sd targets), grafana provisioning
-report/report.py       prometheus -> saturation knees -> self-contained report.html
-cloud/                 terraform: VPC + 3 VMs + pinned-docker cloud-init
+compose.yaml              every service, proxies behind profiles, limits enforced
+compose.cloud.yaml        host networking + cpuset + peer-IP overlay
+proxies/<p>/              one static config per proxy (upstream is always `backend`)
+backend/                  nginx origin, canned bodies generated at start
+loadgen/vegeta-ramp/      open-loop linear-ramp generator (Vegeta LinearPacer) + /metrics
+scripts/vegeta-bench.sh   the driver: build -> per-proxy up/probe/ramp/CSV/down
+monitoring/               prometheus (+file_sd targets), grafana (2 dashboards)
+report/charts.py          shared inline-SVG chart engine + prometheus helpers
+report/report_vegeta.py   CSVs + meta.json + prometheus CPU -> self-contained report.html
+cloud/                    terraform: VPC + 3 VMs + pinned-docker cloud-init
 ```

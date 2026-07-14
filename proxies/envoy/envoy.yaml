@@ -30,7 +30,7 @@ static_resources:
       # connections; tcp_proxy is 1:1 downstream:upstream, so past 1024 VUs the
       # excess connections get no upstream and fail (reset/EOF) while served
       # ones still return 200 — ~1 in 5 failing at the benchmark's VU pool.
-      # Raise every threshold well above MAX_VUS (parity with haproxy maxconn).
+      # Raise every threshold well above MAX_WORKERS (parity with haproxy maxconn).
       circuit_breakers:
         thresholds:
           - priority: DEFAULT

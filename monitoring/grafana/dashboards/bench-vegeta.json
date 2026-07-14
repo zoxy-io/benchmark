@@ -70,7 +70,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Latency (k6 trend stats)",
+      "title": "Latency (p50 / p95 / p99)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -247,7 +247,7 @@
         "hide": false,
         "iconColor": "semi-dark-orange",
         "name": "Proxy pass",
-        "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\"}[1m])) by (proxy)",
+        "expr": "sum(vegeta_achieved_rps{testid=~\"$testid\"}) by (proxy)",
         "step": "15s",
         "tagKeys": "proxy",
         "titleFormat": "{{proxy}}",

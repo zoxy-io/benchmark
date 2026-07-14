@@ -1,18 +1,13 @@
-# proxy-bench v2 — one linear ramp per proxy, local or Yandex Cloud.
+# proxy-bench — one open-loop linear ramp per proxy on Yandex Cloud.
 #
-#   make up          local: start backend + prometheus + grafana (grafana :3000)
-#   make bench       local: full run — every proxy through the identical ramp
-#   make smoke       local: 2-minute mini-ramp on haproxy+nginx (plumbing check)
-#   make report      render results/latest -> report.html (set PROM_URL for cloud)
-#   make down        local: stop everything
-#   make cloud-up    terraform apply the fleet
-#   make cloud-bench rsync + run the full ramp on the fleet
-#   make cloud-sweep rsync + run the closed-loop concurrency sweep on the fleet
-#   make sweep       local: closed-loop throughput-vs-concurrency sweep
+#   make cloud-up    terraform apply the fleet (loadgen + proxy + backend)
+#   make cloud-bench build + ramp every proxy (vegeta-ramp); writes CSVs + report
+#   make report      render results/latest -> report.html
 #   make cloud-down  terraform destroy
+#   make up / down   local: start/stop backend + prometheus + grafana
 #
-# Knobs live in .env (copy .env.example); PROXIES/MAX_RATE/RAMP_DURATION can be
-# overridden per-invocation: make bench PROXIES="zoxy haproxy"
+# Knobs live in .env (copy .env.example); PROXIES / MAX_RATE / RAMP_SECONDS /
+# MAX_WORKERS / PROXY_CPUS override per-invocation: make cloud-bench PROXIES=zoxy
 
 SHELL := bash
 .ONESHELL:
@@ -20,29 +15,14 @@ SHELL := bash
 
 TF ?= tofu
 
-.PHONY: help up bench smoke sweep report sweep-report down cloud-up cloud-bench cloud-sweep cloud-down clean
+.PHONY: help up down report cloud-up cloud-bench cloud-down clean
 
 help:
-	@sed -n '3,12p' $(MAKEFILE_LIST)
+	@sed -n '3,8p' $(MAKEFILE_LIST)
 
 up:
 	docker compose --profile monitoring --profile backend up -d --wait
 	@echo "grafana: http://localhost:3000  prometheus: http://localhost:9090"
-
-bench: up
-	./scripts/run-all.sh
-
-smoke: up
-	MAX_RATE=2000 RAMP_DURATION=2m COOLDOWN=5 PROXIES="$${PROXIES:-haproxy nginx}" ./scripts/run-all.sh
-
-sweep: up
-	./scripts/sweep.sh
-
-report:
-	python3 report/report.py results/latest
-
-sweep-report:
-	python3 report/sweep.py results/latest
 
 down:
 	docker compose --profile '*' down
@@ -52,10 +32,11 @@ cloud-up:
 	$(TF) -chdir=cloud apply -auto-approve
 
 cloud-bench:
-	./scripts/cloud-run.sh
+	./scripts/vegeta-bench.sh
 
-cloud-sweep:
-	DRIVER=sweep.sh ./scripts/cloud-run.sh
+# uses the prometheus URL recorded in the run's meta.json (override: PROM_URL=...)
+report:
+	python3 report/report_vegeta.py results/latest
 
 cloud-down:
 	$(TF) -chdir=cloud destroy -auto-approve

@@ -5,7 +5,7 @@ datasources:
     type: prometheus
     access: proxy
     # local: docker DNS resolves `prometheus`. cloud: grafana is host-networked
-    # on the loadgen VM (no docker DNS) — cloud-run.sh injects PROM_URL with the
+    # on the loadgen VM (no docker DNS) — vegeta-bench.sh injects PROM_URL with the
     # loadgen address. compose defaults PROM_URL to the local name below.
     url: ${PROM_URL}
     isDefault: true

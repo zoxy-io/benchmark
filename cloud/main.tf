@@ -1,7 +1,7 @@
 # Three stock Ubuntu 24.04 hosts, one zone, one subnet. No custom images:
 # cloud-init installs a PINNED docker-ce + compose plugin (so local and cloud
 # run the same compose implementation) and applies the sysctl tuning. The
-# benchmark itself is rsynced and driven by scripts/cloud-run.sh — editing a
+# benchmark itself is rsynced and driven by scripts/vegeta-bench.sh — editing a
 # config never means rebuilding an image.
 
 resource "yandex_vpc_network" "bench" {
@@ -33,7 +33,7 @@ resource "yandex_vpc_security_group" "bench" {
   }
   ingress {
     protocol       = "TCP"
-    description    = "prometheus (loadgen host; report.py queries it)"
+    description    = "prometheus (loadgen host; report_vegeta.py queries it)"
     v4_cidr_blocks = [var.allowed_cidr]
     port           = 9090
   }

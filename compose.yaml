@@ -4,7 +4,8 @@
 #   monitoring  prometheus + grafana            (local: always; cloud: loadgen VM)
 #   backend     nginx origin                    (local: always; cloud: backend VM)
 #   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|nginx|pingora)
-#   loadgen     the k6 service, started only via `docker compose run k6`
+# The load generator is not a compose service: loadgen/vegeta-ramp runs on the
+# loadgen host, driven by scripts/vegeta-bench.sh.
 # cadvisor + node_exporter carry every profile so each docker host exports
 # per-container CPU/mem and host metrics no matter which role it plays.
 #
@@ -14,10 +15,10 @@
 # needed); they are the fairness mechanism that replaces v1's "identical VMs".
 
 # Every proxy gets the same box. PROXY_CPUS must match the thread knobs below
-# (nbthread / --concurrency / GOMAXPROCS) — we do NOT trust cgroup
-# autodetection. Default is 1: zoxy (libxev) is single-threaded by design
-# with no thread knob, so one core each makes the face-off per-core fair;
-# with PROXY_CPUS>1 zoxy still runs one event loop on one core.
+# (nbthread / --concurrency / GOMAXPROCS / worker_processes / threads) — we do
+# NOT trust cgroup autodetection. zoxy has no thread knob, so it runs PROXY_CPUS
+# worker processes sharing :8080 via SO_REUSEPORT, each pinned to a core
+# (ZOXY_WORKERS below) — thread parity with the rest.
 x-proxy-common: &proxy-common
   cpus: ${PROXY_CPUS:-1}
   mem_limit: ${PROXY_MEM:-512m}
@@ -60,7 +61,7 @@ services:
   # ------------------------------------------------------- proxies under test --
   # All six: listen :8080, L4 TCP passthrough (zoxy's libxev build is
   # L4-only, so EVERY proxy relays bytes — nobody parses HTTP), upstream =
-  # backend:9000, no access logs. k6 still speaks h1 end-to-end; the backend
+  # backend:9000, no access logs. the generator speaks h1 end-to-end; the backend
   # nginx is the HTTP endpoint (an nginx proxy relays it at L4, same as the
   # rest). container_name == service name == the `name` label cAdvisor
   # exports, which is how the report joins CPU/mem to a proxy.
@@ -96,7 +97,7 @@ services:
     # Concurrency is hard-capped at relay_buffers_max PER PROCESS (constants.zig;
     # 1024 on current main), one held per open tunnel for its LIFETIME — past it
     # zoxy sheds tunnels with a client EOF. N workers => N x that cap total; the
-    # ramp's MAX_VUS stays well under it. Every other proxy has no such cap.
+    # ramp's MAX_WORKERS stays well under it. Every other proxy has no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
     # resolves `backend` (env below) once at start and renders the template.
     environment:
@@ -188,11 +189,10 @@ services:
     profiles: [monitoring]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-      - --web.enable-remote-write-receiver # k6 pushes its metrics here
       - --storage.tsdb.retention.time=30d
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # local/ ships in-repo; cloud-run.sh generates cloud/ from terraform IPs
+      # local/ ships in-repo; vegeta-bench.sh generates cloud/ from terraform IPs
       - ./monitoring/targets/${PROM_TARGETS:-local}:/etc/prometheus/targets:ro
       - prom-data:/prometheus
     ports:
@@ -207,7 +207,7 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       # datasource url (see provisioning/datasources/prometheus.yml); local
-      # default here, cloud-run.sh overrides via .env with the loadgen address.
+      # default here, vegeta-bench.sh overrides via .env with the loadgen address.
       PROM_URL: ${PROM_URL:-http://prometheus:9090}
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -249,26 +249,10 @@ services:
     ports:
       - "9100:9100"
 
-  # ----------------------------------------------------------------- loadgen --
-  # Run-once, never `up`ed:  docker compose run --rm k6  (driven by run-all.sh)
-  k6:
-    image: grafana/k6:1.0.0
-    container_name: k6
-    profiles: [loadgen]
-    user: "0" # the image's k6 user can't write summaries into the bind mount
-    environment:
-      K6_PROMETHEUS_RW_SERVER_URL: ${K6_PROMETHEUS_RW_SERVER_URL:-http://prometheus:9090/api/v1/write}
-      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),max
-      MAX_RATE: ${MAX_RATE:-20000}
-      RAMP_DURATION: ${RAMP_DURATION:-8m}
-      WARM_RATE: ${WARM_RATE:-100}
-      # sweet-spot concurrency from the sweep (proxies peak at ~100-200 conns);
-      # 400 reaches each peak without the high-concurrency collapse. see ramp.js
-      MAX_VUS: ${MAX_VUS:-400}
-      REQ_PATH: ${REQ_PATH:-/1k}
-    volumes:
-      - ./k6:/scripts:ro
-      - ./results:/results
+  # The load generator is loadgen/vegeta-ramp (an open-loop linear-ramp built on
+  # Vegeta), run on the loadgen host by scripts/vegeta-bench.sh — not a compose
+  # service. It exports a live /metrics endpoint scraped by the `vegeta` job in
+  # prometheus.yml; results land as per-proxy CSVs for report/report_vegeta.py.
 
 volumes:
   prom-data:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Render a report from vegeta-ramp CSVs (loadgen/vegeta-ramp) — the open-loop
-linear-ramp analogue of report.py.
+"""Render the benchmark report from vegeta-ramp CSVs (loadgen/vegeta-ramp).
 
-Unlike report.py (which reads k6 series from Prometheus), the throughput/latency
-here come straight from the harness's per-1s-window CSV, whose offered-rate axis
-is ANALYTIC (offered = start_rate + slope*t). Proxy CPU is still joined from
+Throughput/latency come straight from the harness's per-1s-window CSV, whose
+offered-rate axis is ANALYTIC (offered = start_rate + slope*t). Proxy CPU is
+joined from
 Prometheus (cAdvisor) by mapping each sample's wall-clock time -> elapsed ->
 offered, so every curve shares one exact offered-load x-axis.
 
@@ -23,7 +22,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report import (  # noqa: E402
+from charts import (  # noqa: E402
     PALETTE, PROXY_ORDER, CSS, JS, chart_card, prom_query_range,
     iso_to_epoch, fmt_si,
 )
@@ -50,9 +49,8 @@ def load_merged(run_dir, proxy, tags):
     for t in sorted(per):
         offered, total, ok, p50, p99 = per[t]
         err = (total - ok) / total if total else 0.0
-        # report.py's yfmt="ms" formatter expects the latency series in SECONDS
-        # (it scales x1000 for display, matching k6's second-valued series); the
-        # harness CSV is in ms, so convert ms -> s here.
+        # charts.py's yfmt="ms" formatter expects the latency series in SECONDS
+        # (it scales x1000 for display); the harness CSV is in ms, so convert here.
         out.append({"t": t, "offered": offered, "achieved": ok,
                     "err": err, "p50": p50 / 1000.0, "p99": p99 / 1000.0})
     return out
