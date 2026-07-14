@@ -53,7 +53,7 @@ sshm "cd $REMOTE/monitoring/targets/cloud && for pr in cadvisor:8081 node:9100 v
 sshm "cd $REMOTE && $PENV $COMPOSE --profile monitoring --profile backend up -d --wait" >/dev/null 2>&1
 sshm "docker update --cpuset-cpus=$B_SET backend" >/dev/null 2>&1
 
-record() { python3 -c "import json,sys; m=json.load(open('$META')); m['runs']['$1']={'start':'$2','end':'$3','max_rate':$MAX_RATE,'ramp_seconds':$RAMP_SECONDS,'start_rate':200,'loadgens':['lg1']}; json.dump(m,open('$META','w'),indent=2)"; }
+record() { python3 -c "import json,sys; m=json.load(open('$META')); m['runs']['$1']={'start':'$2','end':'$3','max_rate':$MAX_RATE,'ramp_seconds':$RAMP_SECONDS,'start_rate':200,'loadgens':['lg1'],'proxy_cpuset':'$P_SET'}; json.dump(m,open('$META','w'),indent=2)"; }
 
 for p in $PROXIES; do
     echo ">>> [$p] starting"

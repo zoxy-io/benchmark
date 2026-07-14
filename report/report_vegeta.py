@@ -65,12 +65,36 @@ def knee(rows):
     return None
 
 
+def _expand_cpuset(cpuset):
+    """"0-3,6" -> "0|1|2|3|6" for a prometheus cpu=~ regex."""
+    out = []
+    for part in cpuset.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out += [str(i) for i in range(int(a), int(b) + 1)]
+        elif part:
+            out.append(part)
+    return "|".join(out)
+
+
 def cpu_vs_offered(prom, proxy, run):
-    """Proxy container cores over the run, each sample mapped to the offered
-    rate it was under: offered(t) = start_rate + slope*(ts - start)."""
+    """Proxy cores over the run, each sample mapped to the offered rate it was
+    under: offered(t) = start_rate + slope*(ts - start).
+
+    If the run recorded `proxy_cpuset` (megabox mode — the proxy is pinned to and
+    the sole occupant of those cores), derive CPU from node_exporter's per-core
+    busy time on that cpuset. That's robust where cadvisor drops the container's
+    `name` label once it exits (and it also counts loopback softirq, which the
+    container metric misses). Otherwise use the cAdvisor container metric."""
     s, e = iso_to_epoch(run["start"]), iso_to_epoch(run["end"])
     slope = (run["max_rate"] - run["start_rate"]) / run["ramp_seconds"]
-    q = f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[10s]))'
+    cpuset = run.get("proxy_cpuset")
+    if cpuset:
+        cpus = _expand_cpuset(cpuset)
+        q = (f'sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}"}}[10s])) '
+             f'- sum(rate(node_cpu_seconds_total{{cpu=~"{cpus}",mode="idle"}}[10s]))')
+    else:
+        q = f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[10s]))'
     pts = []
     for ts, cores in prom_query_range(prom, q, s, e):
         offered = run["start_rate"] + slope * (ts - s)
