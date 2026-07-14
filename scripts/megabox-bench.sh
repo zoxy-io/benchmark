@@ -68,6 +68,10 @@ for p in $PROXIES; do
             sshm "cd $REMOTE && $COMPOSE --profile $p rm -sf $p" >/dev/null 2>&1   # ALWAYS clean up (else it blocks :8080 for the next)
             continue
         fi
+        # verify the kernel cpuset cap — no proxy may use more than PROXY_CPUS cores
+        cset=$(sshm "docker inspect -f '{{.HostConfig.CpusetCpus}}' $p" 2>/dev/null)
+        if [ "$cset" = "$P_SET" ]; then echo "  [$p] cpuset=$cset ✓ capped"
+        else echo "  [$p] !!! cpuset='$cset' EXPECTED '$P_SET' — NOT capped, results unfair"; fi
     fi
     start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     echo ">>> [$p] ramping ${RAMP_SECONDS}s to $MAX_RATE"
