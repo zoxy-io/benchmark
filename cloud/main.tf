@@ -58,14 +58,14 @@ data "yandex_compute_image" "ubuntu" {
 }
 
 locals {
-  # Two loadgens (loadgen = primary, hosts prometheus/grafana; loadgen2 = extra
-  # k6 only) so aggregate k6 CPU exceeds a single 16-core box's ~82k wall. Both
-  # carry role="loadgen" so the report's host-CPU validity check sees both.
+  # One loadgen: the open-loop vegeta-ramp generator saturates any proxy from a
+  # single 16-core box at ~25% CPU (it hits the proxy's concurrency-collapse wall
+  # long before its own limit), so a second loadgen added no reach and actually
+  # pushed the proxy into collapse. loadgen also hosts prometheus/grafana.
   hosts = {
-    loadgen  = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
-    loadgen2 = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
-    proxy    = { cores = var.proxy_cores, memory = var.proxy_memory, role = "proxy" }
-    backend  = { cores = var.backend_cores, memory = var.backend_memory, role = "backend" }
+    loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
+    proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, role = "proxy" }
+    backend = { cores = var.backend_cores, memory = var.backend_memory, role = "backend" }
   }
 }
 
