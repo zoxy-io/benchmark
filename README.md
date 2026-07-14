@@ -65,6 +65,30 @@ open-loop)". Run a subset with `make cloud-bench PROXIES="direct zoxy haproxy"`.
 Local `make up` / `make down` start/stop backend + prometheus + grafana for
 poking at the stack; the load driver itself is cloud-only.
 
+## Raw proxy capacity (megabox mode)
+
+The 3-VM fleet's throughput includes the **virtualized cross-VM network tax**:
+every packet between VMs crosses virtio → Yandex SDN → virtio, and at high
+request rates that's roughly *half* the ceiling — the proxy is rarely the wall
+in the cloud. To measure a proxy's **raw relay capacity, network excluded**, run
+everything on ONE big VM over loopback (the kernel routes to the host's own IP
+via `lo` — no NIC/SDN), each role pinned to a disjoint cpuset:
+
+```sh
+make megabox-up            # ONE 32-core VM (tofu -var megabox=true)
+make megabox-bench         # co-located: proxy 0-3 | backend | vegeta, over loopback
+make report
+make cloud-down            # destroys the megabox
+```
+
+`megabox-bench` (`scripts/megabox-bench.sh`) computes the cpuset layout from the
+box's core count and drives the same `vegeta-ramp`; knobs match `cloud-bench`
+(`PROXY_CPUS`, `MAX_RATE`, `MAX_WORKERS`, `BACKEND_CPUS`). Measured: proxies do
+~2× their 3-VM number this way, and every L4 proxy is **I/O-bound, not
+CPU-bound** — it leaves cores idle and doesn't scale past ~2-4 cores even with
+the network removed; the wall is per-request I/O latency under concurrency, so
+efficiency (req/s per core) is the real differentiator, not peak throughput.
+
 ## Fairness rules (what makes the numbers comparable)
 
 - **Same job for every proxy**: all are L4 TCP passthroughs — HAProxy

@@ -5,6 +5,8 @@
 #   make report      render results/latest -> report.html
 #   make cloud-down  terraform destroy
 #   make up / down   local: start/stop backend + prometheus + grafana
+#   make megabox-up  ONE big VM (loadgen+proxy+backend co-located over loopback)
+#   make megabox-bench   raw proxy capacity, virtualized network EXCLUDED
 #
 # Knobs live in .env (copy .env.example); PROXIES / MAX_RATE / RAMP_SECONDS /
 # MAX_WORKERS / PROXY_CPUS override per-invocation: make cloud-bench PROXIES=zoxy
@@ -15,7 +17,7 @@ SHELL := bash
 
 TF ?= tofu
 
-.PHONY: help up down report cloud-up cloud-bench cloud-down clean
+.PHONY: help up down report cloud-up cloud-bench cloud-down clean megabox-up megabox-bench
 
 help:
 	@sed -n '3,8p' $(MAKEFILE_LIST)
@@ -40,6 +42,14 @@ report:
 
 cloud-down:
 	$(TF) -chdir=cloud destroy -auto-approve
+
+# single big VM: loadgen+proxy+backend co-located over loopback (network excluded)
+megabox-up:
+	$(TF) -chdir=cloud init -input=false
+	$(TF) -chdir=cloud apply -auto-approve -var megabox=true
+
+megabox-bench:
+	./scripts/megabox-bench.sh
 
 clean:
 	rm -rf results/* .env.cloud monitoring/targets/cloud

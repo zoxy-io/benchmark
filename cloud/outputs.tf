@@ -9,5 +9,6 @@ output "inventory" {
 }
 
 output "grafana_url" {
-  value = "http://${yandex_compute_instance.host["loadgen"].network_interface[0].nat_ip_address}:3000"
+  # monitoring lives on the loadgen (fleet) or the megabox (single-VM mode)
+  value = "http://${try(yandex_compute_instance.host["loadgen"].network_interface[0].nat_ip_address, yandex_compute_instance.host["megabox"].network_interface[0].nat_ip_address)}:3000"
 }

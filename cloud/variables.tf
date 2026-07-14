@@ -71,3 +71,22 @@ variable "loadgen_memory" {
   type    = number
   default = 16
 }
+
+# Megabox mode: ONE big VM running loadgen+proxy+backend co-located over
+# loopback (kernel routes traffic to the host's own IP via `lo` — no NIC/SDN),
+# each role pinned to a disjoint cpuset. This measures a proxy's RAW relay
+# capacity with the virtualized cross-VM network excluded (the 3-VM fleet's
+# throughput is ~half raw because of the Yandex SDN per-packet tax). Enable with
+# `-var megabox=true` (make megabox-up); driven by scripts/megabox-bench.sh.
+variable "megabox" {
+  type    = bool
+  default = false
+}
+variable "megabox_cores" {
+  type    = number
+  default = 32
+}
+variable "megabox_memory" {
+  type    = number
+  default = 32
+}
