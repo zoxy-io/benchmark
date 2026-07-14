@@ -56,13 +56,34 @@ def load_merged(run_dir, proxy, tags):
     return out
 
 
+KEEPUP = 0.90  # "keeping up" = achieved >= KEEPUP * offered
+
+
 def knee(rows):
-    """First offered where achieved drops below 95% of offered (the tipping
-    point), ignoring the first few noisy warmup seconds."""
-    for r in rows:
-        if r["t"] >= 3 and r["achieved"] < 0.95 * r["offered"] and r["offered"] > 0:
-            return r["offered"]
+    """Offered rate at the tipping point: the first window (after warmup) where
+    the proxy stops keeping up (achieved < KEEPUP*offered) AND stays below for
+    the next window too — so a single transient dip doesn't trip it. This is the
+    x-axis marker; the headline number is `sustained()`."""
+    good = [r for r in rows if r["t"] >= 3 and r["offered"] > 0]
+    for i, r in enumerate(good):
+        if r["achieved"] < KEEPUP * r["offered"]:
+            nxt = good[i + 1] if i + 1 < len(good) else r
+            if nxt["achieved"] < KEEPUP * nxt["offered"]:
+                return r["offered"]
     return None
+
+
+def sustained(rows):
+    """Max SUSTAINABLE throughput: the highest achieved rate while the proxy is
+    still delivering >= KEEPUP of what's offered. This is the real "how fast can
+    it go" number — it excludes both the pre-knee ramp (achieved==offered, not a
+    limit) and the post-knee thrash (bursts of high achieved while badly behind
+    offered, which the old max-achieved 'peak' wrongly caught)."""
+    best = 0
+    for r in rows:
+        if r["t"] >= 3 and r["offered"] > 0 and r["achieved"] >= KEEPUP * r["offered"]:
+            best = max(best, r["achieved"])
+    return best
 
 
 def _expand_cpuset(cpuset):
@@ -109,7 +130,7 @@ def build(meta, run_dir, prom):
     data = {}
     for p in present:
         rows = load_merged(run_dir, p, runs[p].get("loadgens", ["lg1"]))
-        data[p] = {"rows": rows, "knee": knee(rows)}
+        data[p] = {"rows": rows, "knee": knee(rows), "sustained": sustained(rows)}
 
     def line(key):
         out = []
@@ -150,10 +171,9 @@ def build(meta, run_dir, prom):
     # summary table
     rows_html = ""
     for p in present:
-        rows = data[p]["rows"]
-        peak = max((r["achieved"] for r in rows), default=0)
+        s = data[p]["sustained"]
         k = data[p]["knee"]
-        rows_html += (f"<tr><td>{html.escape(p)}</td><td>{fmt_si(peak)}</td>"
+        rows_html += (f"<tr><td>{html.escape(p)}</td><td>{fmt_si(s)}</td>"
                       f"<td>{fmt_si(k) if k else '—'}</td></tr>")
 
     legend = "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)
@@ -164,7 +184,7 @@ def build(meta, run_dir, prom):
 <p class="meta">open-loop linear ramp (Vegeta LinearPacer) · throughput/latency from the harness CSV,
 CPU from Prometheus on a shared analytic offered-load axis</p>
 <div class="legend">{legend}</div>
-<div class="tablewrap"><table><tr><th>proxy</th><th>peak achieved</th><th>knee (tipping point)</th></tr>
+<div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th><th>knee @ offered</th></tr>
 {rows_html}</table></div>
 <div class="grid2">{''.join(cards)}</div>
 <script>{JS}</script></body></html>"""
