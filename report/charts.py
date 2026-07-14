@@ -12,14 +12,16 @@ from datetime import datetime, timezone
 STEP = 5
 
 
+# dark-ground hues (zoxy.io palette): zoxy is the amber signal, the rest are
+# distinct, legible on ink. Both slots equal — the report is dark-only now.
 PALETTE = {
-    "zoxy": ("#2a78d6", "#3987e5"),
-    "haproxy": ("#1baf7a", "#199e70"),
-    "envoy": ("#eda100", "#c98500"),
-    "traefik": ("#008300", "#008300"),
-    "nginx": ("#4a3aa7", "#9085e9"),
-    "pingora": ("#d9481f", "#e2662c"),  # Cloudflare-ish orange, clear of envoy amber
-    "direct": ("#898781", "#898781"),
+    "zoxy": ("#fb9e0e", "#fb9e0e"),
+    "haproxy": ("#38bdf8", "#38bdf8"),
+    "envoy": ("#f2705b", "#f2705b"),
+    "traefik": ("#a78bfa", "#a78bfa"),
+    "nginx": ("#34d399", "#34d399"),
+    "pingora": ("#f472b6", "#f472b6"),
+    "direct": ("#6d7385", "#6d7385"),
 }
 
 
@@ -168,76 +170,84 @@ def chart_card(title, subtitle, chart_id, series_list, present, yfmt="si", y_uni
 
 
 CSS = """
+@import url('https://api.fontshare.com/v2/css?f[]=clash-display@600,500&f[]=satoshi@400,500,700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root {
-  --surface-1:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
-  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
-  --c-zoxy:#2a78d6; --c-haproxy:#1baf7a; --c-envoy:#eda100;
-  --c-traefik:#008300; --c-nginx:#4a3aa7; --c-pingora:#d9481f; --c-direct:#898781;
-}
-@media (prefers-color-scheme: dark) { :root {
-  --surface-1:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7;
-  --muted:#898781; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
-  --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
-  --c-traefik:#008300; --c-nginx:#9085e9; --c-pingora:#e2662c; --c-direct:#898781;
-} }
-/* explicit theme toggles (e.g. hosted viewers) must beat the media query */
-:root[data-theme="dark"] {
-  --surface-1:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7;
-  --muted:#898781; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
-  --c-zoxy:#3987e5; --c-haproxy:#199e70; --c-envoy:#c98500;
-  --c-traefik:#008300; --c-nginx:#9085e9; --c-pingora:#e2662c; --c-direct:#898781;
-}
-:root[data-theme="light"] {
-  --surface-1:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
-  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
-  --c-zoxy:#2a78d6; --c-haproxy:#1baf7a; --c-envoy:#eda100;
-  --c-traefik:#008300; --c-nginx:#4a3aa7; --c-pingora:#d9481f; --c-direct:#898781;
+  /* zoxy.io design tokens */
+  --ink:#0e1016; --ink-1:#13151c; --ink-2:#191d28;
+  --line:rgba(233,239,250,.08); --line-2:rgba(233,239,250,.16);
+  --paper:#f1f1f4; --haze:#9aa1b3; --haze-dim:#6d7385;
+  --amber:#fb9e0e; --amber-hi:#ffc15c; --alarm:#f2705b;
+  --font-display:'Clash Display',system-ui,sans-serif;
+  --font-body:'Satoshi',system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,'SF Mono',monospace;
+  /* per-proxy line hues on the ink ground — zoxy is the amber signal */
+  --c-zoxy:#fb9e0e; --c-haproxy:#38bdf8; --c-envoy:#f2705b;
+  --c-traefik:#a78bfa; --c-nginx:#34d399; --c-pingora:#f472b6; --c-direct:#6d7385;
 }
 * { box-sizing:border-box; margin:0 }
-body { background:var(--page); color:var(--ink);
-  font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; padding:28px; }
-@media (max-width: 480px) { body { padding:12px } .card { padding:12px } }
-h1 { font-size:22px; margin-bottom:4px }
-.meta { color:var(--ink-2); margin-bottom:24px; font-size:13px }
-/* min(420px, 100%) — a hard 420px minimum would overflow phone viewports */
-.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr)); gap:20px }
-.card { background:var(--surface-1); border:1px solid var(--ring); border-radius:10px; padding:18px }
-.card h2 { font-size:15px; font-weight:600 }
-.card .sub { color:var(--muted); font-size:12.5px; margin-bottom:8px }
-.legend { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px }
-.chip { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--ink-2) }
-.swatch { width:10px; height:10px; border-radius:3px; display:inline-block }
+html { -webkit-text-size-adjust:100% }
+body { background:var(--ink); color:var(--paper);
+  font-family:var(--font-body); font-size:15px; line-height:1.6; letter-spacing:-.005em;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  padding:clamp(1.15rem,4vw,2.75rem); max-width:1200px; margin-inline:auto; }
+::selection { background:var(--amber); color:var(--ink) }
+.eyebrow { display:inline-flex; align-items:center; gap:.65ch; font-family:var(--font-mono);
+  font-size:.72rem; font-weight:500; letter-spacing:.22em; text-transform:uppercase;
+  color:var(--amber); margin-bottom:.75rem }
+.eyebrow::before { content:''; width:1.8rem; height:1px; background:linear-gradient(90deg,var(--amber),transparent) }
+h1 { font-family:var(--font-display); font-weight:600; line-height:1.04; letter-spacing:-.02em;
+  font-size:clamp(1.9rem,1.3rem+2.4vw,2.9rem) }
+h1 .rid { color:var(--amber) }
+.meta { color:var(--haze); margin:.6rem 0 2.2rem; font-family:var(--font-mono);
+  font-size:.8rem; letter-spacing:.01em; line-height:1.5 }
+.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr)); gap:18px }
+.card { background:var(--ink-1); border:1px solid var(--line); border-radius:12px; padding:20px 22px }
+@media (max-width:480px) { .card { padding:15px } }
+.card h2 { font-family:var(--font-display); font-size:1.05rem; font-weight:600; letter-spacing:-.01em }
+.card .sub { color:var(--haze-dim); font-size:.8rem; margin:.35rem 0 .95rem; line-height:1.45 }
+.legend { display:flex; flex-wrap:wrap; gap:13px; margin-bottom:8px }
+.chip { display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono);
+  font-size:.74rem; letter-spacing:.02em; color:var(--haze) }
+.swatch { width:9px; height:9px; border-radius:2px; display:inline-block }
 svg { width:100%; height:auto; display:block }
-.grid { stroke:var(--grid); stroke-width:1 }
-.axis { stroke:var(--axis); stroke-width:1 }
-.tick { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums }
-.axis-label { fill:var(--muted); font-size:11px }
+.grid { stroke:var(--line); stroke-width:1 }
+.axis { stroke:var(--line-2); stroke-width:1 }
+.tick { fill:var(--haze-dim); font-family:var(--font-mono); font-size:10.5px }
+.axis-label { fill:var(--haze-dim); font-family:var(--font-mono); font-size:10px;
+  letter-spacing:.08em; text-transform:uppercase }
+.line { fill:none; stroke-width:2 }
 .line.s-zoxy,.satmark.s-zoxy { stroke:var(--c-zoxy) } .swatch.s-zoxy { background:var(--c-zoxy) }
+.line.s-zoxy { stroke-width:2.6; filter:drop-shadow(0 0 5px rgba(251,158,14,.45)) }
 .line.s-haproxy,.satmark.s-haproxy { stroke:var(--c-haproxy) } .swatch.s-haproxy { background:var(--c-haproxy) }
 .line.s-envoy,.satmark.s-envoy { stroke:var(--c-envoy) } .swatch.s-envoy { background:var(--c-envoy) }
 .line.s-traefik,.satmark.s-traefik { stroke:var(--c-traefik) } .swatch.s-traefik { background:var(--c-traefik) }
 .line.s-nginx,.satmark.s-nginx { stroke:var(--c-nginx) } .swatch.s-nginx { background:var(--c-nginx) }
 .line.s-pingora,.satmark.s-pingora { stroke:var(--c-pingora) } .swatch.s-pingora { background:var(--c-pingora) }
 .line.s-direct,.satmark.s-direct { stroke:var(--c-direct) } .swatch.s-direct { background:var(--c-direct) }
-.line.s-offered { stroke:var(--axis) }
+.line.s-direct { stroke-dasharray:5 5; opacity:.85 }
+.line.s-offered { stroke:var(--line-2) }
 .chartwrap { position:relative }
-.tooltip { position:absolute; pointer-events:none; background:var(--surface-1);
-  border:1px solid var(--ring); border-radius:8px; padding:8px 10px; font-size:12px;
-  box-shadow:0 4px 14px rgba(0,0,0,.18); min-width:150px; z-index:2 }
-.tooltip .trow { display:flex; justify-content:space-between; gap:14px }
-.tooltip .tname { display:flex; align-items:center; gap:6px; color:var(--ink-2) }
-.tooltip .tval { font-variant-numeric:tabular-nums }
-/* the 8-column summary scrolls inside its card; the page never scrolls sideways */
-.tablewrap { overflow-x:auto }
-table { border-collapse:collapse; width:100%; min-width:640px; font-size:13.5px }
-th,td { text-align:right; padding:7px 12px; border-bottom:1px solid var(--grid);
-  font-variant-numeric:tabular-nums }
+.tooltip { position:absolute; pointer-events:none; background:var(--ink-2);
+  border:1px solid var(--line-2); border-radius:10px; padding:9px 11px; font-size:12px;
+  font-family:var(--font-mono); box-shadow:0 8px 26px rgba(0,0,0,.5); min-width:158px; z-index:2 }
+.tooltip .trow { display:flex; justify-content:space-between; gap:16px }
+.tooltip .tname { display:flex; align-items:center; gap:7px; color:var(--haze) }
+.tooltip .tval { color:var(--paper) }
+.tablewrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; margin-bottom:22px }
+table { border-collapse:collapse; width:100%; min-width:520px; font-family:var(--font-mono); font-size:13px }
+th,td { text-align:right; padding:11px 16px; border-bottom:1px solid var(--line) }
+tr:last-child td { border-bottom:none }
 th:first-child,td:first-child { text-align:left }
-th { color:var(--ink-2); font-weight:600 }
-.flag { color:#d03b3b; font-size:12.5px }
-.ok { color:#0ca30c }
-.empty { color:var(--muted) }
-footer { color:var(--muted); font-size:12px; margin-top:22px }
+th { color:var(--amber); font-weight:500; font-size:.68rem; letter-spacing:.14em; text-transform:uppercase }
+tbody tr:hover td { background:rgba(233,239,250,.02) }
+td:first-child { color:var(--paper); font-weight:500 }
+.flag { color:var(--alarm); font-size:12.5px }
+.ok { color:var(--nginx,#34d399) }
+.empty { color:var(--haze-dim) }
+footer { color:var(--haze-dim); font-family:var(--font-mono); font-size:.72rem;
+  letter-spacing:.02em; margin-top:26px; padding-top:16px; border-top:1px solid var(--line) }
+footer a { color:var(--amber) }
 """
 
 
