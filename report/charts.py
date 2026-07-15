@@ -264,6 +264,9 @@ td a { color:inherit; text-decoration:underline; text-decoration-color:var(--haz
 td a:hover { color:var(--amber); text-decoration-color:var(--amber) }
 /* latency-distribution section heading */
 .dist-h { font-family:var(--font-display); font-weight:600; letter-spacing:-.01em; font-size:1.15rem; margin:30px 0 14px }
+/* raw .hgrm link in a card subtitle */
+.sub a { color:var(--haze); text-decoration:underline; text-decoration-color:var(--line-2); text-underline-offset:2px }
+.sub a:hover { color:var(--amber); text-decoration-color:var(--amber) }
 """
 
 

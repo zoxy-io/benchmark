@@ -151,11 +151,13 @@ def _ms(v):
 
 
 def load_hgrm(run_dir, proxy, tags):
-    """Parse a proxy's zrk HdrHistogram .hgrm (values already in ms) into
-    (n, latency_ms) points where n = 1/(1-percentile) — the log x-axis of the
-    classic latency-by-percentile plot. One loadgen in practice: first file wins."""
+    """Parse a proxy's zrk HdrHistogram .hgrm (values already in ms). Returns
+    (filename, points): filename is the basename for a relative link from
+    report.html; points are (n, latency_ms) with n = 1/(1-percentile), the log
+    x-axis of the classic latency-by-percentile plot. First file found wins."""
     for tag in tags:
-        path = os.path.join(run_dir, f"{proxy}.{tag}.hgrm")
+        fname = f"{proxy}.{tag}.hgrm"
+        path = os.path.join(run_dir, fname)
         if not os.path.exists(path):
             continue
         pts, maxn = [], 1.0
@@ -174,8 +176,8 @@ def load_hgrm(run_dir, proxy, tags):
             if f[3] != "inf":
                 maxn = max(maxn, n)
             pts.append((max(n, 1.0), val))
-        return pts
-    return []
+        return fname, pts
+    return "", []
 
 
 def hist_svg(proxy, pts):
@@ -231,9 +233,10 @@ def build(meta, run_dir, prom):
     for p in present:
         tags = runs[p].get("loadgens", ["lg1"])
         rows = load_merged(run_dir, p, tags)
+        hgrm_file, hgrm_pts = load_hgrm(run_dir, p, tags)
         data[p] = {"rows": rows, "sustained": sustained(rows),
                    "summary": load_summary(run_dir, p, tags),
-                   "hgrm": load_hgrm(run_dir, p, tags),
+                   "hgrm": hgrm_pts, "hgrm_file": hgrm_file,
                    "mem": None if p == "direct" else peak_mem(prom, p, runs[p])}
 
     def line(key):
@@ -288,7 +291,8 @@ def build(meta, run_dir, prom):
     # anchored so the table's proxy names jump to them
     dist_cards = "".join(
         f'<section class="card" id="hist-{p}"><h2>{html.escape(p)}</h2>'
-        f'<p class="sub">latency by percentile — whole run (HdrHistogram)</p>'
+        f'<p class="sub">latency by percentile — whole run · '
+        f'<a href="{html.escape(data[p]["hgrm_file"])}" download>{html.escape(data[p]["hgrm_file"])}</a></p>'
         f'<div class="chartwrap">{hist_svg(p, data[p]["hgrm"])}</div></section>'
         for p in present if data[p]["hgrm"]
     )
