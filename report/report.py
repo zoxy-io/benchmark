@@ -30,10 +30,6 @@ from charts import (  # noqa: E402
 import hdr  # noqa: E402
 
 
-LAT_CAP = int(os.environ.get("REPORT_LAT_CAP", "100000"))  # ignore latency past
-# this offered rate — beyond collapse the CO-corrected tail balloons to seconds.
-
-
 def load_merged(run_dir, proxy, tags):
     """Merge per-loadgen NDJSON into one window series keyed by elapsed_s.
     Combined offered/achieved are SUMS; latency is the max across loadgens (a
@@ -77,9 +73,10 @@ def load_merged(run_dir, proxy, tags):
 
 def capped_hist(run_dir, proxy, tags):
     """Merge the per-window HdrHistogram blobs (zrk --timeseries-histogram) for
-    windows with offered <= LAT_CAP into one histogram — the meaningful load
-    range, excluding the deep-overload tail past collapse. Returns an hdr.Hdr or
-    None. Uses the first tag's NDJSON (one loadgen in practice)."""
+    the windows where THIS proxy has near-zero backlog (achieved >= LAT_KEEPUP*
+    offered = 99%, after warmup) — its latency at HEALTHY load, PER PROXY,
+    excluding the near-saturation/post-collapse edge where the CO-corrected tail
+    balloons. hdr.Hdr or None."""
     for tag in tags:
         path = os.path.join(run_dir, f"{proxy}.{tag}.ndjson")
         if not os.path.exists(path):
@@ -93,7 +90,8 @@ def capped_hist(run_dir, proxy, tags):
                 r = json.loads(ln)
             except json.JSONDecodeError:
                 continue
-            if float(r.get("target_rate", 0)) <= LAT_CAP and r.get("latency_histogram"):
+            off, ach = float(r.get("target_rate", 0)), float(r.get("achieved_rate", 0))
+            if r.get("t", 0) >= 3 and off > 0 and ach >= LAT_KEEPUP * off and r.get("latency_histogram"):
                 blobs.append(r["latency_histogram"])
         return hdr.merge(blobs)
     return None
@@ -121,7 +119,9 @@ def hdr_points(h):
     return pts
 
 
-KEEPUP = 0.90  # "keeping up" = achieved >= KEEPUP * offered
+KEEPUP = 0.90  # throughput: "keeping up" = achieved >= KEEPUP * offered
+LAT_KEEPUP = 0.99  # latency: stricter — only near-zero-backlog windows count,
+# so the tail isn't inflated by the 90%-keeping-up (already-queuing) edge.
 
 
 def sustained(rows):
@@ -240,11 +240,12 @@ def build(meta, run_dir, prom):
                    "hgrm_file": hgrm_filename(run_dir, p, tags),
                    "mem": None if p == "direct" else peak_mem(prom, p, runs[p])}
 
-    def line(key, cap=None):
+    def line(key, keepup=False):
         out = []
         for p in present:
             pts = [(r["offered"], r[key]) for r in data[p]["rows"]
-                   if cap is None or r["offered"] <= cap]
+                   if not keepup or (r["t"] >= 3 and r["offered"] > 0
+                                     and r["achieved"] >= LAT_KEEPUP * r["offered"])]
             if pts:
                 out.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
         return out
@@ -267,30 +268,28 @@ def build(meta, run_dir, prom):
                    "rps", achieved, present, "si", "req/s"),
         chart_card("Proxy CPU vs offered", "container cores (cAdvisor), mapped onto the offered axis",
                    "cpu", cpu, [p for p in present if p != "direct"], "si", "cores"),
-        chart_card(f"p99 latency vs offered (≤ {fmt_si(LAT_CAP)})",
-                   "per-window tail, up to the meaningful-load cap",
-                   "p99", line("p99", LAT_CAP), present, "ms", "ms"),
+        chart_card("p99 latency vs offered (while keeping up)",
+                   "per-window tail; each line stops where that proxy stops keeping up",
+                   "p99", line("p99", keepup=True), present, "ms", "ms"),
         chart_card("Error ratio vs offered", "non-2xx / timeouts (shedding or collapse)",
                    "err", line("err"), present, "pct", ""),
     ]
 
-    # summary table — max sustained, plus the HdrHistogram deep tail
-    # (whole-run p99.9 / p99.99 / max) that the old p50/p99-only CSV lacked.
+    # summary table — max sustained throughput + median/max latency (per-proxy,
+    # healthy-load window; the full percentile curve is in the distribution below)
     rows_html = ""
     for p in sorted(present, key=lambda p: data[p]["sustained"], reverse=True):
         s = data[p]["sustained"]
         h = data[p]["hist"]
         has_h = bool(h) and h.total() > 0
-        p999 = h.value_at_percentile(99.9) / 1000.0 if has_h else None
-        p9999 = h.value_at_percentile(99.99) / 1000.0 if has_h else None
+        p50 = h.value_at_percentile(50) / 1000.0 if has_h else None
         mx = h.max() / 1000.0 if has_h else None
         mem = data[p]["mem"]
         cls = ' class="baseline"' if p == "direct" else ""
         # proxy name links to its latency distribution (rendered below)
         name = f'<a href="#hist-{p}">{html.escape(p)}</a>' if has_h else html.escape(p)
         rows_html += (f"<tr{cls}><td>{name}</td><td>{fmt_si(s)}</td>"
-                      f"<td>{_ms(p999)}</td>"
-                      f"<td>{_ms(p9999)}</td>"
+                      f"<td>{_ms(p50)}</td>"
                       f"<td>{_ms(mx)}</td>"
                       f"<td>{fmt_bytes(mem) if mem else '—'}</td></tr>")
 
@@ -298,12 +297,12 @@ def build(meta, run_dir, prom):
     # anchored so the table's proxy names jump to them
     dist_cards = "".join(
         f'<section class="card" id="hist-{p}"><h2>{html.escape(p)}</h2>'
-        f'<p class="sub">latency by percentile — offered ≤ {fmt_si(LAT_CAP)} · '
+        f'<p class="sub">latency by percentile — while keeping up · '
         f'raw <a href="{html.escape(data[p]["hgrm_file"])}" download>{html.escape(data[p]["hgrm_file"])}</a> = whole run</p>'
         f'<div class="chartwrap">{hist_svg(p, hdr_points(data[p]["hist"]))}</div></section>'
         for p in present if data[p]["hist"] and data[p]["hist"].total() > 0
     )
-    dist = (f'<h2 class="dist-h">Latency distribution · HdrHistogram (offered ≤ {fmt_si(LAT_CAP)})</h2>'
+    dist = (f'<h2 class="dist-h">Latency distribution · HdrHistogram (while keeping up)</h2>'
             f'<div class="grid2">{dist_cards}</div>') if dist_cards else ""
 
     legend = "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)
@@ -317,11 +316,11 @@ def build(meta, run_dir, prom):
 <div class="eyebrow">L4 proxy benchmark · open-loop ramp</div>
 <h1>relay throughput <span class="rid">{rid}</span></h1>
 <p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
-Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is over windows with offered ≤ {fmt_si(LAT_CAP)} req/s —
-the meaningful-load range, since past collapse the CO-corrected tail balloons to seconds.</p>
+Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is computed per-proxy over the windows where that proxy is
+keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.</p>
 <div class="legend">{legend}</div>
 <div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th>
-<th>p99.9</th><th>p99.99</th><th>max</th><th>peak mem</th></tr>
+<th>median</th><th>max</th><th>peak mem</th></tr>
 {rows_html}</table></div>
 <div class="grid2">{''.join(cards)}</div>
 {dist}
