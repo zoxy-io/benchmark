@@ -14,13 +14,13 @@
 # Resource limits are ENFORCED here (service-level cpus/mem_limit — no swarm
 # needed); they are the fairness mechanism that replaces v1's "identical VMs".
 
-# Every proxy gets the same box. PROXY_CPUS must match the thread knobs below
-# (nbthread / --concurrency / GOMAXPROCS / worker_processes / threads) — we do
-# NOT trust cgroup autodetection. zoxy has no thread knob, so it runs PROXY_CPUS
-# worker processes sharing :8080 via SO_REUSEPORT, each pinned to a core
-# (ZOXY_WORKERS below) — thread parity with the rest.
+# Every proxy gets the same box: hard-capped to 1 CPU, with every thread knob
+# below (nbthread / --concurrency / GOMAXPROCS / worker_processes / threads)
+# hardcoded to 1 — one worker/thread each, no cgroup autodetection. zoxy has no
+# thread knob, so it runs a single process (ZOXY_WORKERS=1). The cloud overlay
+# pins the container to core 0 (cpuset).
 x-proxy-common: &proxy-common
-  cpus: ${PROXY_CPUS:-1}
+  cpus: 1
   mem_limit: ${PROXY_MEM:-512m}
   ulimits:
     nofile:
@@ -89,20 +89,17 @@ services:
         soft: 1048576
         hard: 1048576
       memlock: -1 # io_uring ring memory counts against memlock on kernels <5.12
-    # zoxy (libxev) has NO thread knob: one event loop per PROCESS. To spend a
-    # multi-core box it runs ZOXY_WORKERS processes that share :8080 via
-    # SO_REUSEPORT (kernel spreads connections) — the entrypoint supervises them.
-    # ZOXY_WORKERS = PROXY_CPUS keeps thread parity with the others (nbthread /
-    # --concurrency / GOMAXPROCS); 1 core => 1 process, exactly as before.
-    # Concurrency is hard-capped at relay_buffers_max PER PROCESS (constants.zig;
-    # 1024 on current main), one held per open tunnel for its LIFETIME — past it
-    # zoxy sheds tunnels with a client EOF. N workers => N x that cap total; the
-    # ramp's MAX_WORKERS stays well under it. Every other proxy has no such cap.
-    # It also does no DNS — endpoints must be IP literals, so the entrypoint
-    # resolves `backend` (env below) once at start and renders the template.
+    # zoxy (libxev) has NO thread knob: one event loop per PROCESS. Capped to 1
+    # CPU it runs a SINGLE process (ZOXY_WORKERS=1), pinned to core 0 by the cloud
+    # overlay — thread parity with the others (all = 1). Concurrency is hard-capped
+    # at relay_buffers_max PER PROCESS (constants.zig; 1024 on current main), one
+    # held per open tunnel for its LIFETIME — past it zoxy sheds tunnels with a
+    # client EOF. Every other proxy has no such cap. It also does no DNS —
+    # endpoints must be IP literals, so the entrypoint resolves `backend` (env
+    # below) once at start and renders the template.
     environment:
       BACKEND: backend:9000
-      ZOXY_WORKERS: ${PROXY_CPUS:-1}
+      ZOXY_WORKERS: 1
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:
@@ -114,7 +111,6 @@ services:
     container_name: haproxy
     profiles: [haproxy]
     environment:
-      NBTHREAD: ${PROXY_CPUS:-1}
       # hostname locally (bridge DNS + runtime resolver); the cloud overlay
       # replaces it with an IP literal because 127.0.0.11 doesn't exist there
       BACKEND_ADDR: backend:9000
@@ -129,7 +125,7 @@ services:
     container_name: envoy
     profiles: [envoy]
     command:
-      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "${PROXY_CPUS:-1}"]
+      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "1"]
     volumes:
       - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
@@ -141,7 +137,7 @@ services:
     container_name: traefik
     profiles: [traefik]
     environment:
-      GOMAXPROCS: ${PROXY_CPUS:-1}
+      GOMAXPROCS: 1
     volumes:
       - ./proxies/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./proxies/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
@@ -153,12 +149,11 @@ services:
     # nginx does L4 natively via the stream module — the official image ships
     # it compiled in (--with-stream), so unlike Caddy no custom build is
     # needed. The image's envsubst hook renders the template into /etc/nginx
-    # at start; PROXY_CPUS becomes worker_processes (explicit thread parity).
+    # at start; worker_processes is hardcoded to 1 (1 CPU).
     image: nginx:1.27-alpine
     container_name: nginx
     profiles: [nginx]
     environment:
-      PROXY_CPUS: ${PROXY_CPUS:-1}
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
     volumes:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
@@ -168,15 +163,14 @@ services:
   pingora:
     <<: *proxy-common
     # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a
-    # tiny L4 TCP-passthrough binary on it (src/main.rs). THREADS (= PROXY_CPUS)
-    # is the thread-parity knob; UPSTREAM is resolved once at startup.
+    # tiny L4 TCP-passthrough binary on it (src/main.rs), hardcoded to 1 worker
+    # thread; UPSTREAM is resolved once at startup.
     build:
       context: ./proxies/pingora
     image: zoxy-bench/pingora-l4:0.5
     container_name: pingora
     profiles: [pingora]
     environment:
-      THREADS: ${PROXY_CPUS:-1}
       LISTEN: 0.0.0.0:8080
       UPSTREAM: backend:9000
     ports:

@@ -38,8 +38,8 @@ IPs). **The measurement is one deterministic open-loop ramp** —
 over `RAMP_SECONDS`, and keeps offering at the scheduled rate even when the proxy
 falls behind (coordinated-omission corrected), so the offered axis is analytic
 (`offered = start_rate + slope·t`) and the saturation knee is exact and sharp.
-**One loadgen is enough**: a single 16-core box saturates any proxy at ~25% CPU
-(it hits the proxy's concurrency-collapse wall long before its own limit), so
+**One loadgen is enough**: a single 4-core box saturates a 1-CPU proxy well
+under its own limit (it hits the proxy's concurrency-collapse wall first), so
 there is no second loadgen and no VU/goroutine-heavy generator. **Runs are
 guarded**: `CONNECTIONS` caps in-flight concurrency (zrk keeps one request in
 flight per connection — too high and past saturation it piles connections and
@@ -51,7 +51,7 @@ runs.
 
 ```sh
 cd cloud && cp terraform.tfvars.example terraform.tfvars   # fill in creds
-make cloud-up              # 3 VMs: loadgen 16c / proxy 8c / backend 8c, core_fraction=100
+make cloud-up              # 3 VMs: loadgen 4c / proxy 2c / backend 4c, core_fraction=100
 make cloud-bench           # build zrk, ramp every proxy, write NDJSON + meta.json
 make report                # -> results/latest/report.html
 make cloud-down
@@ -67,30 +67,6 @@ HdrHistogram), tears it down. Live Grafana: **http://\<loadgen-ip\>:3000** →
 Local `make up` / `make down` start/stop backend + prometheus + grafana for
 poking at the stack; the load driver itself is cloud-only.
 
-## Raw proxy capacity (megabox mode)
-
-The 3-VM fleet's throughput includes the **virtualized cross-VM network tax**:
-every packet between VMs crosses virtio → Yandex SDN → virtio, and at high
-request rates that's roughly *half* the ceiling — the proxy is rarely the wall
-in the cloud. To measure a proxy's **raw relay capacity, network excluded**, run
-everything on ONE big VM over loopback (the kernel routes to the host's own IP
-via `lo` — no NIC/SDN), each role pinned to a disjoint cpuset:
-
-```sh
-make megabox-up            # ONE 32-core VM (tofu -var megabox=true)
-make megabox-bench         # co-located: proxy 0-3 | backend | loadgen, over loopback
-make report
-make cloud-down            # destroys the megabox
-```
-
-`megabox-bench` (`scripts/megabox-bench.sh`) computes the cpuset layout from the
-box's core count and drives the same `zrk`; knobs match `cloud-bench`
-(`PROXY_CPUS`, `MAX_RATE`, `CONNECTIONS`, `BACKEND_CPUS`). Measured: proxies do
-~2× their 3-VM number this way, and every L4 proxy is **I/O-bound, not
-CPU-bound** — it leaves cores idle and doesn't scale past ~2-4 cores even with
-the network removed; the wall is per-request I/O latency under concurrency, so
-efficiency (req/s per core) is the real differentiator, not peak throughput.
-
 ## Fairness rules (what makes the numbers comparable)
 
 - **Same job for every proxy**: all are L4 TCP passthroughs — HAProxy
@@ -98,14 +74,13 @@ efficiency (req/s per core) is the real differentiator, not peak throughput.
   official image ships the stream module — no custom build), Pingora (a ~60-line
   Rust binary on Cloudflare's framework — `proxies/pingora`), zoxy natively.
   Nobody pays for HTTP parsing that others skip.
-- **Same box for every proxy**: `PROXY_CPUS` / `PROXY_MEM` enforced by cgroups,
-  identical per proxy; thread counts set *explicitly* to match (`nbthread`,
-  `--concurrency`, `GOMAXPROCS`, `worker_processes`, pingora `threads`).
-  **zoxy has no thread knob** — one event loop per process — so to spend a
-  multi-core box it runs `PROXY_CPUS` worker processes sharing `:8080` via
-  `SO_REUSEPORT`, each `taskset`-pinned to its own core (`ZOXY_WORKERS`). The
-  proxy VM is 8 cores so `PROXY_CPUS=4` pins to cores `0–3` with `4–7` free for
-  the OS/monitoring (a saturated all-cores box starved the single-loop proxies).
+- **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM` by
+  cgroups, identical per proxy; thread counts hardcoded to 1 (`nbthread 1`,
+  `--concurrency 1`, `GOMAXPROCS=1`, `worker_processes 1`, pingora `threads=1`).
+  **zoxy has no thread knob** — one event loop per process — so it runs a single
+  process. The proxy VM is 2 cores; the container is pinned to core `0` (cloud
+  overlay `cpuset`), leaving core `1` for the OS/monitoring (a saturated
+  all-cores box starved the single-loop proxy).
 - **Same ramp for every proxy**: never compare runs with different `MAX_RATE`,
   `RAMP_SECONDS` or `MAX_WORKERS` — the shared offered axis depends on it.
   Recorded per run in `results/<runid>/meta.json`.

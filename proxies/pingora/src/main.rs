@@ -12,7 +12,6 @@
 //! connection is the correct — and fair — behaviour.
 //!
 //! Knobs via env (set by compose, matching the other proxies):
-//!   THREADS   worker threads for the listening service (= PROXY_CPUS)
 //!   LISTEN    downstream bind (default 0.0.0.0:8080)
 //!   UPSTREAM  upstream host:port (default backend:9000), resolved ONCE at
 //!             startup with retry (parity with zoxy's no-runtime-DNS model).
@@ -71,17 +70,13 @@ fn resolve_with_retry(host_port: &str) -> SocketAddr {
 fn main() {
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let upstream = std::env::var("UPSTREAM").unwrap_or_else(|_| "backend:9000".to_string());
-    let threads: usize = std::env::var("THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
 
     let addr = resolve_with_retry(&upstream);
-    eprintln!("pingora-l4: listen={listen} upstream={upstream} -> {addr} threads={threads}");
+    eprintln!("pingora-l4: listen={listen} upstream={upstream} -> {addr} threads=1");
 
-    // threads = PROXY_CPUS: explicit thread parity with the other proxies.
+    // hardcoded to 1 worker thread — 1 CPU, thread parity with the other proxies.
     let mut conf = ServerConf::default();
-    conf.threads = threads;
+    conf.threads = 1;
     let mut server = Server::new_with_opt_and_conf(Opt::default(), conf);
     server.bootstrap();
 

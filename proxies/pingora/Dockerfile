@@ -19,5 +19,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/pingora-l4 /usr/local/bin/pingora-l4
-# LISTEN / UPSTREAM / THREADS come from compose env (THREADS = PROXY_CPUS).
+# LISTEN / UPSTREAM come from compose env; worker threads are hardcoded to 1.
 ENTRYPOINT ["/usr/local/bin/pingora-l4"]

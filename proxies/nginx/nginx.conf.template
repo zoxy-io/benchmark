@@ -2,15 +2,14 @@
 # L4-only libxev build — every proxy relays bytes, nobody parses HTTP). nginx
 # does L4 natively via the stream module, which the official image ships
 # compiled in (--with-stream) — no custom build needed (unlike Caddy). This is
-# an envsubst template (official-image mechanism): worker count comes from
-# PROXY_CPUS so it matches the cpu quota (explicit thread parity — the same
-# rule haproxy's nbthread / envoy's --concurrency / GOMAXPROCS follow; `auto`
-# would count HOST cores and oversubscribe the cgroup). No access_log => the
-# hot path never touches disk. `backend` resolves once at startup via the
-# container's resolver (bridge DNS) or /etc/hosts (cloud extra_hosts); the
-# origin is already healthy by then (depends_on), so no runtime resolver is
-# needed — same as pingora.
-worker_processes ${PROXY_CPUS};
+# an envsubst template (official-image mechanism): worker count is hardcoded to
+# 1 to match the 1-CPU quota (explicit — `auto` would count HOST cores and
+# oversubscribe the cgroup, the trap haproxy's nbthread / envoy's --concurrency /
+# GOMAXPROCS avoid too). No access_log => the hot path never touches disk.
+# `backend` resolves once at startup via the container's resolver (bridge DNS)
+# or /etc/hosts (cloud extra_hosts); the origin is already healthy by then
+# (depends_on), so no runtime resolver is needed — same as pingora.
+worker_processes 1;
 worker_rlimit_nofile 262144;
 error_log /var/log/nginx/error.log warn;
 

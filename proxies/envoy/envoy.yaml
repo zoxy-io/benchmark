@@ -1,6 +1,6 @@
 # L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
-# build — every proxy relays bytes, nobody parses HTTP). Worker count comes
-# from --concurrency in the compose command (= PROXY_CPUS). STRICT_DNS because
+# build — every proxy relays bytes, nobody parses HTTP). Worker count is
+# hardcoded to 1 via --concurrency in the compose command (1 CPU). STRICT_DNS because
 # the upstream is a hostname (compose service locally, extra_hosts entry in
 # cloud). No access log. idle_timeout 60s matches haproxy/zoxy.
 admin:

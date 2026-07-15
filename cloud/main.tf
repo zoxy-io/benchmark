@@ -58,21 +58,14 @@ data "yandex_compute_image" "ubuntu" {
 }
 
 locals {
-  # One loadgen: the open-loop zrk generator saturates any proxy from a
-  # single 16-core box at ~25% CPU (it hits the proxy's concurrency-collapse wall
-  # long before its own limit), so a second loadgen added no reach and actually
-  # pushed the proxy into collapse. loadgen also hosts prometheus/grafana.
-  fleet_hosts = {
+  # One loadgen: the open-loop zrk generator saturates a 1-CPU proxy from a
+  # single 4-core box well under its own limit (it hits the proxy's
+  # concurrency-collapse wall first). loadgen also hosts prometheus/grafana.
+  hosts = {
     loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
     proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, role = "proxy" }
     backend = { cores = var.backend_cores, memory = var.backend_memory, role = "backend" }
   }
-  # megabox mode (var.megabox=true): ONE big VM, all roles co-located over
-  # loopback — measures raw proxy capacity, virtualized network excluded.
-  mega_hosts = {
-    megabox = { cores = var.megabox_cores, memory = var.megabox_memory, role = "megabox" }
-  }
-  hosts = var.megabox ? local.mega_hosts : local.fleet_hosts
 }
 
 resource "yandex_compute_instance" "host" {

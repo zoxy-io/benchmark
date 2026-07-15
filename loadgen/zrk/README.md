@@ -40,9 +40,9 @@ ZRK_REF=<sha> ./build.sh         # build a different zrk commit
 
 ## Run
 
-The drivers (`scripts/zrk-bench.sh` cloud / `scripts/megabox-bench.sh` loopback)
-build `zrk` locally, ship the binary to the loadgen, and invoke `run.py` in a
-`python:3-alpine` container with the config as env:
+The driver (`scripts/zrk-bench.sh`) builds `zrk` locally, ships the binary to the
+loadgen, and invokes `run.py` in a `python:3-alpine` container with the config as
+env:
 
 ```sh
 docker run --rm --network host --ulimit nofile=1048576 -v ~/zrk:/w -w /w \

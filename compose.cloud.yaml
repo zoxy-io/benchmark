@@ -21,13 +21,13 @@ services:
 
   zoxy:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       - "backend:${BACKEND_IP}"
 
   haproxy:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       - "backend:${BACKEND_IP}"
     environment:
@@ -37,19 +37,19 @@ services:
 
   envoy:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       - "backend:${BACKEND_IP}"
 
   traefik:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       - "backend:${BACKEND_IP}"
 
   nginx:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       # nginx stream resolves `backend` once at startup via getaddrinfo, which
       # reads this /etc/hosts entry — no runtime resolver needed (like pingora)
@@ -57,7 +57,7 @@ services:
 
   pingora:
     <<: *host-net
-    cpuset: ${PROXY_CPUSET:-}
+    cpuset: "0"
     extra_hosts:
       - "backend:${BACKEND_IP}"
     # pingora resolves `backend` at startup via getaddrinfo, which reads this

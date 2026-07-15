@@ -42,22 +42,21 @@ variable "disk_size" {
   default = 30
 }
 
-# Sizing: proxy is the SUT box; backend gets 2x its cores so the origin is
-# never the bottleneck; loadgen is the biggest because open-loop generation +
-# prometheus + grafana live there.
+# Sizing: the proxy container is capped to 1 CPU (one zoxy process), so the
+# proxy VM is 2 cores — core 0 for the proxy, core 1 left free for OS/cAdvisor
+# and hypervisor-steal absorption. backend gets 2x the proxy so the origin is
+# never the bottleneck; loadgen hosts open-loop generation + prometheus + grafana.
 variable "proxy_cores" {
   type    = number
-  default = 8 # 8-core box so PROXY_CPUS=4 pins to cores 0-3 with 4-7 free for
-  # OS/monitoring/hypervisor-steal absorption (a saturated 4-core VM starved the
-  # single-loop proxies and inflated CPU steal — see multicore benchmark notes).
+  default = 2
 }
 variable "proxy_memory" {
   type    = number
-  default = 8
+  default = 4
 }
 variable "backend_cores" {
   type    = number
-  default = 8
+  default = 4
 }
 variable "backend_memory" {
   type    = number
@@ -65,28 +64,9 @@ variable "backend_memory" {
 }
 variable "loadgen_cores" {
   type    = number
-  default = 16
+  default = 4
 }
 variable "loadgen_memory" {
   type    = number
-  default = 16
-}
-
-# Megabox mode: ONE big VM running loadgen+proxy+backend co-located over
-# loopback (kernel routes traffic to the host's own IP via `lo` — no NIC/SDN),
-# each role pinned to a disjoint cpuset. This measures a proxy's RAW relay
-# capacity with the virtualized cross-VM network excluded (the 3-VM fleet's
-# throughput is ~half raw because of the Yandex SDN per-packet tax). Enable with
-# `-var megabox=true` (make megabox-up); driven by scripts/megabox-bench.sh.
-variable "megabox" {
-  type    = bool
-  default = false
-}
-variable "megabox_cores" {
-  type    = number
-  default = 32
-}
-variable "megabox_memory" {
-  type    = number
-  default = 32
+  default = 8
 }
