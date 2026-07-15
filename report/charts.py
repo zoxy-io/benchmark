@@ -31,7 +31,7 @@ PROXY_ORDER = ["zoxy", "haproxy", "envoy", "traefik", "nginx", "pingora", "direc
 W, H = 720, 380
 
 
-ML, MR, MT, MB = 62, 16, 14, 40
+ML, MR, MT, MB = 62, 16, 22, 40
 
 
 def prom_query_range(prom, query, start, end):
@@ -63,9 +63,12 @@ def nice_ticks(lo, hi, n=5):
     start = math.floor(lo / step) * step
     ticks = []
     t = start
-    while t <= hi + step * 0.001:
+    # step up to the first tick at/above hi so the axis always COVERS the data
+    # (x is not clamped; y is, but this keeps both exact and avoids overshoot).
+    while t < hi - step * 1e-9:
         ticks.append(round(t, 10))
         t += step
+    ticks.append(round(t, 10))
     return ticks
 
 
@@ -119,7 +122,8 @@ def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
     out.append(f'<line class="axis" x1="{ML}" y1="{H - MB}" x2="{W - MR}" y2="{H - MB}"/>')
     out.append(f'<text class="axis-label" x="{(ML + W - MR) / 2}" y="{H - 6}" text-anchor="middle">offered load (req/s)</text>')
     if y_unit:
-        out.append(f'<text class="axis-label" x="14" y="{MT + 2}" text-anchor="start">{y_unit}</text>')
+        # sit the unit above the top gridline/tick (MT), not level with it
+        out.append(f'<text class="axis-label" x="14" y="10" text-anchor="start">{y_unit}</text>')
 
     for name, _, pts, dashed in series_list:
         if not pts:
@@ -148,12 +152,17 @@ def chart_card(title, subtitle, chart_id, series_list, present, yfmt="si", y_uni
     )
     # hover-layer data: resample every series onto a shared x grid
     data = {
+        # "offered" is the synthetic y=x reference diagonal (2 points), not a
+        # data series — exclude it from the hover tooltip (its value at any x is
+        # just x, already shown in the header) so it doesn't snap 0/​max or dup.
         "series": [
             {"name": n, "pts": [[round(x, 1), y] for x, y in sorted(pts)]}
-            for n, _, pts, _ in series_list if pts
+            for n, _, pts, _ in series_list if pts and n != "offered"
         ],
         "yfmt": yfmt,
-        "xmax": max((x for _, _, pts, _ in series_list for x, _ in pts), default=1),
+        # match svg_chart's x tick ceiling so the crosshair maps onto the same
+        # scale the SVG points are drawn on.
+        "xmax": nice_ticks(0, max((x for _, _, pts, _ in series_list for x, _ in pts), default=1))[-1],
         "geom": [W, H, ML, MR, MT, MB],
     }
     return f"""
@@ -250,6 +259,11 @@ tr.baseline td, tr.baseline td:first-child { color:var(--haze-dim); font-weight:
 footer { color:var(--haze-dim); font-family:var(--font-mono); font-size:.72rem;
   letter-spacing:.02em; margin-top:26px; padding-top:16px; border-top:1px solid var(--line) }
 footer a { color:var(--amber) }
+/* summary-table proxy link -> its latency distribution below */
+td a { color:inherit; text-decoration:underline; text-decoration-color:var(--haze-dim); text-underline-offset:2px }
+td a:hover { color:var(--amber); text-decoration-color:var(--amber) }
+/* latency-distribution section heading */
+.dist-h { font-family:var(--font-display); font-weight:600; letter-spacing:-.01em; font-size:1.15rem; margin:30px 0 14px }
 """
 
 
