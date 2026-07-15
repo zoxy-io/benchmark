@@ -14,15 +14,16 @@ origin nginx is the HTTP endpoint and the proxies are transparent tunnels.
 
 ```
              0 ──────── linear ramp ────────► MAX_RATE
- vegeta-ramp ───────► proxy-under-test ───────────► nginx origin
- (open loop,          (pinned cores, 512 MiB,       (canned 64B..100k
-  LinearPacer)         ONE at a time)                bodies, 8x cpus)
+        zrk ───────► proxy-under-test ───────────► nginx origin
+ (open loop, CO-     (pinned cores, 512 MiB,       (canned 64B..100k
+  corrected)          ONE at a time)                bodies, 8x cpus)
       │                       │ cAdvisor: cpu/mem per container
       ├── /metrics ──► Prometheus ◄── scrape ───────┘
-      │  (scraped)         │
-      └── per-1s CSV       └─► Grafana (live)
+      │  (bridged)         │
+      └── per-1s NDJSON     └─► Grafana (live)
+        + HdrHistogram
              │
-             └─► report/report_vegeta.py  ── the artifact (report.html)
+             └─► report/report.py  ── the artifact (report.html)
 ```
 
 ## The design in five sentences
@@ -33,17 +34,17 @@ static config and the *same* enforced cpu/memory limits (service-level `cpus` /
 one compose project, in the cloud the very same `compose.yaml` runs across three
 VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset, peer
 IPs). **The measurement is one deterministic open-loop ramp** —
-`loadgen/vegeta-ramp` (built on Vegeta's `LinearPacer`) offers `0 → MAX_RATE`
+`loadgen/zrk` (wrk2-lineage, HdrHistogram) offers `START_RATE → MAX_RATE`
 over `RAMP_SECONDS`, and keeps offering at the scheduled rate even when the proxy
-falls behind (coordinated-omission safe), so the offered axis is analytic
+falls behind (coordinated-omission corrected), so the offered axis is analytic
 (`offered = start_rate + slope·t`) and the saturation knee is exact and sharp.
 **One loadgen is enough**: a single 16-core box saturates any proxy at ~25% CPU
 (it hits the proxy's concurrency-collapse wall long before its own limit), so
 there is no second loadgen and no VU/goroutine-heavy generator. **Runs are
-guarded**: `MAX_WORKERS` caps in-flight concurrency (the open-loop analogue of a
-VU pool — too high and past saturation it piles connections and collapses the
-path), and a `direct` pseudo-proxy calibrates that the origin itself saturates
-above the proxies. **Local = plumbing, cloud = numbers**: quote the 3-VM cloud
+guarded**: `CONNECTIONS` caps in-flight concurrency (zrk keeps one request in
+flight per connection — too high and past saturation it piles connections and
+collapses the path), and a `direct` pseudo-proxy calibrates that the origin
+itself saturates above the proxies. **Local = plumbing, cloud = numbers**: quote the 3-VM cloud
 runs.
 
 ## Run it in Yandex Cloud
@@ -51,16 +52,17 @@ runs.
 ```sh
 cd cloud && cp terraform.tfvars.example terraform.tfvars   # fill in creds
 make cloud-up              # 3 VMs: loadgen 16c / proxy 8c / backend 8c, core_fraction=100
-make cloud-bench           # build vegeta-ramp, ramp every proxy, write CSVs + meta.json
+make cloud-bench           # build zrk, ramp every proxy, write NDJSON + meta.json
 make report                # -> results/latest/report.html
 make cloud-down
 ```
 
-`cloud-bench` (`scripts/vegeta-bench.sh`) reads the terraform inventory, ships
+`cloud-bench` (`scripts/zrk-bench.sh`) reads the terraform inventory, ships
 the repo, brings up backend + monitoring, and for each proxy: brings it up,
-ramps it with `vegeta-ramp` on the loadgen, pulls the per-1s CSV, tears it down.
-Live Grafana: **http://\<loadgen-ip\>:3000** → "Proxy bench — live run (vegeta
-open-loop)". Run a subset with `make cloud-bench PROXIES="direct zoxy haproxy"`.
+ramps it with `zrk` on the loadgen, pulls the per-1s NDJSON (+ whole-run
+HdrHistogram), tears it down. Live Grafana: **http://\<loadgen-ip\>:3000** →
+"Proxy bench — live run (zrk open-loop)". Run a subset with
+`make cloud-bench PROXIES="direct zoxy haproxy"`.
 
 Local `make up` / `make down` start/stop backend + prometheus + grafana for
 poking at the stack; the load driver itself is cloud-only.
@@ -76,14 +78,14 @@ via `lo` — no NIC/SDN), each role pinned to a disjoint cpuset:
 
 ```sh
 make megabox-up            # ONE 32-core VM (tofu -var megabox=true)
-make megabox-bench         # co-located: proxy 0-3 | backend | vegeta, over loopback
+make megabox-bench         # co-located: proxy 0-3 | backend | loadgen, over loopback
 make report
 make cloud-down            # destroys the megabox
 ```
 
 `megabox-bench` (`scripts/megabox-bench.sh`) computes the cpuset layout from the
-box's core count and drives the same `vegeta-ramp`; knobs match `cloud-bench`
-(`PROXY_CPUS`, `MAX_RATE`, `MAX_WORKERS`, `BACKEND_CPUS`). Measured: proxies do
+box's core count and drives the same `zrk`; knobs match `cloud-bench`
+(`PROXY_CPUS`, `MAX_RATE`, `CONNECTIONS`, `BACKEND_CPUS`). Measured: proxies do
 ~2× their 3-VM number this way, and every L4 proxy is **I/O-bound, not
 CPU-bound** — it leaves cores idle and doesn't scale past ~2-4 cores even with
 the network removed; the wall is per-request I/O latency under concurrency, so
@@ -134,10 +136,10 @@ compose.yaml              every service, proxies behind profiles, limits enforce
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
 proxies/<p>/              one static config per proxy (upstream is always `backend`)
 backend/                  nginx origin, canned bodies generated at start
-loadgen/vegeta-ramp/      open-loop linear-ramp generator (Vegeta LinearPacer) + /metrics
-scripts/vegeta-bench.sh   the driver: build -> per-proxy up/probe/ramp/CSV/down
-monitoring/               prometheus (+file_sd targets), grafana (2 dashboards)
+loadgen/zrk/              open-loop linear-ramp generator (zrk, HdrHistogram) + /metrics bridge
+scripts/zrk-bench.sh      the driver: build -> per-proxy up/probe/ramp/NDJSON/down
+monitoring/               prometheus (+file_sd targets), grafana (live dashboard)
 report/charts.py          shared inline-SVG chart engine + prometheus helpers
-report/report_vegeta.py   CSVs + meta.json + prometheus CPU -> self-contained report.html
+report/report.py          NDJSON + meta.json + prometheus CPU -> self-contained report.html
 cloud/                    terraform: VPC + 3 VMs + pinned-docker cloud-init
 ```

@@ -7,7 +7,7 @@
 #     makes thread autodetection agree with the cpu limit.
 #  3. peer addressing via env: proxy configs always dial the hostname
 #     `backend`; here extra_hosts maps it to the backend VM's private IP
-#     (vegeta-bench.sh writes BACKEND_IP/PROXY_IP into .env from terraform).
+#     (zrk-bench.sh writes BACKEND_IP/PROXY_IP into .env from terraform).
 #     zoxy itself does no DNS — its entrypoint resolves `backend` (via this
 #     same extra_hosts entry) and renders the IP literal into its config.
 
@@ -72,7 +72,7 @@ services:
   cadvisor:
     <<: *host-net
     # host networking would collide with the proxy on :8080 — move cadvisor
-    # (vegeta-bench.sh writes the prometheus targets with :8081 to match).
+    # (zrk-bench.sh writes the prometheus targets with :8081 to match).
     # The override replaces the whole command: keep the disable_metrics list
     # identical to compose.yaml.
     command:

@@ -18,9 +18,11 @@ PROXY_CPUS=${PROXY_CPUS:-4}
 BACKEND_CPUS=${BACKEND_CPUS:-6}    # backend cores (kept off the proxy's cpuset)
 MAX_RATE=${MAX_RATE:-200000}
 RAMP_SECONDS=${RAMP_SECONDS:-120}
-MAX_WORKERS=${MAX_WORKERS:-2000}
-CONNECTIONS=${CONNECTIONS:-2000}
+CONNECTIONS=${CONNECTIONS:-2000}   # open connections = in-flight cap (open-loop guard)
+THREADS=${THREADS:-}               # zrk worker threads (empty -> loadgen nproc)
+TIMEOUT_S=${TIMEOUT_S:-5}
 ZOXY_REF=${ZOXY_REF:-main}
+ZRK_REF=${ZRK_REF:-e82ac7e}        # pinned zrk build (see loadgen/zrk/build.sh)
 RUNID=${RUNID:-megabox-$(date -u +%Y%m%d-%H%M%S)}
 
 inv=$($TF -chdir=cloud output -json inventory)
@@ -29,14 +31,14 @@ BIP=$(echo "$inv" | jq -r '.megabox.internal_ip // empty')
 [ -n "$MB" ] || { echo "no megabox in the fleet — run: make megabox-up"; exit 1; }
 sshm() { ssh -o BatchMode=yes "$SSH_USER@$MB" "$@"; }
 
-# --- cpuset layout: proxy | backend | vegeta | OS(reserve 2) -------------------
+# --- cpuset layout: proxy | backend | loadgen | OS(reserve 2) ------------------
 NC=$(sshm nproc)
 P_SET="0-$((PROXY_CPUS - 1))"
 B_SET="$PROXY_CPUS-$((PROXY_CPUS + BACKEND_CPUS - 1))"
 V_START=$((PROXY_CPUS + BACKEND_CPUS)); V_END=$((NC - 3))   # leave last 2 cores for OS/softirq
 [ "$V_START" -le "$V_END" ] || { echo "not enough cores ($NC) for PROXY_CPUS=$PROXY_CPUS + BACKEND_CPUS=$BACKEND_CPUS + loadgen"; exit 1; }
 V_SET="$V_START-$V_END"
-echo ">>> megabox=$MB ($NC cores)  proxy=$P_SET backend=$B_SET vegeta=$V_SET  ramp $MAX_RATE/${RAMP_SECONDS}s workers<=$MAX_WORKERS"
+echo ">>> megabox=$MB ($NC cores)  proxy=$P_SET backend=$B_SET loadgen=$V_SET  ramp $MAX_RATE/${RAMP_SECONDS}s conns=$CONNECTIONS"
 
 RESULTS="results/$RUNID"; mkdir -p "$RESULTS"; ln -sfn "$RUNID" results/latest
 META="$RESULTS/meta.json"
@@ -44,12 +46,12 @@ echo "{\"prom\":\"http://$MB:9090\",\"runid\":\"$RUNID\",\"runs\":{}}" > "$META"
 COMPOSE="docker compose -f compose.yaml -f compose.cloud.yaml"
 PENV="ZOXY_REF=$ZOXY_REF PROXY_CPUS=$PROXY_CPUS PROXY_CPUSET=$P_SET BACKEND_IP=$BIP PROM_TARGETS=cloud PROM_URL=http://$BIP:9090"
 
-# --- ship repo, build vegeta-ramp, monitoring targets -> the megabox, roles up -
+# --- ship repo, build zrk, monitoring targets -> the megabox, roles up ---------
 rsync -az --delete --exclude .git --exclude results --exclude .env --exclude .env.cloud \
     --exclude 'cloud/.terraform*' --exclude 'cloud/terraform.tfstate*' ./ "$SSH_USER@$MB:$REMOTE/"
-sshm "mkdir -p ~/vegeta-ramp"; rsync -az loadgen/vegeta-ramp/ "$SSH_USER@$MB:vegeta-ramp/"
-sshm "test -x ~/vegeta-ramp/vegeta-ramp || (cd ~/vegeta-ramp && docker run --rm -v \"\$PWD\":/src -w /src golang:1.23 sh -c 'CGO_ENABLED=0 go build -o vegeta-ramp .')"
-sshm "cd $REMOTE/monitoring/targets/cloud && for pr in cadvisor:8081 node:9100 vegeta:8090; do n=\${pr%%:*}; port=\${pr##*:}; printf -- '- targets: [\"$BIP:%s\"]\n  labels: { role: megabox }\n' \"\$port\" > \$n.yml; done"
+echo ">>> building zrk (ref=$ZRK_REF)"; ZRK_REF=$ZRK_REF ./loadgen/zrk/build.sh
+sshm "mkdir -p ~/zrk"; rsync -az --exclude src loadgen/zrk/ "$SSH_USER@$MB:zrk/"
+sshm "cd $REMOTE/monitoring/targets/cloud && for pr in cadvisor:8081 node:9100 zrk:8090; do n=\${pr%%:*}; port=\${pr##*:}; printf -- '- targets: [\"$BIP:%s\"]\n  labels: { role: megabox }\n' \"\$port\" > \$n.yml; done"
 sshm "cd $REMOTE && $PENV $COMPOSE --profile monitoring --profile backend up -d --wait" >/dev/null 2>&1
 sshm "docker update --cpuset-cpus=$B_SET backend" >/dev/null 2>&1
 
@@ -75,14 +77,15 @@ for p in $PROXIES; do
     fi
     start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     echo ">>> [$p] ramping ${RAMP_SECONDS}s to $MAX_RATE"
-    sshm "docker run --rm --network host --cpuset-cpus=$V_SET --ulimit nofile=1048576 -v ~/vegeta-ramp:/w -w /w \
+    sshm "docker run --rm --network host --cpuset-cpus=$V_SET --ulimit nofile=1048576 -v ~/zrk:/w -w /w \
         -e TARGET=$target -e MAX_RATE=$MAX_RATE -e RAMP_SECONDS=$RAMP_SECONDS -e START_RATE=200 \
-        -e CONNECTIONS=$CONNECTIONS -e MAX_WORKERS=$MAX_WORKERS -e OUT=/w/$p.lg1.csv -e NAME=$p -e RUNID=$RUNID \
-        alpine:3 /w/vegeta-ramp" 2>&1 | grep -E 'peak|knee'
+        -e CONNECTIONS=$CONNECTIONS -e THREADS=$THREADS -e TIMEOUT_S=$TIMEOUT_S \
+        -e OUT=/w/$p.lg1 -e NAME=$p -e RUNID=$RUNID -e METRICS_ADDR=:8090 \
+        python:3-alpine python3 /w/run.py" 2>&1 | grep -E 'peak|knee'
     end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    scp -q "$SSH_USER@$MB":vegeta-ramp/$p.lg1.csv "$RESULTS/"
+    for ext in ndjson json hgrm; do scp -q "$SSH_USER@$MB:zrk/$p.lg1.$ext" "$RESULTS/" 2>/dev/null || true; done
     record "$p" "$start" "$end"
     [ "$p" != direct ] && sshm "cd $REMOTE && $COMPOSE --profile $p rm -sf $p" >/dev/null 2>&1
     echo ">>> [$p] done"; sleep 5
 done
-echo ">>> render:  python3 report/report_vegeta.py $RESULTS"
+echo ">>> render:  python3 report/report.py $RESULTS"

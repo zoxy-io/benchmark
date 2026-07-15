@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Render the benchmark report from vegeta-ramp CSVs (loadgen/vegeta-ramp).
+"""Render the benchmark report from zrk per-interval NDJSON (loadgen/zrk).
 
-Throughput/latency come straight from the harness's per-1s-window CSV, whose
-offered-rate axis is ANALYTIC (offered = start_rate + slope*t). Proxy CPU is
-joined from
-Prometheus (cAdvisor) by mapping each sample's wall-clock time -> elapsed ->
-offered, so every curve shares one exact offered-load x-axis.
+Throughput/latency come straight from zrk's per-1s-window NDJSON, whose
+offered-rate axis is the ramp's analytic target rate. Latency is
+coordinated-omission-corrected and carries the full HdrHistogram tail
+(p50/p90/p99/p99.9/max per window; p99.99 + a mergeable blob for the whole run).
+Proxy CPU is joined from Prometheus (cAdvisor) by mapping each sample's
+wall-clock time -> elapsed -> offered, so every curve shares one offered-load axis.
 
-Layout of a run dir (see scripts/vegeta-bench.sh):
+Layout of a run dir (see scripts/zrk-bench.sh):
   <dir>/meta.json                 {"prom": "...", "runid": "...", "runs": {proxy: {...}}}
      runs[proxy] = {start, end (ISO Z), max_rate, ramp_seconds, start_rate, loadgens:[tag,...]}
-  <dir>/<proxy>.<tag>.csv         one per loadgen tag (merged here)
+  <dir>/<proxy>.<tag>.ndjson      per-interval NDJSON, one per loadgen tag (merged here)
+  <dir>/<proxy>.<tag>.json        whole-run summary (latency_us incl. p99.99, max)
 
-Usage: python3 report/report_vegeta.py <dir>   (PROM_URL overrides meta.prom)
+Usage: python3 report/report.py <dir>   (PROM_URL overrides meta.prom)
 """
-import csv
 import glob
 import html
 import json
@@ -29,31 +30,63 @@ from charts import (  # noqa: E402
 
 
 def load_merged(run_dir, proxy, tags):
-    """Merge per-loadgen CSVs into one window series keyed by elapsed_s.
+    """Merge per-loadgen NDJSON into one window series keyed by elapsed_s.
     Combined offered/achieved are SUMS; latency is the max across loadgens (a
-    conservative tail — they hit the same proxy, so distributions track)."""
-    per = {}  # elapsed -> [offered, total, ok, p50max, p99max]
+    conservative tail — they hit the same proxy, so distributions track).
+    zrk latency is in microseconds; charts want seconds, so divide by 1e6."""
+    per = {}  # elapsed -> [offered, total_req, errs, p50us, p99us, p999us, maxus]
     for tag in tags:
-        path = os.path.join(run_dir, f"{proxy}.{tag}.csv")
+        path = os.path.join(run_dir, f"{proxy}.{tag}.ndjson")
         if not os.path.exists(path):
             continue
-        for r in csv.DictReader(open(path)):
-            t = int(r["elapsed_s"])
-            row = per.setdefault(t, [0.0, 0, 0, 0.0, 0.0])
-            row[0] += float(r["offered_rps"])
-            row[1] += int(r["total"])
-            row[2] += int(r["ok"])
-            row[3] = max(row[3], float(r["p50_ms"]))
-            row[4] = max(row[4], float(r["p99_ms"]))
+        with open(path) as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    r = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                t = int(round(float(r.get("t", 0))))
+                lat = r.get("latency_us", {})
+                row = per.setdefault(t, [0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                row[0] += float(r.get("target_rate", 0.0))     # offered
+                row[1] += float(r.get("achieved_rate", 0.0))   # achieved (req/s)
+                row[2] += int(r.get("requests", 0))            # window req count
+                row[3] += int(r.get("errors", 0))              # window err count
+                row[4] = max(row[4], float(lat.get("p50", 0)))
+                row[5] = max(row[5], float(lat.get("p99", 0)))
+                row[6] = max(row[6], float(lat.get("p99_9", 0)))
+                row[7] = max(row[7], float(lat.get("max", 0)))
     out = []
     for t in sorted(per):
-        offered, total, ok, p50, p99 = per[t]
-        err = (total - ok) / total if total else 0.0
-        # charts.py's yfmt="ms" formatter expects the latency series in SECONDS
-        # (it scales x1000 for display); the harness CSV is in ms, so convert here.
-        out.append({"t": t, "offered": offered, "achieved": ok,
-                    "err": err, "p50": p50 / 1000.0, "p99": p99 / 1000.0})
+        offered, achieved, total, errs, p50, p99, p999, mx = per[t]
+        err = errs / total if total else 0.0
+        # latency series are handed to charts in SECONDS (yfmt="ms" scales x1000).
+        out.append({"t": t, "offered": offered, "achieved": achieved, "err": err,
+                    "p50": p50 / 1e6, "p99": p99 / 1e6,
+                    "p999": p999 / 1e6, "max": mx / 1e6})
     return out
+
+
+def load_summary(run_dir, proxy, tags):
+    """Whole-run tail latency (ms) from zrk's --format json summary — the numbers
+    the old p50/p99-only CSV could never give: p99.9, p99.99, max. Max across
+    tags (one loadgen in practice)."""
+    best = {}
+    for tag in tags:
+        for path in (os.path.join(run_dir, f"{proxy}.{tag}.json"),):
+            if not os.path.exists(path):
+                continue
+            try:
+                lat = json.load(open(path)).get("latency_us", {})
+            except (json.JSONDecodeError, OSError):
+                continue
+            for k in ("p99", "p99_9", "p99_99", "max"):
+                if k in lat:
+                    best[k] = max(best.get(k, 0.0), float(lat[k]) / 1000.0)  # us -> ms
+    return best
 
 
 KEEPUP = 0.90  # "keeping up" = achieved >= KEEPUP * offered
@@ -127,13 +160,19 @@ def cpu_vs_offered(prom, proxy, run):
     return pts
 
 
+def _ms(v):
+    return "—" if v is None else (f"{v:.0f}ms" if v >= 10 else f"{v:.1f}ms")
+
+
 def build(meta, run_dir, prom):
     runs = meta["runs"]
     present = [p for p in PROXY_ORDER if p in runs] + [p for p in runs if p not in PROXY_ORDER]
     data = {}
     for p in present:
-        rows = load_merged(run_dir, p, runs[p].get("loadgens", ["lg1"]))
-        data[p] = {"rows": rows, "knee": knee(rows), "sustained": sustained(rows)}
+        tags = runs[p].get("loadgens", ["lg1"])
+        rows = load_merged(run_dir, p, tags)
+        data[p] = {"rows": rows, "knee": knee(rows), "sustained": sustained(rows),
+                   "summary": load_summary(run_dir, p, tags)}
 
     def line(key):
         out = []
@@ -163,6 +202,10 @@ def build(meta, run_dir, prom):
                    "rps", achieved, present, "si", "req/s", sat),
         chart_card("p99 latency vs offered", "tail — explodes at the tipping point",
                    "p99", line("p99"), present, "ms", "ms", sat),
+        chart_card("p99.9 latency vs offered", "deep tail (HdrHistogram, coordinated-omission corrected)",
+                   "p999", line("p999"), present, "ms", "ms", sat),
+        chart_card("max latency vs offered", "worst request per window — the CO-corrected outlier",
+                   "max", line("max"), present, "ms", "ms", sat),
         chart_card("p50 latency vs offered", "median request duration",
                    "p50", line("p50"), present, "ms", "ms", sat),
         chart_card("Proxy CPU vs offered", "container cores (cAdvisor), mapped onto the offered axis",
@@ -171,14 +214,19 @@ def build(meta, run_dir, prom):
                    "err", line("err"), present, "pct", "", sat),
     ]
 
-    # summary table
+    # summary table — max sustained + knee, plus the HdrHistogram deep tail
+    # (whole-run p99.9 / p99.99 / max) that the old p50/p99-only CSV lacked.
     rows_html = ""
     for p in sorted(present, key=lambda p: data[p]["sustained"], reverse=True):
         s = data[p]["sustained"]
         k = data[p]["knee"]
+        sm = data[p]["summary"]
         cls = ' class="baseline"' if p == "direct" else ""
         rows_html += (f"<tr{cls}><td>{html.escape(p)}</td><td>{fmt_si(s)}</td>"
-                      f"<td>{fmt_si(k) if k else '—'}</td></tr>")
+                      f"<td>{fmt_si(k) if k else '—'}</td>"
+                      f"<td>{_ms(sm.get('p99_9'))}</td>"
+                      f"<td>{_ms(sm.get('p99_99'))}</td>"
+                      f"<td>{_ms(sm.get('max'))}</td></tr>")
 
     legend = "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)
     rid = html.escape(meta.get("runid", ""))
@@ -190,19 +238,20 @@ def build(meta, run_dir, prom):
 <body>
 <div class="eyebrow">L4 proxy benchmark · open-loop ramp</div>
 <h1>relay throughput <span class="rid">{rid}</span></h1>
-<p class="meta">Every proxy driven through the identical linear ramp (Vegeta LinearPacer, coordinated-omission safe).
-Throughput &amp; latency from the harness CSV, proxy CPU from Prometheus — all on one analytic offered-load axis.</p>
+<p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
+Throughput &amp; HdrHistogram latency from the harness NDJSON, proxy CPU from Prometheus — all on one offered-load axis.</p>
 <div class="legend">{legend}</div>
-<div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th><th>knee @ offered</th></tr>
+<div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th><th>knee @ offered</th>
+<th>p99.9</th><th>p99.99</th><th>max</th></tr>
 {rows_html}</table></div>
 <div class="grid2">{''.join(cards)}</div>
-<footer>generated by report/report_vegeta.py — <a href="https://zoxy.io">zoxy.io</a></footer>
+<footer>generated by report/report.py — <a href="https://zoxy.io">zoxy.io</a></footer>
 <script>{JS}</script></body></html>"""
 
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: report_vegeta.py <run-dir>", file=sys.stderr)
+        print("usage: report.py <run-dir>", file=sys.stderr)
         sys.exit(2)
     run_dir = sys.argv[1]
     meta = json.load(open(os.path.join(run_dir, "meta.json")))

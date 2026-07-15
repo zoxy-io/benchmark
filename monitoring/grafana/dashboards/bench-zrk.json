@@ -1,6 +1,6 @@
 {
-  "uid": "proxy-bench-live-veg",
-  "title": "Proxy bench \u2014 live run (vegeta open-loop)",
+  "uid": "proxy-bench-live-zrk",
+  "title": "Proxy bench \u2014 live run (zrk open-loop)",
   "description": "Watch a ramp as it runs. Cross-proxy comparison lives in the HTML report (make report), not here.",
   "schemaVersion": 39,
   "editable": true,
@@ -19,7 +19,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "query": "label_values(vegeta_achieved_rps, testid)",
+        "query": "label_values(zrk_achieved_rps, testid)",
         "refresh": 2,
         "sort": 4
       },
@@ -31,7 +31,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "query": "label_values(vegeta_achieved_rps{testid=~\"$testid\"}, proxy)",
+        "query": "label_values(zrk_achieved_rps{testid=~\"$testid\"}, proxy)",
         "refresh": 2,
         "includeAll": true,
         "multi": true
@@ -42,7 +42,7 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Achieved req/s per proxy (vegeta)",
+      "title": "Achieved req/s per proxy (zrk)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -62,7 +62,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (proxy) (vegeta_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "sum by (proxy) (zrk_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
           "legendFormat": "{{proxy}}"
         }
       ]
@@ -70,7 +70,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Latency (p50 / p95 / p99)",
+      "title": "Latency (p50 / p90 / p99 / p99.9)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -90,18 +90,23 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (proxy) (vegeta_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.5\"})",
+          "expr": "max by (proxy) (zrk_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.5\"})",
           "legendFormat": "{{proxy}} p50"
         },
         {
           "refId": "B",
-          "expr": "max by (proxy) (vegeta_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.95\"})",
-          "legendFormat": "{{proxy}} p95"
+          "expr": "max by (proxy) (zrk_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.9\"})",
+          "legendFormat": "{{proxy}} p90"
         },
         {
           "refId": "C",
-          "expr": "max by (proxy) (vegeta_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.99\"})",
+          "expr": "max by (proxy) (zrk_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.99\"})",
           "legendFormat": "{{proxy}} p99"
+        },
+        {
+          "refId": "D",
+          "expr": "max by (proxy) (zrk_latency_seconds{testid=~\"$testid\", proxy=~\"$proxy\", quantile=\"0.999\"})",
+          "legendFormat": "{{proxy}} p99.9"
         }
       ]
     },
@@ -128,12 +133,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (proxy) (vegeta_errors_ratio{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "max by (proxy) (zrk_errors_ratio{testid=~\"$testid\", proxy=~\"$proxy\"})",
           "legendFormat": "{{proxy}} error ratio"
         },
         {
           "refId": "B",
-          "expr": "sum by (proxy) (vegeta_offered_rps{testid=~\"$testid\", proxy=~\"$proxy\"} - vegeta_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "expr": "sum by (proxy) (zrk_offered_rps{testid=~\"$testid\", proxy=~\"$proxy\"} - zrk_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
           "legendFormat": "{{proxy}} shortfall"
         }
       ]
@@ -247,7 +252,7 @@
         "hide": false,
         "iconColor": "semi-dark-orange",
         "name": "Proxy pass",
-        "expr": "sum(vegeta_achieved_rps{testid=~\"$testid\"}) by (proxy)",
+        "expr": "sum(zrk_achieved_rps{testid=~\"$testid\"}) by (proxy)",
         "step": "15s",
         "tagKeys": "proxy",
         "titleFormat": "{{proxy}}",

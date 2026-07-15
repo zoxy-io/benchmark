@@ -4,8 +4,8 @@
 #   monitoring  prometheus + grafana            (local: always; cloud: loadgen VM)
 #   backend     nginx origin                    (local: always; cloud: backend VM)
 #   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|nginx|pingora)
-# The load generator is not a compose service: loadgen/vegeta-ramp runs on the
-# loadgen host, driven by scripts/vegeta-bench.sh.
+# The load generator is not a compose service: loadgen/zrk runs on the
+# loadgen host, driven by scripts/zrk-bench.sh.
 # cadvisor + node_exporter carry every profile so each docker host exports
 # per-container CPU/mem and host metrics no matter which role it plays.
 #
@@ -192,7 +192,7 @@ services:
       - --storage.tsdb.retention.time=30d
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # local/ ships in-repo; vegeta-bench.sh generates cloud/ from terraform IPs
+      # local/ ships in-repo; zrk-bench.sh generates cloud/ from terraform IPs
       - ./monitoring/targets/${PROM_TARGETS:-local}:/etc/prometheus/targets:ro
       - prom-data:/prometheus
     ports:
@@ -207,7 +207,7 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       # datasource url (see provisioning/datasources/prometheus.yml); local
-      # default here, vegeta-bench.sh overrides via .env with the loadgen address.
+      # default here, zrk-bench.sh overrides via .env with the loadgen address.
       PROM_URL: ${PROM_URL:-http://prometheus:9090}
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -249,10 +249,10 @@ services:
     ports:
       - "9100:9100"
 
-  # The load generator is loadgen/vegeta-ramp (an open-loop linear-ramp built on
-  # Vegeta), run on the loadgen host by scripts/vegeta-bench.sh — not a compose
-  # service. It exports a live /metrics endpoint scraped by the `vegeta` job in
-  # prometheus.yml; results land as per-proxy CSVs for report/report_vegeta.py.
+  # The load generator is loadgen/zrk (an open-loop linear-ramp built on
+  # zrk), run on the loadgen host by scripts/zrk-bench.sh — not a compose
+  # service. Its run.py bridges live stats to a /metrics endpoint scraped by the `zrk` job in
+  # prometheus.yml; results land as per-proxy NDJSON/JSON/HDR for report/report.py.
 
 volumes:
   prom-data:

@@ -1,7 +1,7 @@
 # proxy-bench — one open-loop linear ramp per proxy on Yandex Cloud.
 #
 #   make cloud-up    terraform apply the fleet (loadgen + proxy + backend)
-#   make cloud-bench build + ramp every proxy (vegeta-ramp); writes CSVs + report
+#   make cloud-bench build + ramp every proxy (zrk); writes NDJSON + report
 #   make report      render results/latest -> report.html
 #   make cloud-down  terraform destroy
 #   make up / down   local: start/stop backend + prometheus + grafana
@@ -34,11 +34,11 @@ cloud-up:
 	$(TF) -chdir=cloud apply -auto-approve
 
 cloud-bench:
-	./scripts/vegeta-bench.sh
+	./scripts/zrk-bench.sh
 
 # uses the prometheus URL recorded in the run's meta.json (override: PROM_URL=...)
 report:
-	python3 report/report_vegeta.py results/latest
+	python3 report/report.py results/latest
 
 cloud-down:
 	$(TF) -chdir=cloud destroy -auto-approve

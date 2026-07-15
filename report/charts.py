@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared inline-SVG chart engine + Prometheus helpers for the report scripts.
-Extracted so report_vegeta.py (the vegeta open-loop report) has the charting
-without pulling in any k6-specific logic. Stdlib only."""
+Extracted so report.py (the zrk open-loop report) has the charting without
+pulling in anything generator-specific. Stdlib only."""
 import html
 import json
 import math

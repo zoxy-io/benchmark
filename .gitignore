@@ -16,6 +16,11 @@ devenv.local.nix
 # direnv
 .direnv
 
-# python bytecode (report_vegeta.py imports charts.py)
+# python bytecode (report.py imports charts.py)
 __pycache__/
 *.pyc
+
+# zrk load generator build artifacts (loadgen/zrk/build.sh)
+loadgen/zrk/src/
+loadgen/zrk/zrk
+loadgen/zrk/.built-ref
