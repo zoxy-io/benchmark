@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 TF=${TF:-tofu}; SSH_USER=${SSH_USER:-ubuntu}; REMOTE=${REMOTE_DIR:-bench}
 PROXIES=${PROXIES:-"direct zoxy haproxy envoy traefik nginx pingora"}
 MAX_RATE=${MAX_RATE:-67000}
-RAMP_SECONDS=${RAMP_SECONDS:-120}
+RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1024}   # in-flight cap = zoxy's 1-process relay-buffer cap
 THREADS=${THREADS:-}               # zrk worker threads (empty -> loadgen nproc)
