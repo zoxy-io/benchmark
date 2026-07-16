@@ -21,6 +21,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from charts import (  # noqa: E402
@@ -228,7 +229,22 @@ def peak_mem(prom, proxy, run):
     return max((v for _, v in pts), default=None)
 
 
-def build(meta, run_dir, prom):
+def _series(present, data, key, keepup=False):
+    """One chart's series list: [(proxy, colors, [(offered, y)...], dashed)]. With
+    keepup, keep only near-zero-backlog windows (latency at healthy load)."""
+    out = []
+    for p in present:
+        pts = [(r["offered"], r[key]) for r in data[p]["rows"]
+               if not keepup or (r["t"] >= 3 and r["offered"] > 0
+                                 and r["achieved"] >= LAT_KEEPUP * r["offered"])]
+        if pts:
+            out.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
+    return out
+
+
+def gather(meta, run_dir, prom):
+    """Compute every measured curve/summary once, generator-agnostic, so the HTML
+    and the JSON render from the SAME numbers. Returns (present, data, series)."""
     runs = meta["runs"]
     present = [p for p in PROXY_ORDER if p in runs] + [p for p in runs if p not in PROXY_ORDER]
     data = {}
@@ -240,17 +256,7 @@ def build(meta, run_dir, prom):
                    "hgrm_file": hgrm_filename(run_dir, p, tags),
                    "mem": None if p == "direct" else peak_mem(prom, p, runs[p])}
 
-    def line(key, keepup=False):
-        out = []
-        for p in present:
-            pts = [(r["offered"], r[key]) for r in data[p]["rows"]
-                   if not keepup or (r["t"] >= 3 and r["offered"] > 0
-                                     and r["achieved"] >= LAT_KEEPUP * r["offered"])]
-            if pts:
-                out.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
-        return out
-
-    achieved = line("achieved")
+    achieved = _series(present, data, "achieved")
     xmax = max((x for _, _, pts, _ in achieved for x, _ in pts), default=1)
     achieved.append(("offered", ("#c3c2b7", "#383835"), [(0, 0), (xmax, xmax)], True))
 
@@ -262,17 +268,24 @@ def build(meta, run_dir, prom):
         if pts:
             cpu.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, False))
 
+    series = {"rps": achieved, "cpu": cpu,
+              "p99": _series(present, data, "p99", keepup=True),
+              "err": _series(present, data, "err")}
+    return present, data, series
+
+
+def build(meta, present, data, series):
     cards = [
         chart_card("Successful req/s vs offered",
                    "open-loop ramp; dashed gray = perfect keep-up",
-                   "rps", achieved, "si", "req/s"),
+                   "rps", series["rps"], "si", "req/s"),
         chart_card("Proxy CPU vs offered", "container cores (cAdvisor), mapped onto the offered axis",
-                   "cpu", cpu, "si", "cores"),
+                   "cpu", series["cpu"], "si", "cores"),
         chart_card("p99 latency vs offered (while keeping up)",
                    "per-window tail; each line stops where that proxy stops keeping up",
-                   "p99", line("p99", keepup=True), "ms", "ms"),
+                   "p99", series["p99"], "ms", "ms"),
         chart_card("Error ratio vs offered", "non-2xx / timeouts (shedding or collapse)",
-                   "err", line("err"), "pct", ""),
+                   "err", series["err"], "pct", ""),
     ]
 
     # summary table — max sustained throughput + median/max latency (per-proxy,
@@ -329,6 +342,72 @@ keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at hea
 <script>{JS}</script></body></html>"""
 
 
+def build_json(meta, present, data, series, generated):
+    """The canonical MEASURED-data artifact — the exact numbers the HTML renders,
+    as JSON, so downstream consumers (the site) never parse HTML. Editorial copy
+    (version strings, prose, notes) is NOT here; it belongs to the consumer. All
+    units are declared in `units`. Latency is milliseconds; the hist x-axis is
+    n = 1/(1-percentile) so p0/p90/p99/p99.9… land on even decades."""
+    runs = meta["runs"]
+    # the ramp is identical across proxies — read it off any present run
+    ramp_src = next((runs[p] for p in present if p in runs), {})
+
+    def proxy_row(p):
+        h = data[p]["hist"]
+        has_h = bool(h) and h.total() > 0
+        return {
+            "name": p,
+            "self": p == "zoxy",           # the subject of the benchmark
+            "baseline": p == "direct",     # no-proxy origin calibration, not a competitor
+            "sustained": round(data[p]["sustained"]),          # req/s
+            "mem": data[p]["mem"],                             # peak working-set bytes | null
+            "latency_ms": {
+                "p50": round(h.value_at_percentile(50) / 1000.0, 4) if has_h else None,
+                "max": round(h.max() / 1000.0, 4) if has_h else None,
+            },
+            "hgrm_file": data[p]["hgrm_file"] or None,         # raw whole-run histogram
+        }
+
+    def ser(lst, yfn):
+        out = []
+        for n, _, pts, dashed in lst:
+            if not pts:
+                continue
+            row = {"name": n, "pts": [[round(x, 1), yfn(y)] for x, y in sorted(pts)]}
+            if n == "offered":
+                row["ref"] = True          # synthetic y=x perfect-keep-up diagonal
+            if n == "direct":
+                row["baseline"] = True
+            out.append(row)
+        return out
+
+    return {
+        "schema": 1,
+        "runid": meta.get("runid", ""),
+        "generated": generated,
+        "units": {"rps": "req/s", "cpu": "cores", "p99_ms": "ms", "err": "ratio",
+                  "mem": "bytes", "latency_ms": "ms", "hist": "[1/(1-percentile), ms]"},
+        "ramp": {"start_rate": ramp_src.get("start_rate"),
+                 "max_rate": ramp_src.get("max_rate"),
+                 "ramp_seconds": ramp_src.get("ramp_seconds")},
+        "keepup": {"throughput": KEEPUP, "latency": LAT_KEEPUP},
+        "palette": {p: PALETTE[p][0] for p in present if p in PALETTE},
+        # ordered by max sustained throughput, same as the HTML summary table
+        "proxies": [proxy_row(p) for p in
+                    sorted(present, key=lambda p: data[p]["sustained"], reverse=True)],
+        "series": {
+            "rps": ser(series["rps"], lambda y: round(y, 1)),
+            "cpu": ser(series["cpu"], lambda y: round(y, 6)),
+            "p99_ms": ser(series["p99"], lambda y: round(y * 1000.0, 4)),
+            "err": ser(series["err"], lambda y: round(y, 6)),
+        },
+        "hist": {
+            p: {"pts": [[round(n, 4), round(v, 4)] for n, v in hdr_points(data[p]["hist"])]}
+            for p in present if data[p]["hist"] and data[p]["hist"].total() > 0
+        },
+    }
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: report.py <run-dir>", file=sys.stderr)
@@ -336,7 +415,16 @@ def main():
     run_dir = sys.argv[1]
     meta = json.load(open(os.path.join(run_dir, "meta.json")))
     prom = os.environ.get("PROM_URL", meta.get("prom", "http://localhost:9090"))
-    out = build(meta, run_dir, prom)
+
+    present, data, series = gather(meta, run_dir, prom)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rj = build_json(meta, present, data, series, generated)
+    json_dest = os.path.join(run_dir, "report.json")
+    open(json_dest, "w").write(json.dumps(rj, separators=(",", ":")))
+    print(f"wrote {os.path.abspath(json_dest)}")
+
+    out = build(meta, present, data, series)
     dest = os.path.join(run_dir, "report.html")
     open(dest, "w").write(out)
     print(f"wrote {os.path.abspath(dest)}")
