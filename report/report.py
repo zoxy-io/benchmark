@@ -97,9 +97,13 @@ def load_merged(run_dir, proxy, tags):
     for i in sorted(per):
         offered, achieved, total, errs, p50, p99, p999, mx, t = per[i]
         err = errs / total if total else 0.0
+        # shed = fraction of OFFERED load the proxy never served. L4 passthroughs
+        # don't reject or time out under overload (err stays ~0) — they just can't
+        # keep up, so the shortfall (achieved < offered) is the real "shedding".
+        shed = max(0.0, 1.0 - achieved / offered) if offered else 0.0
         # latency series are handed to charts in SECONDS (yfmt="ms" scales x1000).
         out.append({"t": t, "offered": offered, "achieved": achieved, "err": err,
-                    "p50": p50 / 1e6, "p99": p99 / 1e6,
+                    "shed": shed, "p50": p50 / 1e6, "p99": p99 / 1e6,
                     "p999": p999 / 1e6, "max": mx / 1e6})
     return out
 
@@ -283,6 +287,22 @@ def _series(present, data, key, keepup=False, keep_ratio=LAT_KEEPUP):
     return out
 
 
+def smooth_median(pts, w=7):
+    """Rolling-median (odd window) over x-sorted points — damps per-window jitter
+    and lone spikes (e.g. shed-ratio blowing up in a low-offered warmup window
+    where the tiny denominator makes a small dip read as a huge fraction) while
+    keeping the trend."""
+    if len(pts) < w:
+        return sorted(pts)
+    s = sorted(pts)
+    h = w // 2
+    out = []
+    for i in range(len(s)):
+        ys = sorted(y for _, y in s[max(0, i - h):i + h + 1])
+        out.append((s[i][0], ys[len(ys) // 2]))
+    return out
+
+
 def p99_curve(run_dir, proxy, tags, keep_ratio=P99_KEEPUP, win=9):
     """Dense, low-noise p99-vs-offered curve: one point per keep-up window (full
     x-resolution), but each p99 is read from the MERGED per-window HdrHistograms of
@@ -351,8 +371,17 @@ def gather(meta, run_dir, prom):
         pts = p99_curve(run_dir, p, runs[p].get("loadgens", ["lg1"]))
         if pts:
             p99.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
-    series = {"rps": achieved, "cpu": cpu, "p99": p99,
-              "err": _series(present, data, "err")}
+    # shed only means something once offered is non-trivial: below ~2k req/s the
+    # ratio is warmup jitter (a small dip on a tiny denominator reads as a big
+    # fraction), so floor it, then smooth to expose the collapse trend.
+    shed = []
+    for p in present:
+        pts = [(r["offered"], r["shed"]) for r in data[p]["rows"]
+               if r["t"] >= 3 and r["offered"] >= 2000]
+        if pts:
+            shed.append((p, PALETTE.get(p, ("#898781", "#898781")),
+                         smooth_median(pts, 15), p == "direct"))
+    series = {"rps": achieved, "cpu": cpu, "p99": p99, "shed": shed}
     return present, data, series
 
 
@@ -372,8 +401,8 @@ def build(meta, present, data, series):
         chart_card("p99 latency vs offered (while keeping up)",
                    "per-window tail (log scale); each line stops where that proxy stops keeping up",
                    "p99", series["p99"], "ms", "ms", ylog=True, xmax=crop),
-        chart_card("Error ratio vs offered", "non-2xx / timeouts (shedding or collapse)",
-                   "err", series["err"], "pct", "", xmax=crop),
+        chart_card("Load shed vs offered", "offered load the proxy couldn't serve (1 − achieved/offered); HTTP errors/timeouts were ~0",
+                   "shed", series["shed"], "pct", "", xmax=crop),
     ]
 
     # summary table — max sustained throughput + median/max latency (per-proxy,
@@ -473,7 +502,7 @@ def build_json(meta, present, data, series, generated):
         "schema": 1,
         "runid": meta.get("runid", ""),
         "generated": generated,
-        "units": {"rps": "req/s", "cpu": "cores", "p99_ms": "ms", "err": "ratio",
+        "units": {"rps": "req/s", "cpu": "cores", "p99_ms": "ms", "shed": "ratio",
                   "mem": "bytes", "latency_ms": "ms", "hist": "[1/(1-percentile), ms]"},
         "ramp": {"start_rate": ramp_src.get("start_rate"),
                  "max_rate": ramp_src.get("max_rate"),
@@ -487,7 +516,7 @@ def build_json(meta, present, data, series, generated):
             "rps": ser(series["rps"], lambda y: round(y, 1)),
             "cpu": ser(series["cpu"], lambda y: round(y, 6)),
             "p99_ms": ser(series["p99"], lambda y: round(y * 1000.0, 4)),
-            "err": ser(series["err"], lambda y: round(y, 6)),
+            "shed": ser(series["shed"], lambda y: round(y, 6)),
         },
         "hist": {
             p: {"pts": [[round(n, 4), round(v, 4)] for n, v in hdr_points(data[p]["hist"])]}
