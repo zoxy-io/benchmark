@@ -32,16 +32,26 @@ import hdr  # noqa: E402
 
 
 def load_merged(run_dir, proxy, tags):
-    """Merge per-loadgen NDJSON into one window series keyed by elapsed_s.
-    Combined offered/achieved are SUMS; latency is the max across loadgens (a
-    conservative tail — they hit the same proxy, so distributions track).
-    zrk latency is in microseconds; charts want seconds, so divide by 1e6."""
-    per = {}  # elapsed -> [offered, total_req, errs, p50us, p99us, p999us, maxus]
+    """Merge per-loadgen NDJSON into one window series, ALIGNED BY INTERVAL INDEX.
+    Combined offered/achieved are SUMS ACROSS LOADGENS (each loadgen emits one row
+    per interval); latency is the max across loadgens (a conservative tail — they
+    hit the same proxy, so distributions track). zrk latency is in microseconds;
+    charts want seconds, so divide by 1e6.
+
+    We bucket by each loadgen's interval SEQUENCE INDEX, not by rounded wall-clock
+    seconds. zrk's ~1s grid drifts, so a single loadgen can emit two rows that
+    round to the same integer second (notably the last on-grid window plus the
+    end-of-run flush row at t≈duration+ε). Rounding-then-summing fused those two
+    windows and DOUBLED that point's offered/achieved — a phantom spike at the
+    right edge of every chart. Index alignment sums only matching intervals across
+    loadgens and never fuses a loadgen's own adjacent windows."""
+    per = {}  # interval_idx -> [offered, achieved, req, err, p50us, p99us, p999us, maxus, elapsed_s]
     for tag in tags:
         path = os.path.join(run_dir, f"{proxy}.{tag}.ndjson")
         if not os.path.exists(path):
             continue
         with open(path) as fh:
+            i = 0
             for raw in fh:
                 raw = raw.strip()
                 if not raw:
@@ -50,9 +60,8 @@ def load_merged(run_dir, proxy, tags):
                     r = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                t = int(round(float(r.get("t", 0))))
                 lat = r.get("latency_us", {})
-                row = per.setdefault(t, [0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                row = per.setdefault(i, [0.0, 0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
                 row[0] += float(r.get("target_rate", 0.0))     # offered
                 row[1] += float(r.get("achieved_rate", 0.0))   # achieved (req/s)
                 row[2] += int(r.get("requests", 0))            # window req count
@@ -61,9 +70,11 @@ def load_merged(run_dir, proxy, tags):
                 row[5] = max(row[5], float(lat.get("p99", 0)))
                 row[6] = max(row[6], float(lat.get("p99_9", 0)))
                 row[7] = max(row[7], float(lat.get("max", 0)))
+                row[8] = max(row[8], float(r.get("t", 0)))     # elapsed (warmup filter)
+                i += 1
     out = []
-    for t in sorted(per):
-        offered, achieved, total, errs, p50, p99, p999, mx = per[t]
+    for i in sorted(per):
+        offered, achieved, total, errs, p50, p99, p999, mx, t = per[i]
         err = errs / total if total else 0.0
         # latency series are handed to charts in SECONDS (yfmt="ms" scales x1000).
         out.append({"t": t, "offered": offered, "achieved": achieved, "err": err,
