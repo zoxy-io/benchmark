@@ -65,6 +65,10 @@ done
 # on the backend, exporters on the proxy. Non-fatal — a `direct` run (loadgen ->
 # backend) needs neither prometheus nor the proxy VM.
 ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && PROM_TARGETS=cloud PROM_URL=http://$LG_PRIV:9090 $COMPOSE --profile monitoring up -d" >/dev/null 2>&1 || true
+# prometheus.yml is a bind mount: content edits don't recreate the container, so
+# ask the running instance to reload (requires --web.enable-lifecycle; harmless
+# no-op right after a fresh recreate)
+ssh -o BatchMode=yes "$SSH_USER@$LG" 'curl -fsS -X POST localhost:9090/-/reload' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$BACKEND_PUB" "cd $REMOTE && $COMPOSE --profile backend up -d --wait" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile monitoring up -d cadvisor node_exporter" >/dev/null 2>&1 || true
 

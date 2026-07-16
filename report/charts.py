@@ -9,7 +9,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-STEP = 5
+# query_range step (s). cadvisor/zrk are scraped at 1s (monitoring/prometheus.yml)
+# — a coarser step would throw that resolution away in the CPU-vs-offered curve.
+STEP = 1
 
 
 # dark-ground hues (zoxy.io palette): zoxy is the amber signal, the rest are

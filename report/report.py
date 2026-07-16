@@ -211,7 +211,10 @@ def cpu_vs_offered(prom, proxy, run):
                 for ts, cores in prom_query_range(prom, q, s, e)
                 if run["start_rate"] + slope * (ts - s) >= 0]
 
-    pts = series(f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[10s]))')
+    # [4s] over 1s cadvisor scrapes: 4-5 samples per window — fine-grained with
+    # mild smoothing. The node fallback keeps [10s]: that job scrapes at 5s, so
+    # a tighter window would leave rate() without its two required samples.
+    pts = series(f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[4s]))')
     if pts:
         return pts
     cpuset = run.get("proxy_cpuset")

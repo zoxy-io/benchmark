@@ -7,7 +7,12 @@ global:
   scrape_timeout: 4s
 
 scrape_configs:
+  # 1s: the report's CPU-vs-offered curve resolves one point per scrape, so 5s
+  # gave ~60 coarse points across a 300s ramp (~1.1k rps of offered axis each).
+  # cAdvisor is pinned to 1s housekeeping in compose to match.
   - job_name: cadvisor
+    scrape_interval: 1s
+    scrape_timeout: 900ms
     file_sd_configs:
       - files: ["/etc/prometheus/targets/cadvisor.yml"]
 
@@ -16,7 +21,10 @@ scrape_configs:
       - files: ["/etc/prometheus/targets/node.yml"]
 
   # zrk's live /metrics (up only while a ramp runs; "down" between proxies is
-  # expected). file_sd tolerates the target file being absent.
+  # expected). file_sd tolerates the target file being absent. 1s: the gauges
+  # update once per zrk interval — scraping slower blurs the live dashboard.
   - job_name: zrk
+    scrape_interval: 1s
+    scrape_timeout: 900ms
     file_sd_configs:
       - files: ["/etc/prometheus/targets/zrk.yml"]

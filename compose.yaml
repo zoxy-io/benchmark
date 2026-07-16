@@ -184,6 +184,9 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=30d
+      # allow `curl -X POST /-/reload`: the config is a bind mount, so content
+      # edits don't recreate the container and would otherwise need a restart
+      - --web.enable-lifecycle
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       # local/ ships in-repo; zrk-bench.sh generates cloud/ from terraform IPs
@@ -223,6 +226,11 @@ services:
     # replaces command wholesale).
     command:
       - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+      # hard 1s sampling: dynamic housekeeping backs off (up to 60s) on "stable"
+      # containers, which would cap the report's 1s-scraped CPU curve at the
+      # backoff cadence rather than the prometheus scrape_interval
+      - --housekeeping_interval=1s
+      - --allow_dynamic_housekeeping=false
     privileged: true
     volumes:
       - /:/rootfs:ro

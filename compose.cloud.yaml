@@ -74,10 +74,12 @@ services:
     # host networking would collide with the proxy on :8080 — move cadvisor
     # (zrk-bench.sh writes the prometheus targets with :8081 to match).
     # The override replaces the whole command: keep the disable_metrics list
-    # identical to compose.yaml.
+    # and housekeeping flags identical to compose.yaml.
     command:
       - --port=8081
       - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
+      - --housekeeping_interval=1s
+      - --allow_dynamic_housekeeping=false
     environment:
       # the image's built-in HEALTHCHECK probes $CADVISOR_HEALTHCHECK_URL,
       # which defaults to :8080 — repoint it at the moved port or `up --wait`
