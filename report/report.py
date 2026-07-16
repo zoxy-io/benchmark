@@ -150,8 +150,12 @@ def hdr_points(h):
 
 
 KEEPUP = 0.90  # throughput: "keeping up" = achieved >= KEEPUP * offered
-LAT_KEEPUP = 0.99  # latency: stricter — only near-zero-backlog windows count,
-# so the tail isn't inflated by the 90%-keeping-up (already-queuing) edge.
+LAT_KEEPUP = 0.99  # latency DISTRIBUTION (capped_hist): stricter — only near-zero-
+# backlog windows count, so the tail isn't inflated by the 90%-keeping-up
+# (already-queuing) edge.
+P99_KEEPUP = 0.95  # p99-vs-offered CURVE only: looser than the histogram so the
+# line isn't starved — 0.99 drops ~78% of windows, leaving a sparse, low-res
+# curve; <=5% backlog is still a fair per-window p99 reading and ~triples points.
 
 
 def sustained(rows):
@@ -219,7 +223,8 @@ def _ms(v):
 
 
 def hist_svg(proxy, pts):
-    """A latency-by-percentile SVG from .hgrm points: log x = 1/(1-percentile)
+    """A latency-by-percentile SVG from hdr_points() (the merged live histogram,
+    NOT the .hgrm file — that's only the download link): log x = 1/(1-percentile)
     (so p0/p90/p99/p99.9… are evenly spaced), linear y = latency ms."""
     if not pts:
         return "<p class='empty'>no histogram</p>"
@@ -264,16 +269,54 @@ def peak_mem(prom, proxy, run):
     return max((v for _, v in pts), default=None)
 
 
-def _series(present, data, key, keepup=False):
+def _series(present, data, key, keepup=False, keep_ratio=LAT_KEEPUP):
     """One chart's series list: [(proxy, colors, [(offered, y)...], dashed)]. With
-    keepup, keep only near-zero-backlog windows (latency at healthy load)."""
+    keepup, keep only windows within keep_ratio of offered (latency at healthy
+    load); a looser keep_ratio yields a denser, higher-resolution curve."""
     out = []
     for p in present:
         pts = [(r["offered"], r[key]) for r in data[p]["rows"]
                if not keepup or (r["t"] >= 3 and r["offered"] > 0
-                                 and r["achieved"] >= LAT_KEEPUP * r["offered"])]
+                                 and r["achieved"] >= keep_ratio * r["offered"])]
         if pts:
             out.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
+    return out
+
+
+def p99_curve(run_dir, proxy, tags, keep_ratio=P99_KEEPUP, win=9):
+    """Dense, low-noise p99-vs-offered curve: one point per keep-up window (full
+    x-resolution), but each p99 is read from the MERGED per-window HdrHistograms of
+    a win-wide neighborhood — many windows' samples instead of one ~1s window's few
+    tail samples — so the estimate is stable rather than sawtooth. Median-smoothing
+    the raw per-window p99 couldn't fix that; merging the actual sample counts does.
+    Rebuilt from the live blobs zrk streams (no .hgrm needed). Returns
+    [(offered, p99_seconds)] in window order."""
+    rows = full_windows(read_ndjson(os.path.join(run_dir, f"{proxy}.{tags[0]}.ndjson")))
+    keep = [r for r in rows
+            if r.get("t", 0) >= 3 and float(r.get("target_rate", 0)) > 0
+            and float(r.get("achieved_rate", 0)) >= keep_ratio * float(r.get("target_rate", 0))
+            and r.get("latency_histogram")]
+    if not keep:
+        return []
+    hdrs = [hdr.decode(r["latency_histogram"]) for r in keep]
+    # nonzero (bucket, count) per window: merging a neighborhood is then a few
+    # hundred ops per window, not a walk of the full ~10k-bucket counts array.
+    nz = [[(i, c) for i, c in enumerate(hd.counts) if c] for hd in hdrs]
+    offs = [float(r["target_rate"]) for r in keep]
+    geo, h, out = hdrs[0], win // 2, []
+    for i in range(len(hdrs)):
+        acc, tot = {}, 0
+        for j in range(max(0, i - h), min(len(hdrs), i + h + 1)):
+            for idx, c in nz[j]:
+                acc[idx] = acc.get(idx, 0) + c
+                tot += c
+        wanted = max(1, int(0.99 * tot + 0.5))   # matches hdr.value_at_percentile rounding
+        run = 0
+        for idx in sorted(acc):
+            run += acc[idx]
+            if run >= wanted:
+                out.append((offs[i], geo._median_equiv(geo._value_from_index(idx)) / 1e6))
+                break
     return out
 
 
@@ -303,24 +346,34 @@ def gather(meta, run_dir, prom):
         if pts:
             cpu.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, False))
 
-    series = {"rps": achieved, "cpu": cpu,
-              "p99": _series(present, data, "p99", keepup=True),
+    p99 = []
+    for p in present:
+        pts = p99_curve(run_dir, p, runs[p].get("loadgens", ["lg1"]))
+        if pts:
+            p99.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
+    series = {"rps": achieved, "cpu": cpu, "p99": p99,
               "err": _series(present, data, "err")}
     return present, data, series
 
 
 def build(meta, present, data, series):
+    # Crop every chart's offered axis to where the LAST real proxy stops keeping
+    # up (the p99 curves are keep-up-filtered, so their rightmost offered is that
+    # knee — zoxy's). Past it only the direct baseline has data, so the full ramp
+    # wasted half the width on empty space; direct's tail is clipped at the edge.
+    crop = max((x for n, _, pts, _ in series["p99"] if n != "direct" for x, _ in pts),
+               default=None)
     cards = [
         chart_card("Successful req/s vs offered",
                    "open-loop ramp; dashed gray = perfect keep-up",
-                   "rps", series["rps"], "si", "req/s"),
+                   "rps", series["rps"], "si", "req/s", xmax=crop),
         chart_card("Proxy CPU vs offered", "container cores (cAdvisor), mapped onto the offered axis",
-                   "cpu", series["cpu"], "si", "cores"),
+                   "cpu", series["cpu"], "si", "cores", xmax=crop),
         chart_card("p99 latency vs offered (while keeping up)",
-                   "per-window tail; each line stops where that proxy stops keeping up",
-                   "p99", series["p99"], "ms", "ms"),
+                   "per-window tail (log scale); each line stops where that proxy stops keeping up",
+                   "p99", series["p99"], "ms", "ms", ylog=True, xmax=crop),
         chart_card("Error ratio vs offered", "non-2xx / timeouts (shedding or collapse)",
-                   "err", series["err"], "pct", ""),
+                   "err", series["err"], "pct", "", xmax=crop),
     ]
 
     # summary table — max sustained throughput + median/max latency (per-proxy,

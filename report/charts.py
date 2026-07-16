@@ -91,29 +91,55 @@ def fmt_bytes(v):
     return f"{v:.0f}B"
 
 
-def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
-    """series_list: [(name, colors(light,dark), [(x,y)...], dashed)]"""
+def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None, ylog=False, xmax=None):
+    """series_list: [(name, colors(light,dark), [(x,y)...], dashed)]. xmax crops the
+    offered axis (e.g. to where the last real proxy stops keeping up); lines that
+    run past it are clipped at the plot edge."""
     pts_all = [p for _, _, pts, _ in series_list for p in pts]
     if not pts_all:
         return "<p class='empty'>no data</p>"
-    xmax = max(x for x, _ in pts_all)
-    ymax = max(y for _, y in pts_all)
+    if xmax is None:
+        xmax = max(x for x, _ in pts_all)
     xticks = nice_ticks(0, xmax)
-    yticks = nice_ticks(0, ymax * 1.05)
-    xmaxt, ymaxt = xticks[-1], yticks[-1]
+    xmaxt = xticks[-1]
 
     def X(x):
         return ML + (W - ML - MR) * x / xmaxt
 
-    def Y(y):
-        return H - MB - (H - MB - MT) * y / ymaxt
+    # y-axis fits the VISIBLE window (points within the cropped x-range) so a
+    # cropped-out tail can't inflate the scale.
+    vis = [(x, y) for x, y in pts_all if x <= xmaxt] or pts_all
+    if ylog:
+        # latency spans decades (sub-ms when healthy -> ~half a second at the
+        # saturation knee); a linear axis crushes every curve but the tallest into
+        # the baseline. Map log10 onto whole-decade gridlines instead.
+        pos = [y for _, y in vis if y > 0]
+        lo_exp = math.floor(math.log10(min(pos))) if pos else -3
+        hi_exp = math.ceil(math.log10(max(pos))) if pos else 0
+        if hi_exp <= lo_exp:
+            hi_exp = lo_exp + 1
+        yticks = [10.0 ** e for e in range(lo_exp, hi_exp + 1)]
+        ylo, ymaxt = 10.0 ** lo_exp, 10.0 ** hi_exp
+
+        def Y(y):
+            ly = math.log10(min(max(y, ylo), ymaxt))
+            return H - MB - (H - MB - MT) * (ly - lo_exp) / (hi_exp - lo_exp)
+    else:
+        ymax = max(y for _, y in vis)
+        yticks = nice_ticks(0, ymax * 1.05)
+        ymaxt = yticks[-1]
+
+        def Y(y):
+            return H - MB - (H - MB - MT) * y / ymaxt
 
     # latency series are in SECONDS; "ms" scales the tick labels to milliseconds
     # (the tick POSITIONS stay in seconds, so nice round seconds like 0.01 map to
     # nice round ms like 10 — no tiny 0.0050-style labels).
     fmt = fmt_bytes if yfmt == "bytes" else (lambda v: f"{v * 100:g}%") if yfmt == "pct" \
         else (lambda v: fmt_si(v * 1000)) if yfmt == "ms" else fmt_si
-    out = [f'<svg viewBox="0 0 {W} {H}" role="img">']
+    out = [f'<svg viewBox="0 0 {W} {H}" role="img">',
+           f'<clipPath id="clip-{chart_id}"><rect x="{ML}" y="{MT}" '
+           f'width="{W - ML - MR}" height="{H - MT - MB}"/></clipPath>']
     for t in yticks:
         out.append(f'<line class="grid" x1="{ML}" y1="{Y(t):.1f}" x2="{W - MR}" y2="{Y(t):.1f}"/>')
         out.append(f'<text class="tick" x="{ML - 8}" y="{Y(t) + 4:.1f}" text-anchor="end">{fmt(t)}</text>')
@@ -125,12 +151,14 @@ def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
         # sit the unit above the top gridline/tick (MT), not level with it
         out.append(f'<text class="axis-label" x="14" y="10" text-anchor="start">{y_unit}</text>')
 
+    out.append(f'<g clip-path="url(#clip-{chart_id})">')
     for name, _, pts, dashed in series_list:
         if not pts:
             continue
-        d = " ".join(f"{X(x):.1f},{Y(min(y, ymaxt)):.1f}" for x, y in sorted(pts))
+        d = " ".join(f"{X(x):.1f},{Y(y):.1f}" for x, y in sorted(pts))
         dash = ' stroke-dasharray="6 4"' if dashed else ""
         out.append(f'<polyline class="line s-{name}" points="{d}" fill="none" stroke-width="2"{dash}/>')
+    out.append('</g>')
 
     # saturation knee markers (status "serious" is reserved for state, ok here)
     for name, x in (sat_marks or []):
@@ -145,7 +173,7 @@ def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
     return "".join(out)
 
 
-def chart_card(title, subtitle, chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
+def chart_card(title, subtitle, chart_id, series_list, yfmt="si", y_unit="", sat_marks=None, ylog=False, xmax=None):
     # per-pane legends are gone — the summary table's color swatches are the
     # single key, and each chart's hover tooltip names its own lines.
     # hover-layer data: resample every series onto a shared x grid
@@ -160,7 +188,8 @@ def chart_card(title, subtitle, chart_id, series_list, yfmt="si", y_unit="", sat
         "yfmt": yfmt,
         # match svg_chart's x tick ceiling so the crosshair maps onto the same
         # scale the SVG points are drawn on.
-        "xmax": nice_ticks(0, max((x for _, _, pts, _ in series_list for x, _ in pts), default=1))[-1],
+        "xmax": nice_ticks(0, xmax if xmax is not None
+                           else max((x for _, _, pts, _ in series_list for x, _ in pts), default=1))[-1],
         "geom": [W, H, ML, MR, MT, MB],
     }
     return f"""
@@ -168,7 +197,7 @@ def chart_card(title, subtitle, chart_id, series_list, yfmt="si", y_unit="", sat
   <h2>{html.escape(title)}</h2>
   <p class="sub">{html.escape(subtitle)}</p>
   <div class="chartwrap" id="wrap-{chart_id}">
-    {svg_chart(chart_id, series_list, yfmt, y_unit, sat_marks)}
+    {svg_chart(chart_id, series_list, yfmt, y_unit, sat_marks, ylog, xmax)}
     <div class="tooltip" id="tip-{chart_id}" hidden></div>
   </div>
   <script type="application/json" id="data-{chart_id}">{json.dumps(data)}</script>
