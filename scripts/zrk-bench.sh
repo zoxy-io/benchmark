@@ -14,10 +14,9 @@ MAX_RATE=${MAX_RATE:-67000}
 RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1024}   # in-flight cap = zoxy's 1-process relay-buffer cap
-THREADS=${THREADS:-}               # zrk worker threads (empty -> loadgen nproc)
 TIMEOUT_S=${TIMEOUT_S:-5}
 ZOXY_REF=${ZOXY_REF:-main}
-ZRK_REF=${ZRK_REF:-e82ac7e}        # pinned zrk build (see loadgen/zrk/build.sh)
+ZRK_REF=${ZRK_REF:-8e9b88c}        # pinned zrk build (v0.2.1; see loadgen/zrk/build.sh)
 COOLDOWN=${COOLDOWN:-8}
 RUNID=${RUNID:-zrk-$(date -u +%Y%m%d-%H%M%S)}
 
@@ -110,7 +109,7 @@ for p in $PROXIES; do
     ssh -o BatchMode=yes "$SSH_USER@$LG" "docker run --rm --network host --ulimit nofile=1048576 \
         -v ~/zrk:/w -w /w \
         -e TARGET=$target -e MAX_RATE=$MAX_RATE -e RAMP_SECONDS=$RAMP_SECONDS -e START_RATE=$START_RATE \
-        -e CONNECTIONS=$CONNECTIONS -e THREADS=$THREADS -e TIMEOUT_S=$TIMEOUT_S \
+        -e CONNECTIONS=$CONNECTIONS -e TIMEOUT_S=$TIMEOUT_S \
         -e OUT=/w/$p.lg1 -e NAME=$p -e RUNID=$RUNID -e METRICS_ADDR=:8090 \
         python:3-alpine python3 /w/run.py" 2>&1 | grep -E 'peak|knee' || true
     end=$(date -u +%Y-%m-%dT%H:%M:%SZ)

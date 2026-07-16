@@ -20,7 +20,6 @@ change):
   RAMP_SECONDS  ramp length / run duration                         (default 120)
   START_RATE    req/s at t=0                                        (default 200)
   CONNECTIONS   open connections = in-flight cap (open-loop guard)  (default 2000)
-  THREADS       zrk worker threads                                 (default: nproc)
   TIMEOUT_S     per-request timeout, seconds                       (default 5)
   OUT           output BASE path, no extension                     (default /w/ramp)
   NAME          proxy label (logs + `proxy` metric label)          (default ramp)
@@ -57,7 +56,6 @@ MAX_RATE = envi("MAX_RATE", 200000)
 RAMP_SECONDS = envi("RAMP_SECONDS", 120)
 START_RATE = envi("START_RATE", 200)
 CONNECTIONS = envi("CONNECTIONS", 2000)
-THREADS = envi("THREADS", os.cpu_count() or 4)
 TIMEOUT_S = envi("TIMEOUT_S", 5)
 OUT = env("OUT", "/w/ramp")
 NAME = env("NAME", "ramp")
@@ -157,7 +155,6 @@ def main():
         "-R", f"{START_RATE}:{MAX_RATE}",
         "-d", f"{RAMP_SECONDS}s",
         "-c", str(CONNECTIONS),
-        "-t", str(THREADS),
         "--timeout", f"{TIMEOUT_S}s",
         "--interval", "1s",
         "--timeseries", ND, "--timeseries-histogram",
@@ -172,7 +169,7 @@ def main():
     except FileNotFoundError:
         pass
     print(f"zrk[{NAME}]: {TARGET}  {START_RATE}..{MAX_RATE} rps over {RAMP_SECONDS}s, "
-          f"conns={CONNECTIONS}, threads={THREADS}, metrics {METRICS_ADDR}", file=sys.stderr)
+          f"conns={CONNECTIONS}, metrics {METRICS_ADDR}", file=sys.stderr)
     proc = subprocess.Popen(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     # Tail the NDJSON as zrk flushes each line; keep the last gauge live.
