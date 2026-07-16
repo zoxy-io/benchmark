@@ -16,7 +16,7 @@ START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1024}   # in-flight cap = zoxy's 1-process relay-buffer cap
 TIMEOUT_S=${TIMEOUT_S:-5}
 ZOXY_REF=${ZOXY_REF:-main}
-ZRK_REF=${ZRK_REF:-8e9b88c}        # pinned zrk build (v0.2.1; see loadgen/zrk/build.sh)
+ZRK_REF=${ZRK_REF:-9f0a62d}        # pinned zrk build (see loadgen/zrk/build.sh)
 COOLDOWN=${COOLDOWN:-8}
 RUNID=${RUNID:-zrk-$(date -u +%Y%m%d-%H%M%S)}
 

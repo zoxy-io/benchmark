@@ -8,7 +8,7 @@
 set -eu
 
 ZRK_REPO=${ZRK_REPO:-https://github.com/floatdrop/zrk}
-ZRK_REF=${ZRK_REF:-8e9b88c}                    # v0.2.1: measuring fixes; -t removed (#11)
+ZRK_REF=${ZRK_REF:-9f0a62d}                    # v0.2.1 + staggered sends & live counters
 ZIG_TARGET=${ZIG_TARGET:-x86_64-linux-musl}    # static: runs in alpine:3
 
 DIR=$(cd "$(dirname "$0")" && pwd)
