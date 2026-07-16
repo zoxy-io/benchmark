@@ -31,6 +31,38 @@ from charts import (  # noqa: E402
 import hdr  # noqa: E402
 
 
+def read_ndjson(path):
+    """Parse an NDJSON file into a list of dicts in emission order (skip junk)."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path) as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rows.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def full_windows(rows):
+    """The measurement windows worth trusting, dropping zrk's end-of-run PARTIAL
+    flush. zrk closes a run with a final sub-interval window (dt << the ~1s grid)
+    whose achieved_rate is a handful of requests over a sliver of wall-clock — a
+    backlog-drain burst, not steady state. Its rate lands anywhere (a collapsed
+    proxy's hit 0.94x offered, sneaking past the keep-up band to fake a 62k
+    'sustained'), so exclude any window narrower than half the run's median window.
+    `rows` are parsed NDJSON dicts in emission order; window width = gap to the
+    prior row's timestamp (first row: from t=0)."""
+    ts = [float(r.get("t", 0)) for r in rows]
+    dts = [ts[k] - (ts[k - 1] if k else 0.0) for k in range(len(ts))]
+    nominal = sorted(dts)[len(dts) // 2] if dts else 0.0
+    return [r for r, dt in zip(rows, dts) if not (nominal > 0 and dt < 0.5 * nominal)]
+
+
 def load_merged(run_dir, proxy, tags):
     """Merge per-loadgen NDJSON into one window series, ALIGNED BY INTERVAL INDEX.
     Combined offered/achieved are SUMS ACROSS LOADGENS (each loadgen emits one row
@@ -44,34 +76,23 @@ def load_merged(run_dir, proxy, tags):
     end-of-run flush row at t≈duration+ε). Rounding-then-summing fused those two
     windows and DOUBLED that point's offered/achieved — a phantom spike at the
     right edge of every chart. Index alignment sums only matching intervals across
-    loadgens and never fuses a loadgen's own adjacent windows."""
+    loadgens and never fuses a loadgen's own adjacent windows. The end-of-run
+    partial flush is dropped up front (see full_windows)."""
     per = {}  # interval_idx -> [offered, achieved, req, err, p50us, p99us, p999us, maxus, elapsed_s]
     for tag in tags:
-        path = os.path.join(run_dir, f"{proxy}.{tag}.ndjson")
-        if not os.path.exists(path):
-            continue
-        with open(path) as fh:
-            i = 0
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    r = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                lat = r.get("latency_us", {})
-                row = per.setdefault(i, [0.0, 0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                row[0] += float(r.get("target_rate", 0.0))     # offered
-                row[1] += float(r.get("achieved_rate", 0.0))   # achieved (req/s)
-                row[2] += int(r.get("requests", 0))            # window req count
-                row[3] += int(r.get("errors", 0))              # window err count
-                row[4] = max(row[4], float(lat.get("p50", 0)))
-                row[5] = max(row[5], float(lat.get("p99", 0)))
-                row[6] = max(row[6], float(lat.get("p99_9", 0)))
-                row[7] = max(row[7], float(lat.get("max", 0)))
-                row[8] = max(row[8], float(r.get("t", 0)))     # elapsed (warmup filter)
-                i += 1
+        rows = full_windows(read_ndjson(os.path.join(run_dir, f"{proxy}.{tag}.ndjson")))
+        for i, r in enumerate(rows):
+            lat = r.get("latency_us", {})
+            row = per.setdefault(i, [0.0, 0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            row[0] += float(r.get("target_rate", 0.0))     # offered
+            row[1] += float(r.get("achieved_rate", 0.0))   # achieved (req/s)
+            row[2] += int(r.get("requests", 0))            # window req count
+            row[3] += int(r.get("errors", 0))              # window err count
+            row[4] = max(row[4], float(lat.get("p50", 0)))
+            row[5] = max(row[5], float(lat.get("p99", 0)))
+            row[6] = max(row[6], float(lat.get("p99_9", 0)))
+            row[7] = max(row[7], float(lat.get("max", 0)))
+            row[8] = max(row[8], float(r.get("t", 0)))     # elapsed (warmup filter)
     out = []
     for i in sorted(per):
         offered, achieved, total, errs, p50, p99, p999, mx, t = per[i]
@@ -94,16 +115,13 @@ def capped_hist(run_dir, proxy, tags):
         if not os.path.exists(path):
             continue
         blobs = []
-        for ln in open(path):
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                r = json.loads(ln)
-            except json.JSONDecodeError:
-                continue
+        for r in full_windows(read_ndjson(path)):
             off, ach = float(r.get("target_rate", 0)), float(r.get("achieved_rate", 0))
-            if r.get("t", 0) >= 3 and off > 0 and ach >= LAT_KEEPUP * off and r.get("latency_histogram"):
+            # Same keep-up BAND as sustained(): near-zero backlog means achieved
+            # tracks offered from BOTH sides. A catch-up burst (achieved >> offered)
+            # carries balloon latencies and must not pollute the healthy histogram.
+            if r.get("t", 0) >= 3 and off > 0 and r.get("latency_histogram") and \
+                    LAT_KEEPUP * off <= ach <= off / LAT_KEEPUP:
                 blobs.append(r["latency_histogram"])
         return hdr.merge(blobs)
     return None
@@ -126,7 +144,7 @@ def hdr_points(h):
     pts, n = [], 1.0
     while n < total:
         pts.append((n, h.value_at_percentile(100.0 * (1.0 - 1.0 / n)) / 1000.0))
-        n *= 10 ** 0.25                              # ~4 points per decade
+        n *= 10 ** 0.1                               # ~10 points per decade
     pts.append((float(total), h.max() / 1000.0))     # true max at the far right
     return pts
 
@@ -144,7 +162,13 @@ def sustained(rows):
     offered, which the old max-achieved 'peak' wrongly caught)."""
     best = 0
     for r in rows:
-        if r["t"] >= 3 and r["offered"] > 0 and r["achieved"] >= KEEPUP * r["offered"]:
+        # Keep-up is a BAND, not a floor. A window whose achieved massively
+        # OVERSHOOTS offered isn't sustained throughput — it's zrk's open-loop
+        # catch-up draining backlog after a stall (CO correction). Bounding above
+        # by offered/KEEPUP rejects that post-knee thrash, the very burst the old
+        # one-sided `achieved >= KEEPUP*offered` wrongly counted as a new peak.
+        if r["t"] >= 3 and r["offered"] > 0 and \
+                KEEPUP * r["offered"] <= r["achieved"] <= r["offered"] / KEEPUP:
             best = max(best, r["achieved"])
     return best
 
