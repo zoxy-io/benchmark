@@ -94,13 +94,22 @@ def load_merged(run_dir, proxy, tags):
             row[7] = max(row[7], float(lat.get("max", 0)))
             row[8] = max(row[8], float(r.get("t", 0)))     # elapsed (warmup filter)
     out = []
+    prev_offered = 0.0
     for i in sorted(per):
         offered, achieved, total, errs, p50, p99, p999, mx, t = per[i]
         err = errs / total if total else 0.0
         # shed = fraction of OFFERED load the proxy never served. L4 passthroughs
         # don't reject or time out under overload (err stays ~0) — they just can't
         # keep up, so the shortfall (achieved < offered) is the real "shedding".
-        shed = max(0.0, 1.0 - achieved / offered) if offered else 0.0
+        # Reference the WINDOW-AVERAGE offered (midpoint of this and the previous
+        # window's end rate): zrk stamps target_rate at window END, which on a
+        # rising ramp overstates what was actually asked during the window by
+        # slope*dt/2 (~110 rps here) — ~11% of offered in the earliest windows,
+        # which read as phantom "shedding" at the start of every run (the direct
+        # baseline showed the identical bump, proving no proxy was involved).
+        mid = (offered + prev_offered) / 2 if prev_offered else offered
+        shed = max(0.0, 1.0 - achieved / mid) if mid else 0.0
+        prev_offered = offered
         # latency series are handed to charts in SECONDS (yfmt="ms" scales x1000).
         out.append({"t": t, "offered": offered, "achieved": achieved, "err": err,
                     "shed": shed, "p50": p50 / 1e6, "p99": p99 / 1e6,
@@ -380,13 +389,15 @@ def gather(meta, run_dir, prom):
         pts = p99_curve(run_dir, p, runs[p].get("loadgens", ["lg1"]))
         if pts:
             p99.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
-    # shed only means something once offered is non-trivial: below ~2k req/s the
-    # ratio is warmup jitter (a small dip on a tiny denominator reads as a big
-    # fraction), so floor it, then smooth to expose the collapse trend.
+    # shed only means something once offered is non-trivial: below ~5k req/s the
+    # DIRECT baseline itself reads ~1-4% "shed" (small-number noise on a tiny
+    # denominator — no proxy involved), so anything shown there slanders the
+    # proxies. Floor at 5k, where the baseline residual drops under ~1%, then
+    # smooth to expose the collapse trend.
     shed = []
     for p in present:
         pts = [(r["offered"], r["shed"]) for r in data[p]["rows"]
-               if r["t"] >= 3 and r["offered"] >= 2000]
+               if r["t"] >= 3 and r["offered"] >= 5000]
         if pts:
             shed.append((p, PALETTE.get(p, ("#898781", "#898781")),
                          smooth_median(pts, 15), p == "direct"))
