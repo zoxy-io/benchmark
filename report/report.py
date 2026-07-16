@@ -107,8 +107,13 @@ def load_merged(run_dir, proxy, tags):
         # slope*dt/2 (~110 rps here) — ~11% of offered in the earliest windows,
         # which read as phantom "shedding" at the start of every run (the direct
         # baseline showed the identical bump, proving no proxy was involved).
+        # NOT clamped at 0: per-window noise is symmetric around true zero, and
+        # clamping raw windows clips only the negative half — a phantom positive
+        # bias exactly where shed should read 0 (worst at low offered, where the
+        # fixed absolute noise is a larger fraction). The chart clamps AFTER
+        # median-smoothing instead, which is unbiased.
         mid = (offered + prev_offered) / 2 if prev_offered else offered
-        shed = max(0.0, 1.0 - achieved / mid) if mid else 0.0
+        shed = (1.0 - achieved / mid) if mid else 0.0
         prev_offered = offered
         # latency series are handed to charts in SECONDS (yfmt="ms" scales x1000).
         out.append({"t": t, "offered": offered, "achieved": achieved, "err": err,
@@ -317,6 +322,28 @@ def smooth_median(pts, w=7):
     return out
 
 
+def _interp(pts, x):
+    """Linear interpolation of y at x over x-sorted (x, y) points; clamps to the
+    end values outside the range, 0.0 if empty. Used to read the direct
+    baseline's shed at another run's offered levels (their window grids differ
+    by fractions of a second)."""
+    if not pts:
+        return 0.0
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    lo, hi = 0, len(pts) - 1
+    while hi - lo > 1:
+        m = (lo + hi) // 2
+        if pts[m][0] <= x:
+            lo = m
+        else:
+            hi = m
+    (x0, y0), (x1, y1) = pts[lo], pts[hi]
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0) if x1 > x0 else y0
+
+
 def p99_curve(run_dir, proxy, tags, keep_ratio=P99_KEEPUP, win=9):
     """Dense, low-noise p99-vs-offered curve: one point per keep-up window (full
     x-resolution), but each p99 is read from the MERGED per-window HdrHistograms of
@@ -389,18 +416,22 @@ def gather(meta, run_dir, prom):
         pts = p99_curve(run_dir, p, runs[p].get("loadgens", ["lg1"]))
         if pts:
             p99.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
-    # shed only means something once offered is non-trivial: below ~5k req/s the
-    # DIRECT baseline itself reads ~1-4% "shed" (small-number noise on a tiny
-    # denominator — no proxy involved), so anything shown there slanders the
-    # proxies. Floor at 5k, where the baseline residual drops under ~1%, then
-    # smooth to expose the collapse trend.
+    # Every window shown — no offered floor. Raw shed is signed (see load_merged)
+    # and median-smoothed; then the DIRECT baseline's smoothed shortfall at the
+    # same offered is subtracted before clamping at 0. The loadgen itself falls
+    # a few % short of the schedule in the first ~15s (connect overhead, TCP
+    # slow-start) and direct measures exactly that with no proxy on the path —
+    # subtracting it isolates the proxy's own shedding, so curves sit at zero
+    # from the left edge until the proxy's real knee.
+    smoothed = {p: smooth_median([(r["offered"], r["shed"]) for r in data[p]["rows"]
+                                  if r["t"] >= 3 and r["offered"] > 0], 15)
+                for p in present}
+    base = smoothed.get("direct", [])
     shed = []
     for p in present:
-        pts = [(r["offered"], r["shed"]) for r in data[p]["rows"]
-               if r["t"] >= 3 and r["offered"] >= 5000]
+        pts = [(x, max(0.0, y - _interp(base, x))) for x, y in smoothed[p]]
         if pts:
-            shed.append((p, PALETTE.get(p, ("#898781", "#898781")),
-                         smooth_median(pts, 15), p == "direct"))
+            shed.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
     series = {"rps": achieved, "cpu": cpu, "p99": p99, "shed": shed}
     return present, data, series
 
@@ -421,7 +452,7 @@ def build(meta, present, data, series):
         chart_card("p99 latency vs offered (while keeping up)",
                    "per-window tail (log scale); each line stops where that proxy stops keeping up",
                    "p99", series["p99"], "ms", "ms", ylog=True, xmax=crop),
-        chart_card("Load shed vs offered", "offered load the proxy couldn't serve (1 − achieved/offered); HTTP errors/timeouts were ~0",
+        chart_card("Load shed vs offered", "offered load the proxy couldn't serve (1 − achieved/offered), minus the direct baseline's loadgen-side shortfall; HTTP errors/timeouts were ~0",
                    "shed", series["shed"], "pct", "", xmax=crop),
     ]
 
