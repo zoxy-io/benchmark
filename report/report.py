@@ -211,10 +211,12 @@ def cpu_vs_offered(prom, proxy, run):
                 for ts, cores in prom_query_range(prom, q, s, e)
                 if run["start_rate"] + slope * (ts - s) >= 0]
 
-    # [4s] over 1s cadvisor scrapes: 4-5 samples per window — fine-grained with
-    # mild smoothing. The node fallback keeps [10s]: that job scrapes at 5s, so
-    # a tighter window would leave rate() without its two required samples.
-    pts = series(f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[4s]))')
+    # [8s] over 1s cadvisor scrapes: cadvisor's counter ticks at housekeeping
+    # cadence (~1-1.5s effective), so a tighter window catches duplicate samples
+    # at its edges and rate() dips spuriously; 8s covers ~6 ticks — smooth, and
+    # still one point per 1s step (vs the old 10s window on a 5s step). The node
+    # fallback keeps [10s]: that job scrapes at 5s and needs two samples.
+    pts = series(f'sum(rate(container_cpu_usage_seconds_total{{name="{proxy}"}}[8s]))')
     if pts:
         return pts
     cpuset = run.get("proxy_cpuset")
@@ -367,7 +369,11 @@ def gather(meta, run_dir, prom):
             continue
         pts = cpu_vs_offered(prom, p, runs[p])
         if pts:
-            cpu.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, False))
+            # median over 7 points (7s at STEP=1): cadvisor's housekeeping thread
+            # stalls under host load, gapping counter updates 2-4s, and rate()
+            # dips spuriously at the gaps — 1-2 sample spikes the median erases
+            # without the systematic lag a wider rate window would add.
+            cpu.append((p, PALETTE.get(p, ("#898781", "#898781")), smooth_median(pts), False))
 
     p99 = []
     for p in present:
