@@ -265,14 +265,14 @@ def build(meta, run_dir, prom):
     cards = [
         chart_card("Successful req/s vs offered",
                    "open-loop ramp; dashed gray = perfect keep-up",
-                   "rps", achieved, present, "si", "req/s"),
+                   "rps", achieved, "si", "req/s"),
         chart_card("Proxy CPU vs offered", "container cores (cAdvisor), mapped onto the offered axis",
-                   "cpu", cpu, [p for p in present if p != "direct"], "si", "cores"),
+                   "cpu", cpu, "si", "cores"),
         chart_card("p99 latency vs offered (while keeping up)",
                    "per-window tail; each line stops where that proxy stops keeping up",
-                   "p99", line("p99", keepup=True), present, "ms", "ms"),
+                   "p99", line("p99", keepup=True), "ms", "ms"),
         chart_card("Error ratio vs offered", "non-2xx / timeouts (shedding or collapse)",
-                   "err", line("err"), present, "pct", ""),
+                   "err", line("err"), "pct", ""),
     ]
 
     # summary table — max sustained throughput + median/max latency (per-proxy,
@@ -286,8 +286,11 @@ def build(meta, run_dir, prom):
         mx = h.max() / 1000.0 if has_h else None
         mem = data[p]["mem"]
         cls = ' class="baseline"' if p == "direct" else ""
-        # proxy name links to its latency distribution (rendered below)
-        name = f'<a href="#hist-{p}">{html.escape(p)}</a>' if has_h else html.escape(p)
+        # color swatch (the report's only legend) + proxy name; the name links
+        # to its latency distribution below when there's a histogram to jump to.
+        sw = f'<span class="swatch s-{p}"></span>'
+        name = (f'<a class="proxycell" href="#hist-{p}">{sw}{html.escape(p)}</a>' if has_h
+                else f'<span class="proxycell">{sw}{html.escape(p)}</span>')
         rows_html += (f"<tr{cls}><td>{name}</td><td>{fmt_si(s)}</td>"
                       f"<td>{_ms(p50)}</td>"
                       f"<td>{_ms(mx)}</td>"
@@ -305,7 +308,6 @@ def build(meta, run_dir, prom):
     dist = (f'<h2 class="dist-h">Latency distribution · HdrHistogram (while keeping up)</h2>'
             f'<div class="grid2">{dist_cards}</div>') if dist_cards else ""
 
-    legend = "".join(f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>' for p in present)
     rid = html.escape(meta.get("runid", ""))
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -318,7 +320,6 @@ def build(meta, run_dir, prom):
 <p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
 Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is computed per-proxy over the windows where that proxy is
 keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.</p>
-<div class="legend">{legend}</div>
 <div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th>
 <th>median</th><th>max</th><th>peak mem</th></tr>
 {rows_html}</table></div>

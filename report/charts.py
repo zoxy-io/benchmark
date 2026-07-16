@@ -145,11 +145,9 @@ def svg_chart(chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
     return "".join(out)
 
 
-def chart_card(title, subtitle, chart_id, series_list, present, yfmt="si", y_unit="", sat_marks=None):
-    legend = "".join(
-        f'<span class="chip"><span class="swatch s-{p}"></span>{p}</span>'
-        for p in present
-    )
+def chart_card(title, subtitle, chart_id, series_list, yfmt="si", y_unit="", sat_marks=None):
+    # per-pane legends are gone — the summary table's color swatches are the
+    # single key, and each chart's hover tooltip names its own lines.
     # hover-layer data: resample every series onto a shared x grid
     data = {
         # "offered" is the synthetic y=x reference diagonal (2 points), not a
@@ -169,7 +167,6 @@ def chart_card(title, subtitle, chart_id, series_list, present, yfmt="si", y_uni
 <section class="card">
   <h2>{html.escape(title)}</h2>
   <p class="sub">{html.escape(subtitle)}</p>
-  <div class="legend">{legend}</div>
   <div class="chartwrap" id="wrap-{chart_id}">
     {svg_chart(chart_id, series_list, yfmt, y_unit, sat_marks)}
     <div class="tooltip" id="tip-{chart_id}" hidden></div>
@@ -215,9 +212,6 @@ h1 .rid { color:var(--amber) }
 @media (max-width:480px) { .card { padding:15px } }
 .card h2 { font-family:var(--font-display); font-size:1.05rem; font-weight:600; letter-spacing:-.01em }
 .card .sub { color:var(--haze-dim); font-size:.8rem; margin:.35rem 0 .95rem; line-height:1.45 }
-.legend { display:flex; flex-wrap:wrap; gap:13px; margin-bottom:8px }
-.chip { display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono);
-  font-size:.74rem; letter-spacing:.02em; color:var(--haze) }
 .swatch { width:9px; height:9px; border-radius:2px; display:inline-block }
 svg { width:100%; height:auto; display:block }
 .grid { stroke:var(--line); stroke-width:1 }
@@ -248,6 +242,9 @@ table { border-collapse:collapse; width:100%; min-width:520px; font-family:var(-
 th,td { text-align:right; padding:11px 16px; border-bottom:1px solid var(--line) }
 tr:last-child td { border-bottom:none }
 th:first-child,td:first-child { text-align:left }
+/* table proxy cell: color swatch + name (the report's only legend now) */
+.proxycell { display:flex; align-items:center; gap:8px }
+.proxycell .swatch { flex:none }
 th { color:var(--amber); font-weight:500; font-size:.68rem; letter-spacing:.14em; text-transform:uppercase }
 tbody tr:hover td { background:rgba(233,239,250,.02) }
 td:first-child { color:var(--paper); font-weight:500 }
