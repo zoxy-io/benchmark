@@ -156,6 +156,36 @@ def hgrm_filename(run_dir, proxy, tags):
     return ""
 
 
+def whole_run_lat(run_dir, proxy, tags):
+    """Whole-run latency_us (µs) from the <proxy>.<tag>.json summary. The fallback
+    for a proxy that has NO keep-up window (it kneed below the ramp's start rate,
+    so capped_hist is empty) — covers the WHOLE run incl. its overloaded tail, so
+    it reads higher than the healthy-load number and is flagged as such."""
+    for tag in tags:
+        path = os.path.join(run_dir, f"{proxy}.{tag}.json")
+        if not os.path.exists(path):
+            continue
+        try:
+            return json.load(open(path)).get("latency_us")
+        except (ValueError, OSError):
+            return None
+    return None
+
+
+def lat_summary(d):
+    """(p50_ms, max_ms, source) for the summary table/JSON: the keep-up
+    histogram when present, else the whole-run json fallback, else (None,None,
+    None). source in {'keepup','whole',None} so consumers can flag the fallback."""
+    h = d["hist"]
+    if h and h.total() > 0:
+        return h.value_at_percentile(50) / 1000.0, h.max() / 1000.0, "keepup"
+    lj = d.get("lat_json")
+    if lj and lj.get("p50") is not None:
+        mx = lj.get("max")
+        return lj["p50"] / 1000.0, (mx / 1000.0 if mx is not None else None), "whole"
+    return None, None, None
+
+
 def hdr_points(h):
     """(n = 1/(1-percentile), latency_ms) points across the range for hist_svg."""
     if h is None or h.total() == 0:
@@ -394,6 +424,7 @@ def gather(meta, run_dir, prom):
         rows = load_merged(run_dir, p, tags)
         data[p] = {"rows": rows, "sustained": sustained(rows),
                    "hist": capped_hist(run_dir, p, tags),
+                   "lat_json": whole_run_lat(run_dir, p, tags),
                    "hgrm_file": hgrm_filename(run_dir, p, tags),
                    "mem": None if p == "direct" else peak_mem(prom, p, runs[p])}
 
@@ -465,8 +496,8 @@ def build(meta, present, data, series):
         s = data[p]["sustained"]
         h = data[p]["hist"]
         has_h = bool(h) and h.total() > 0
-        p50 = h.value_at_percentile(50) / 1000.0 if has_h else None
-        mx = h.max() / 1000.0 if has_h else None
+        p50, mx, lat_src = lat_summary(data[p])
+        mark = "†" if lat_src == "whole" else ""   # whole-run fallback, reads high
         mem = data[p]["mem"]
         cls = ' class="baseline"' if p == "direct" else ""
         # color swatch (the report's only legend) + proxy name; the name links
@@ -475,8 +506,8 @@ def build(meta, present, data, series):
         name = (f'<a class="proxycell" href="#hist-{p}">{sw}{html.escape(p)}</a>' if has_h
                 else f'<span class="proxycell">{sw}{html.escape(p)}</span>')
         rows_html += (f"<tr{cls}><td>{name}</td><td>{fmt_si(s)}</td>"
-                      f"<td>{_ms(p50)}</td>"
-                      f"<td>{_ms(mx)}</td>"
+                      f"<td>{_ms(p50)}{mark}</td>"
+                      f"<td>{_ms(mx)}{mark}</td>"
                       f"<td>{fmt_bytes(mem) if mem else '—'}</td></tr>")
 
     # per-proxy latency-by-percentile distributions (from the .hgrm files),
@@ -502,7 +533,8 @@ def build(meta, present, data, series):
 <h1>request throughput <span class="rid">{rid}</span></h1>
 <p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
 Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is computed per-proxy over the windows where that proxy is
-keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.</p>
+keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.
+A <b>&dagger;</b> marks a proxy with no keep-up window (it kneed below the ramp's start rate); its latency is the whole-run figure incl. overload, so it reads high.</p>
 <div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th>
 <th>median</th><th>max</th><th>peak mem</th></tr>
 {rows_html}</table></div>
@@ -523,8 +555,7 @@ def build_json(meta, present, data, series, generated):
     ramp_src = next((runs[p] for p in present if p in runs), {})
 
     def proxy_row(p):
-        h = data[p]["hist"]
-        has_h = bool(h) and h.total() > 0
+        p50, mx, lat_src = lat_summary(data[p])
         return {
             "name": p,
             "self": p == "zoxy",           # the subject of the benchmark
@@ -532,8 +563,11 @@ def build_json(meta, present, data, series, generated):
             "sustained": round(data[p]["sustained"]),          # req/s
             "mem": data[p]["mem"],                             # peak working-set bytes | null
             "latency_ms": {
-                "p50": round(h.value_at_percentile(50) / 1000.0, 4) if has_h else None,
-                "max": round(h.max() / 1000.0, 4) if has_h else None,
+                "p50": round(p50, 4) if p50 is not None else None,
+                "max": round(mx, 4) if mx is not None else None,
+                # 'keepup' = healthy-load window; 'whole' = whole-run fallback
+                # (kneed below ramp start, reads high); null = no data
+                "source": lat_src,
             },
             "hgrm_file": data[p]["hgrm_file"] or None,         # raw whole-run histogram
         }
