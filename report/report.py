@@ -98,9 +98,11 @@ def load_merged(run_dir, proxy, tags):
     for i in sorted(per):
         offered, achieved, total, errs, p50, p99, p999, mx, t = per[i]
         err = errs / total if total else 0.0
-        # shed = fraction of OFFERED load the proxy never served. L4 passthroughs
-        # don't reject or time out under overload (err stays ~0) — they just can't
-        # keep up, so the shortfall (achieved < offered) is the real "shedding".
+        # shed = fraction of OFFERED load the proxy never served. Under overload
+        # these HTTP proxies mostly just can't keep up rather than reject (err
+        # stays low) — so the shortfall (achieved < offered) is the real
+        # "shedding"; explicit rejects (e.g. zoxy's static shed response past its
+        # admission cap) surface separately as errors.
         # Reference the WINDOW-AVERAGE offered (midpoint of this and the previous
         # window's end rate): zrk stamps target_rate at window END, which on a
         # rising ramp overstates what was actually asked during the window by
@@ -496,8 +498,8 @@ def build(meta, present, data, series):
 <meta name="theme-color" content="#0e1016">
 <title>zoxy bench · {rid}</title><style>{CSS}</style></head>
 <body>
-<div class="eyebrow">L4 proxy benchmark · open-loop ramp</div>
-<h1>relay throughput <span class="rid">{rid}</span></h1>
+<div class="eyebrow">HTTP (L7) proxy benchmark · open-loop ramp</div>
+<h1>request throughput <span class="rid">{rid}</span></h1>
 <p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
 Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is computed per-proxy over the windows where that proxy is
 keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.</p>

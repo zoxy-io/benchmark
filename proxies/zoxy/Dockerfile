@@ -15,10 +15,12 @@ ARG ZIG_VERSION=0.16.0
 ARG BUILDARCH
 ARG TARGETARCH
 # Benchmark-only override of zoxy's compile-time relay-buffer pool (the L4
-# concurrency cap). Empty = upstream default (1024). Patched at build time so
-# no zoxy fork is needed; the image tag carries the value. Ceiling ~1634: past
-# it the comptime assert in_flight_ops_max <= completion_queue_entries (8192)
-# fails, because the io_uring ring is pre-budgeted (relay_buffers_max*5 ops).
+# concurrency cap). LEGACY on phase-1: the L7 path is bounded instead by the
+# comptime-derived conn_slots_max (~1020) plus the shared upstream keep-alive
+# pool, and relay_buffers_max is no longer a numeric literal (`= conn_slots_max`)
+# — so the sed guard below fails loudly if this is set against a phase-1 ref.
+# Leave EMPTY for L7 runs (the default); kept only for L4-listener A/B builds.
+# Empty = upstream default; the image tag carries the value when set.
 ARG RELAY_BUFFERS_MAX=
 
 RUN apt-get update \

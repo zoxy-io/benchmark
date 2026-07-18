@@ -6,11 +6,13 @@ ramp until it stops keeping up, and the output is one HTML report overlaying
 **latency, CPU, memory and achieved req/s against offered load** — plus a live
 Grafana view while a run is in flight.
 
-zoxy's libxev build is **L4-only**, so every proxy runs as an **L4 TCP
-passthrough** (`mode tcp`, `tcp_proxy`, TCP router, nginx `stream`, and a small
-Rust binary on Cloudflare's Pingora framework) — the same job for everyone:
-relay bytes, parse nothing. The generator still speaks HTTP end-to-end; the
-origin nginx is the HTTP endpoint and the proxies are transparent tunnels.
+zoxy's phase-1 build adds an **HTTP (L7)** listener, so every proxy runs as an
+**HTTP/1.1 reverse proxy** (`mode http`, `http_connection_manager`, HTTP router,
+nginx `proxy_pass`, and a small Rust binary on Cloudflare's Pingora framework) —
+the same job for everyone: parse each request, forward it to the origin over a
+pooled keep-alive upstream, stream the response back. The generator speaks HTTP
+end-to-end and the origin nginx is the HTTP endpoint, as before — now the
+proxies parse it too instead of tunnelling bytes.
 
 ```
              0 ──────── linear ramp ────────► MAX_RATE
@@ -69,11 +71,12 @@ poking at the stack; the load driver itself is cloud-only.
 
 ## Fairness rules (what makes the numbers comparable)
 
-- **Same job for every proxy**: all are L4 TCP passthroughs — HAProxy
-  `mode tcp`, Envoy `tcp_proxy`, Traefik TCP router, nginx `stream` (the
-  official image ships the stream module — no custom build), Pingora (a ~60-line
-  Rust binary on Cloudflare's framework — `proxies/pingora`), zoxy natively.
-  Nobody pays for HTTP parsing that others skip.
+- **Same job for every proxy**: all are HTTP/1.1 reverse proxies — HAProxy
+  `mode http`, Envoy `http_connection_manager`, Traefik HTTP router, nginx
+  `proxy_pass` (stock official image, no custom build), Pingora (a ~90-line Rust
+  binary on Cloudflare's framework — `proxies/pingora`), zoxy's phase-1 `http`
+  listener. Everyone parses each request and keeps both the client and the
+  pooled upstream connection alive — nobody skips HTTP parsing that others pay.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM` by
   cgroups, identical per proxy; thread counts hardcoded to 1 (`nbthread 1`,
   `--concurrency 1`, `GOMAXPROCS=1`, `worker_processes 1`, pingora `threads=1`).
@@ -82,7 +85,7 @@ poking at the stack; the load driver itself is cloud-only.
   overlay `cpuset`), leaving core `1` for the OS/monitoring (a saturated
   all-cores box starved the single-loop proxy).
 - **Same ramp for every proxy**: never compare runs with different `MAX_RATE`,
-  `RAMP_SECONDS` or `MAX_WORKERS` — the shared offered axis depends on it.
+  `RAMP_SECONDS` or `CONNECTIONS` — the shared offered axis depends on it.
   Recorded per run in `results/<runid>/meta.json`.
 - **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
   engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
@@ -93,12 +96,14 @@ poking at the stack; the load driver itself is cloud-only.
 - **zoxy does no DNS**: endpoints must be IP literals. The entrypoint resolves
   `backend` once at start (compose DNS locally, `extra_hosts` in cloud) and
   renders the literal into the config.
-- **zoxy holds one relay buffer per open tunnel, pool = 1024 per process,
-  compile-time**: connections beyond it get an immediate close. With N worker
-  processes the cap is N×1024, so keep `MAX_WORKERS` under it. Past a proxy's
-  sweet-spot concurrency (~2000 connections) *every* proxy congestion-collapses
-  — throughput falls as latency climbs — so `MAX_WORKERS` is set at the plateau,
-  not maxed.
+- **zoxy caps admitted connections per process, compile-time**: on the phase-1
+  L7 path the bound is `conn_slots_max` (~1020, comptime-derived from the
+  io_uring completion-queue budget) plus a shared upstream keep-alive pool of
+  `upstream_slots_max`=1024; connections beyond the admission ceiling get a
+  static shed response. So keep `CONNECTIONS` (zrk's in-flight cap) at/under it —
+  the default 1024 matches. Past a proxy's sweet-spot concurrency *every* proxy
+  congestion-collapses (throughput falls as latency climbs), so `CONNECTIONS` is
+  set at the plateau, not maxed. Every other proxy has no such per-process cap.
 - **Pin the zoxy build**: the Dockerfile caches its `git clone`, so `ZOXY_REF=main`
   can silently be a stale commit. Pin a SHA for anything version-sensitive.
 - **Origin headroom**: backend gets several times the proxy's cores; `direct`

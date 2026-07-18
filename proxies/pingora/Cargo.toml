@@ -1,20 +1,21 @@
 [package]
-name = "pingora-l4"
+name = "pingora-http"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "pingora-l4"
+name = "pingora-http"
 path = "src/main.rs"
 
 [dependencies]
-# Pingora is a framework, not a proxy — we build the L4 proxy in main.rs.
-# pingora-core alone carries Server / ServerApp / listening::Service (no need
-# for the L7 pingora-proxy or cache crates). Pin the minor here; bump to bench
-# a newer Pingora.
+# Pingora is a framework, not a proxy — we build the L7 HTTP proxy in main.rs.
+# pingora-proxy carries the ProxyHttp trait + http_proxy_service (the HTTP/1.1
+# reverse-proxy state machine and upstream connection pool); pingora-core
+# carries Server / ServerConf / HttpPeer. Pin the minor here; bump to bench a
+# newer Pingora.
 pingora-core = "0.5"
+pingora-proxy = "0.5"
 async-trait = "0.1"
-tokio = { version = "1", features = ["net", "io-util"] }
 
 [profile.release]
 opt-level = 3

@@ -1,14 +1,13 @@
-# L4 (stream) TCP passthrough :8080 -> backend:9000 (parity with zoxy's
-# L4-only libxev build — every proxy relays bytes, nobody parses HTTP). nginx
-# does L4 natively via the stream module, which the official image ships
-# compiled in (--with-stream) — no custom build needed (unlike Caddy). This is
-# an envsubst template (official-image mechanism): worker count is hardcoded to
-# 1 to match the 1-CPU quota (explicit — `auto` would count HOST cores and
-# oversubscribe the cgroup, the trap haproxy's nbthread / envoy's --concurrency /
-# GOMAXPROCS avoid too). No access_log => the hot path never touches disk.
-# `backend` resolves once at startup via the container's resolver (bridge DNS)
-# or /etc/hosts (cloud extra_hosts); the origin is already healthy by then
-# (depends_on), so no runtime resolver is needed — same as pingora.
+# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# build — every proxy now parses HTTP/1.1 and reverse-proxies requests, keeping
+# both client and upstream connections alive). This is an envsubst template
+# (official-image mechanism): worker count is hardcoded to 1 to match the 1-CPU
+# quota (explicit — `auto` would count HOST cores and oversubscribe the cgroup,
+# the trap haproxy's nbthread / envoy's --concurrency / GOMAXPROCS avoid too).
+# access_log off => the hot path never touches disk. `backend` resolves once at
+# startup via the container's resolver (bridge DNS) or /etc/hosts (cloud
+# extra_hosts); the origin is already healthy by then (depends_on), so no
+# runtime resolver is needed — same as pingora.
 worker_processes 1;
 worker_rlimit_nofile 262144;
 error_log /var/log/nginx/error.log warn;
@@ -19,12 +18,29 @@ events {
     multi_accept on; # drain the accept queue in one wakeup under bursts
 }
 
-stream {
+http {
+    access_log off;              # hot path never touches disk
+    server_tokens off;
+
     upstream origin {
         server backend:9000;
+        # Pool + keep-alive the upstream leg for parity with the other L7
+        # proxies (haproxy http-reuse, envoy/traefik/pingora default pools,
+        # zoxy's per-endpoint idle lists). Without this nginx opens a fresh
+        # backend connection per request and pays a connect on the hot path.
+        keepalive 512;
+        keepalive_requests 1000000;
+        keepalive_timeout 60s;
     }
+
     server {
         listen 8080;
-        proxy_pass origin;
+        location / {
+            proxy_pass http://origin;
+            # keep-alive to the upstream requires HTTP/1.1 with the per-hop
+            # Connection header cleared (nginx defaults to HTTP/1.0 + close).
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
     }
 }

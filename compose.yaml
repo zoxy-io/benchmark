@@ -59,12 +59,12 @@ services:
       retries: 15
 
   # ------------------------------------------------------- proxies under test --
-  # All six: listen :8080, L4 TCP passthrough (zoxy's libxev build is
-  # L4-only, so EVERY proxy relays bytes — nobody parses HTTP), upstream =
-  # backend:9000, no access logs. the generator speaks h1 end-to-end; the backend
-  # nginx is the HTTP endpoint (an nginx proxy relays it at L4, same as the
-  # rest). container_name == service name == the `name` label cAdvisor
-  # exports, which is how the report joins CPU/mem to a proxy.
+  # All six: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
+  # an `http` listener, so EVERY proxy now parses requests and reverse-proxies
+  # them), upstream = backend:9000, keep-alive both legs, no access logs. The
+  # generator speaks h1 end-to-end; the backend nginx is the HTTP origin.
+  # container_name == service name == the `name` label cAdvisor exports, which
+  # is how the report joins CPU/mem to a proxy.
   zoxy:
     <<: *proxy-common
     build:
@@ -91,12 +91,13 @@ services:
       memlock: -1 # io_uring ring memory counts against memlock on kernels <5.12
     # zoxy (libxev) has NO thread knob: one event loop per PROCESS. Capped to 1
     # CPU it runs a SINGLE process (ZOXY_WORKERS=1), pinned to core 0 by the cloud
-    # overlay — thread parity with the others (all = 1). Concurrency is hard-capped
-    # at relay_buffers_max PER PROCESS (constants.zig; 1024 on current main), one
-    # held per open tunnel for its LIFETIME — past it zoxy sheds tunnels with a
-    # client EOF. Every other proxy has no such cap. It also does no DNS —
-    # endpoints must be IP literals, so the entrypoint resolves `backend` (env
-    # below) once at start and renders the template.
+    # overlay — thread parity with the others (all = 1). On the phase-1 L7 path
+    # concurrency is hard-capped at conn_slots_max PER PROCESS (~1020, comptime-
+    # derived from the io_uring CQ budget in constants.zig) with a shared
+    # upstream keep-alive pool of upstream_slots_max=1024; past the admission
+    # ceiling zoxy sheds with a static error. Every other proxy has no such cap.
+    # It also does no DNS — endpoints must be IP literals, so the entrypoint
+    # resolves `backend` (env below) once at start and renders the template.
     environment:
       BACKEND: backend:9000
       ZOXY_WORKERS: 1
@@ -146,10 +147,10 @@ services:
 
   nginx:
     <<: *proxy-common
-    # nginx does L4 natively via the stream module — the official image ships
-    # it compiled in (--with-stream), so unlike Caddy no custom build is
-    # needed. The image's envsubst hook renders the template into /etc/nginx
-    # at start; worker_processes is hardcoded to 1 (1 CPU).
+    # nginx runs as an HTTP reverse proxy (proxy_pass) with an upstream
+    # keepalive pool — the stock official image, no custom build. The image's
+    # envsubst hook renders the template into /etc/nginx at start;
+    # worker_processes is hardcoded to 1 (1 CPU).
     image: nginx:1.27-alpine
     container_name: nginx
     profiles: [nginx]
@@ -163,11 +164,11 @@ services:
   pingora:
     <<: *proxy-common
     # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a
-    # tiny L4 TCP-passthrough binary on it (src/main.rs), hardcoded to 1 worker
-    # thread; UPSTREAM is resolved once at startup.
+    # tiny L7 HTTP reverse-proxy binary on it (src/main.rs), hardcoded to 1
+    # worker thread; UPSTREAM is resolved once at startup and pooled/kept alive.
     build:
       context: ./proxies/pingora
-    image: zoxy-bench/pingora-l4:0.5
+    image: zoxy-bench/pingora-http:0.5
     container_name: pingora
     profiles: [pingora]
     environment:

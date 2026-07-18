@@ -1,8 +1,9 @@
-# L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
-# build — every proxy relays bytes, nobody parses HTTP). Worker count is
-# hardcoded to 1 via --concurrency in the compose command (1 CPU). STRICT_DNS because
-# the upstream is a hostname (compose service locally, extra_hosts entry in
-# cloud). No access log. idle_timeout 60s matches haproxy/zoxy.
+# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# build — every proxy now parses HTTP/1.1 and reverse-proxies requests). Worker
+# count is hardcoded to 1 via --concurrency in the compose command (1 CPU).
+# STRICT_DNS because the upstream is a hostname (compose service locally,
+# extra_hosts entry in cloud). No access log. Envoy keeps both the downstream
+# and the pooled upstream connections alive by default.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9902 }
@@ -14,12 +15,28 @@ static_resources:
         socket_address: { address: 0.0.0.0, port_value: 8080 }
       filter_chains:
         - filters:
-            - name: envoy.filters.network.tcp_proxy
+            - name: envoy.filters.network.http_connection_manager
               typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: ingress_plain
-                cluster: origin
-                idle_timeout: 60s
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                common_http_protocol_options:
+                  idle_timeout: 60s
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: origin
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: origin
+                            # don't let Envoy time out the request itself; the
+                            # loadgen owns the deadline (parity with the others).
+                            timeout: 0s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
     - name: origin
@@ -27,10 +44,9 @@ static_resources:
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       # Envoy's DEFAULT circuit breaker caps a cluster at 1024 upstream
-      # connections; tcp_proxy is 1:1 downstream:upstream, so past 1024 VUs the
-      # excess connections get no upstream and fail (reset/EOF) while served
-      # ones still return 200 — ~1 in 5 failing at the benchmark's VU pool.
-      # Raise every threshold well above MAX_WORKERS (parity with haproxy maxconn).
+      # connections and requests; raise every threshold well above CONNECTIONS
+      # so pooled HTTP requests are never queued/rejected (parity with haproxy
+      # maxconn).
       circuit_breakers:
         thresholds:
           - priority: DEFAULT

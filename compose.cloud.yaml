@@ -51,8 +51,8 @@ services:
     <<: *host-net
     cpuset: "0"
     extra_hosts:
-      # nginx stream resolves `backend` once at startup via getaddrinfo, which
-      # reads this /etc/hosts entry — no runtime resolver needed (like pingora)
+      # nginx resolves `backend` once at startup via getaddrinfo, which reads
+      # this /etc/hosts entry — no runtime resolver needed (like pingora)
       - "backend:${BACKEND_IP}"
 
   pingora:

@@ -1,15 +1,16 @@
-//! Minimal L4 (TCP passthrough) proxy built on Cloudflare Pingora, for the
-//! proxy benchmark. Pingora is a framework, not a ready-made proxy, so this is
-//! the smallest program that stands a Pingora server whose app copies bytes
-//! bidirectionally between each accepted downstream connection and a freshly
-//! dialed upstream TCP connection — the same one-tunnel-per-connection L4
-//! semantics as haproxy `mode tcp` / envoy tcp_proxy / traefik TCP router.
+//! Minimal L7 (HTTP/1.1 reverse-proxy) proxy built on Cloudflare Pingora, for
+//! the proxy benchmark. Pingora is a framework, not a ready-made proxy, so this
+//! is the smallest program that stands a Pingora HTTP proxy: it parses each
+//! request, forwards it to the origin over a POOLED, KEPT-ALIVE upstream
+//! connection, and streams the response back — the same L7 job as haproxy
+//! `mode http` / envoy http_connection_manager / traefik HTTP router / zoxy's
+//! phase-1 `protocol: http` listener.
 //!
-//! We use Pingora's `ServerApp` (its accept loop, runtime, graceful shutdown,
-//! listener handling) but dial the upstream with a plain per-connection
-//! `TcpStream` rather than Pingora's pooling connector: L4 tunnels can't be
-//! multiplexed over a reused upstream socket, so a fresh dial per downstream
-//! connection is the correct — and fair — behaviour.
+//! We use Pingora's `pingora_proxy::http_proxy_service` (its accept loop,
+//! runtime, HTTP/1.1 state machine, graceful shutdown, and — crucially — its
+//! upstream connection pool, so the backend leg is kept alive and reused across
+//! requests, matching the other L7 proxies). All this proxy has to supply is
+//! the upstream peer via `ProxyHttp::upstream_peer`.
 //!
 //! Knobs via env (set by compose, matching the other proxies):
 //!   LISTEN    downstream bind (default 0.0.0.0:8080)
@@ -17,37 +18,33 @@
 //!             startup with retry (parity with zoxy's no-runtime-DNS model).
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pingora_core::apps::ServerApp;
-use pingora_core::protocols::Stream;
 use pingora_core::server::configuration::{Opt, ServerConf};
-use pingora_core::server::{Server, ShutdownWatch};
-use pingora_core::services::listening::Service;
-use tokio::net::TcpStream;
+use pingora_core::server::Server;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::Result;
+use pingora_proxy::{ProxyHttp, Session};
 
-struct L4Proxy {
+struct HttpProxy {
     upstream: SocketAddr,
 }
 
 #[async_trait]
-impl ServerApp for L4Proxy {
-    async fn process_new(
-        self: &Arc<Self>,
-        mut downstream: Stream,
-        _shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
-        match TcpStream::connect(self.upstream).await {
-            Ok(mut upstream) => {
-                let _ = upstream.set_nodelay(true);
-                // one tunnel: pump both directions until either half closes
-                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
-            }
-            Err(e) => eprintln!("pingora-l4: upstream {} connect failed: {e}", self.upstream),
-        }
-        None // L4 passthrough holds no keep-alive downstream state to reuse
+impl ProxyHttp for HttpProxy {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    /// The one required hook: name the upstream for this request. A fixed
+    /// single origin, plain HTTP (no TLS), no SNI. Pingora dials it through its
+    /// connection pool and reuses idle keep-alive connections automatically.
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        Ok(Box::new(HttpPeer::new(self.upstream, false, String::new())))
     }
 }
 
@@ -61,10 +58,10 @@ fn resolve_with_retry(host_port: &str) -> SocketAddr {
                 return a;
             }
         }
-        eprintln!("pingora-l4: waiting to resolve {host_port} ({i}/40)");
+        eprintln!("pingora-http: waiting to resolve {host_port} ({i}/40)");
         std::thread::sleep(Duration::from_millis(500));
     }
-    panic!("pingora-l4: cannot resolve upstream {host_port} — is the backend up?");
+    panic!("pingora-http: cannot resolve upstream {host_port} — is the backend up?");
 }
 
 fn main() {
@@ -72,7 +69,7 @@ fn main() {
     let upstream = std::env::var("UPSTREAM").unwrap_or_else(|_| "backend:9000".to_string());
 
     let addr = resolve_with_retry(&upstream);
-    eprintln!("pingora-l4: listen={listen} upstream={upstream} -> {addr} threads=1");
+    eprintln!("pingora-http: listen={listen} upstream={upstream} -> {addr} threads=1");
 
     // hardcoded to 1 worker thread — 1 CPU, thread parity with the other proxies.
     let mut conf = ServerConf::default();
@@ -80,9 +77,12 @@ fn main() {
     let mut server = Server::new_with_opt_and_conf(Opt::default(), conf);
     server.bootstrap();
 
-    // Service::new takes the app by value (it Arc-wraps it internally; the
-    // ServerApp callback receives &Arc<Self>).
-    let mut svc = Service::new("pingora-l4".to_string(), L4Proxy { upstream: addr });
+    // http_proxy_service wraps our ProxyHttp in Pingora's HTTP/1.1 proxy
+    // service (accept loop + upstream pool); we just add the TCP listener.
+    let mut svc = pingora_proxy::http_proxy_service(
+        &server.configuration,
+        HttpProxy { upstream: addr },
+    );
     svc.add_tcp(&listen);
     server.add_service(svc);
 

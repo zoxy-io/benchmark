@@ -1,15 +1,15 @@
-# L4 TCP passthrough :8080 -> backend:9000 (parity with zoxy's L4-only libxev
-# build — every proxy relays bytes, nobody parses HTTP). HostSNI(`*`) is the
-# only rule that matches non-TLS TCP connections — it's the L4 catch-all, not
-# actual SNI inspection.
-tcp:
+# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# build — every proxy now parses HTTP/1.1 and reverse-proxies requests).
+# PathPrefix(`/`) is the catch-all HTTP rule; Traefik keeps client connections
+# alive and pools upstream connections by default.
+http:
   routers:
     r-plain:
-      rule: "HostSNI(`*`)"
+      rule: "PathPrefix(`/`)"
       entryPoints: [plain]
       service: origin
   services:
     origin:
       loadBalancer:
         servers:
-          - address: "backend:9000"
+          - url: "http://backend:9000"

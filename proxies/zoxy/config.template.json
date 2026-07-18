@@ -1,5 +1,5 @@
 {
-  "listeners": [{ "bind": "0.0.0.0:8080", "cluster": "origin" }],
+  "listeners": [{ "bind": "0.0.0.0:8080", "cluster": "origin", "protocol": "http" }],
   "clusters": {
     "origin": { "endpoints": ["@BACKEND_ADDR@"] }
   },

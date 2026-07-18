@@ -1,7 +1,7 @@
 # Static config. GOMAXPROCS=1 comes from compose env (1 CPU, explicit — Go would
-# otherwise count HOST cores). accessLog omitted => disabled. The router is a TCP (L4)
-# catch-all — see dynamic.yml; no ping endpoint, the TCP router would shadow
-# HTTP on the same entrypoint anyway (the driver probes through the tunnel).
+# otherwise count HOST cores). accessLog omitted => disabled. The router is an
+# HTTP PathPrefix(`/`) catch-all — see dynamic.yml; the driver probes with a
+# real GET, which the HTTP router serves.
 entryPoints:
   plain:
     address: ":8080"
