@@ -12,7 +12,13 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
-RUN cargo build --release && strip target/release/pingora-http
+# Compile for the BUILD host's exact CPU — native SIMD (AVX2 + AVX-512 on the
+# Icelake proxy VM), parity with zoxy, which zig builds `-mcpu=native` in this
+# same spot. The image is built on the very VM it runs on, so native is both
+# safe and fair. Set PINGORA_TARGET_CPU=x86-64 for a generic/baseline build.
+ARG PINGORA_TARGET_CPU=native
+RUN RUSTFLAGS="-C target-cpu=${PINGORA_TARGET_CPU}" cargo build --release \
+    && strip target/release/pingora-http
 
 FROM debian:bookworm-slim
 RUN apt-get update \
