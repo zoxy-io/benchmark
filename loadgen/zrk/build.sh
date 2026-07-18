@@ -1,44 +1,49 @@
 #!/usr/bin/env sh
-# Build the zrk load generator (github.com/floatdrop/zrk) into ./zrk as a STATIC
-# musl binary that runs in any alpine container. Uses your local zig (the devenv
-# shell provides it; needs >= 0.16) — cross-compiled to musl, no toolchain fetch.
+# Fetch the zrk load generator (github.com/zoxy-io/zrk) into ./zrk from a PINNED
+# release. zrk ships statically-linked Linux binaries, so the same file runs in
+# any container (the driver runs it in python:3-alpine) — no zig / build
+# toolchain, no source clone. This replaces the old clone+cross-compile.
 #
-# Pinned to a SHA (ZRK_REF): zrk force-pushes main, and a cached `git clone`
-# would silently keep building an OLD commit. Bump ZRK_REF deliberately.
+# Pinned to a release VERSION (ZRK_VERSION); bump it deliberately. The tarball
+# is checksum-verified against the release's SHA256SUMS.txt before install.
 set -eu
 
-ZRK_REPO=${ZRK_REPO:-https://github.com/floatdrop/zrk}
-ZRK_REF=${ZRK_REF:-9f0a62d}                    # v0.2.1 + staggered sends & live counters
-ZIG_TARGET=${ZIG_TARGET:-x86_64-linux-musl}    # static: runs in alpine:3
+ZRK_REPO=${ZRK_REPO:-zoxy-io/zrk}
+ZRK_VERSION=${ZRK_VERSION:-0.3.6}
+ZRK_ARCH=${ZRK_ARCH:-x86_64-linux}    # static binary: runs in alpine and glibc alike
 
 DIR=$(cd "$(dirname "$0")" && pwd)
-SRC="$DIR/src"
 BIN="$DIR/zrk"
 STAMP="$DIR/.built-ref"
 
-command -v zig >/dev/null 2>&1 || {
-    echo "zrk/build.sh: zig not found — it's in the devenv shell (needs >= 0.16)" >&2
-    exit 1
-}
+asset="zrk-${ZRK_VERSION}-${ZRK_ARCH}.tar.gz"
+base="https://github.com/${ZRK_REPO}/releases/download/v${ZRK_VERSION}"
+want="${ZRK_VERSION}-${ZRK_ARCH}"
 
-# Skip if we already built this exact ref.
-if [ -x "$BIN" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$ZRK_REF" ]; then
-    echo "zrk: $BIN already built at $ZRK_REF"
+# Skip if we already have this exact release.
+if [ -x "$BIN" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$want" ]; then
+    echo "zrk: $BIN already at $want"
     exit 0
 fi
 
-# Fetch/refresh the pinned source. Explicit checkout of the SHA defeats any
-# clone caching — the whole point of pinning.
-if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" fetch origin "$ZRK_REF" 2>/dev/null || git -C "$SRC" fetch --tags origin
-else
-    rm -rf "$SRC"
-    git clone "$ZRK_REPO" "$SRC"
-fi
-git -C "$SRC" checkout -q "$ZRK_REF"
+command -v curl >/dev/null 2>&1 || { echo "zrk/build.sh: curl not found" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then SHACHECK="sha256sum -c -"
+elif command -v shasum   >/dev/null 2>&1; then SHACHECK="shasum -a 256 -c -"
+else echo "zrk/build.sh: need sha256sum or shasum" >&2; exit 1; fi
 
-# Cross-compile a static musl binary with the local zig.
-( cd "$SRC" && zig build -Doptimize=ReleaseFast -Dtarget="$ZIG_TARGET" )
-cp "$SRC/zig-out/bin/zrk" "$BIN"
-printf '%s' "$ZRK_REF" > "$STAMP"
-echo "zrk: built $BIN at $ZRK_REF ($ZIG_TARGET, zig $(zig version 2>/dev/null || echo '?'))"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+echo "zrk: fetching $asset from $ZRK_REPO v$ZRK_VERSION"
+curl -fsSL "$base/$asset"          -o "$tmp/$asset"
+curl -fsSL "$base/SHA256SUMS.txt"  -o "$tmp/SHA256SUMS.txt"
+
+# Verify the checksum (fail loudly on mismatch — a truncated/tampered download
+# must never silently become the load generator).
+( cd "$tmp" && grep -F "$asset" SHA256SUMS.txt | $SHACHECK ) \
+    || { echo "zrk/build.sh: checksum verification FAILED for $asset" >&2; exit 1; }
+
+tar xzf "$tmp/$asset" -C "$tmp"
+install -m 0755 "$tmp/zrk" "$BIN"
+printf '%s' "$want" > "$STAMP"
+echo "zrk: installed $BIN ($asset, $("$BIN" --version 2>/dev/null || echo '?'))"

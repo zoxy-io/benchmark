@@ -16,7 +16,7 @@ START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1024}   # in-flight cap = zoxy's 1-process relay-buffer cap
 TIMEOUT_S=${TIMEOUT_S:-5}
 ZOXY_REF=${ZOXY_REF:-main}
-ZRK_REF=${ZRK_REF:-9f0a62d}        # pinned zrk build (see loadgen/zrk/build.sh)
+ZRK_VERSION=${ZRK_VERSION:-0.3.6}  # pinned zrk release (see loadgen/zrk/build.sh)
 COOLDOWN=${COOLDOWN:-8}
 RUNID=${RUNID:-zrk-$(date -u +%Y%m%d-%H%M%S)}
 
@@ -72,10 +72,10 @@ ssh -o BatchMode=yes "$SSH_USER@$LG" 'curl -fsS -X POST localhost:9090/-/reload'
 ssh -o BatchMode=yes "$SSH_USER@$BACKEND_PUB" "cd $REMOTE && $COMPOSE --profile backend up -d --wait" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile monitoring up -d cadvisor node_exporter" >/dev/null 2>&1 || true
 
-# build zrk locally with zig (build.sh self-skips if current), ship the static
-# binary + orchestrator to the loadgen — no zig/docker build on the loadgen
-echo ">>> building zrk (ref=$ZRK_REF)"
-ZRK_REF=$ZRK_REF ./loadgen/zrk/build.sh
+# fetch the pinned zrk release binary locally (build.sh self-skips if current),
+# ship the static binary + orchestrator to the loadgen — nothing built there
+echo ">>> fetching zrk release (v$ZRK_VERSION)"
+ZRK_VERSION=$ZRK_VERSION ./loadgen/zrk/build.sh
 ssh -o BatchMode=yes "$SSH_USER@$LG" 'mkdir -p ~/zrk'
 rsync -az --exclude src loadgen/zrk/ "$SSH_USER@$LG:zrk/"
 

@@ -1,6 +1,6 @@
 # zrk (load generator)
 
-The benchmark's load generator is [**zrk**](https://github.com/floatdrop/zrk) — a
+The benchmark's load generator is [**zrk**](https://github.com/zoxy-io/zrk) — a
 constant-throughput / linear-ramp HTTP load generator (Zig, wrk2 lineage) that
 reports latency **corrected for coordinated omission** and records it in an
 **HdrHistogram**. It replaced the old `vegeta-ramp`.
@@ -20,34 +20,36 @@ Why zrk here:
 ## Files
 
 ```
-build.sh   clone (pinned ZRK_REF) + build a static musl `zrk` with local zig
+build.sh   download a PINNED zrk release (ZRK_VERSION) — checksum-verified,
+           statically-linked `zrk`; no zig / source clone
 run.py     orchestrator: runs zrk for one ramp AND re-exports its live NDJSON as a
            Prometheus /metrics endpoint (:8090) so the Grafana live dashboard works
-src/       the cloned zrk source (git-ignored; created by build.sh)
-zrk        the built static binary   (git-ignored)
+zrk        the downloaded static binary   (git-ignored)
 ```
 
-## Build
+## Fetch
 
-`build.sh` uses the local `zig` (the devenv shell provides it; needs >= 0.16) to
-cross-compile a static musl `zrk`. It pins a zrk commit — zrk force-pushes
-`main`, so a floating ref would silently build an old commit.
+`build.sh` downloads a pinned zrk **release** binary (statically linked, so the
+same file runs in `alpine` or any glibc image) and verifies it against the
+release's `SHA256SUMS.txt`. No build toolchain is needed. Pin a release version —
+bump it deliberately.
 
 ```sh
-./build.sh                       # builds ./zrk at the pinned ZRK_REF
-ZRK_REF=<sha> ./build.sh         # build a different zrk commit
+./build.sh                          # fetches ./zrk at the pinned ZRK_VERSION (0.3.6)
+ZRK_VERSION=0.3.6 ./build.sh        # a specific release
+ZRK_ARCH=aarch64-linux ./build.sh   # a different arch (default x86_64-linux)
 ```
 
 ## Run
 
-The driver (`scripts/zrk-bench.sh`) builds `zrk` locally, ships the binary to the
+The driver (`scripts/zrk-bench.sh`) fetches `zrk` locally, ships the binary to the
 loadgen, and invokes `run.py` in a `python:3-alpine` container with the config as
 env:
 
 ```sh
 docker run --rm --network host --ulimit nofile=1048576 -v ~/zrk:/w -w /w \
-  -e TARGET=http://PROXY:8080/1k -e MAX_RATE=160000 -e RAMP_SECONDS=120 \
-  -e START_RATE=200 -e CONNECTIONS=2000 -e OUT=/w/zoxy.lg1 -e NAME=zoxy -e RUNID=$RUNID \
+  -e TARGET=http://PROXY:8080/1k -e MAX_RATE=67000 -e RAMP_SECONDS=300 \
+  -e START_RATE=200 -e CONNECTIONS=1024 -e OUT=/w/zoxy.lg1 -e NAME=zoxy -e RUNID=$RUNID \
   python:3-alpine python3 /w/run.py
 ```
 
