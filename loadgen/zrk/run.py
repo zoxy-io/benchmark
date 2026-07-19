@@ -20,7 +20,7 @@ change):
   RAMP_SECONDS  ramp length / run duration                         (default 120)
   START_RATE    req/s at t=0                                        (default 200)
   CONNECTIONS   open connections = in-flight cap (open-loop guard)  (default 2000)
-  TIMEOUT_S     per-request timeout, seconds                       (default 5)
+  TIMEOUT_S     per-request timeout, seconds (slow reqs -> errors)  (default 1)
   OUT           output BASE path, no extension                     (default /w/ramp)
   NAME          proxy label (logs + `proxy` metric label)          (default ramp)
   RUNID         `testid` metric label                              (default adhoc)
@@ -56,7 +56,7 @@ MAX_RATE = envi("MAX_RATE", 200000)
 RAMP_SECONDS = envi("RAMP_SECONDS", 120)
 START_RATE = envi("START_RATE", 200)
 CONNECTIONS = envi("CONNECTIONS", 2000)
-TIMEOUT_S = envi("TIMEOUT_S", 5)
+TIMEOUT_S = envi("TIMEOUT_S", 1)
 OUT = env("OUT", "/w/ramp")
 NAME = env("NAME", "ramp")
 RUNID = env("RUNID", "adhoc")
@@ -155,7 +155,13 @@ def main():
         "-R", f"{START_RATE}:{MAX_RATE}",
         "-d", f"{RAMP_SECONDS}s",
         "-c", str(CONNECTIONS),
+        # Bound the latency instead of letting the CO-corrected tail balloon
+        # unboundedly past saturation: a request slower than the timeout is a
+        # timeout ERROR, and --no-record-timeouts keeps it OUT of the latency
+        # histogram — so latency reflects healthy load and overload shows as
+        # errors + achieved-shortfall, not a 30s+ tail.
         "--timeout", f"{TIMEOUT_S}s",
+        "--no-record-timeouts",
         "--interval", "1s",
         "--timeseries", ND, "--timeseries-histogram",
         "--hdr", HGRM,
