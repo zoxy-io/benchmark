@@ -14,9 +14,11 @@ MAX_RATE=${MAX_RATE:-67000}
 RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1024}   # in-flight cap = zoxy's 1-process relay-buffer cap
-TIMEOUT_S=${TIMEOUT_S:-1}          # per-request timeout: past it a request is a
-                                   # timeout ERROR, not an unbounded CO-latency tail
-                                   # (run.py adds --no-record-timeouts to match)
+TIMEOUT_S=${TIMEOUT_S:-1}          # per-request WIRE timeout (hung-conn guard). It
+                                   # does NOT bound the CO-corrected tail (that's a
+                                   # scheduling delay, not wire time); latency
+                                   # fairness lives in the report, sampled at a
+                                   # common sub-knee REF_RATE. See run.py's note.
 ZOXY_REF=${ZOXY_REF:-main}
 ZRK_VERSION=${ZRK_VERSION:-0.3.6}  # pinned zrk release (see loadgen/zrk/build.sh)
 COOLDOWN=${COOLDOWN:-8}

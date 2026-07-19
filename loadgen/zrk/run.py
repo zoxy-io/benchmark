@@ -20,7 +20,8 @@ change):
   RAMP_SECONDS  ramp length / run duration                         (default 120)
   START_RATE    req/s at t=0                                        (default 200)
   CONNECTIONS   open connections = in-flight cap (open-loop guard)  (default 2000)
-  TIMEOUT_S     per-request timeout, seconds (slow reqs -> errors)  (default 1)
+  TIMEOUT_S     per-request WIRE timeout, s (hung-conn guard, NOT a
+                CO-tail bound — see the --timeout note in main())       (default 1)
   OUT           output BASE path, no extension                     (default /w/ramp)
   NAME          proxy label (logs + `proxy` metric label)          (default ramp)
   RUNID         `testid` metric label                              (default adhoc)
@@ -155,11 +156,16 @@ def main():
         "-R", f"{START_RATE}:{MAX_RATE}",
         "-d", f"{RAMP_SECONDS}s",
         "-c", str(CONNECTIONS),
-        # Bound the latency instead of letting the CO-corrected tail balloon
-        # unboundedly past saturation: a request slower than the timeout is a
-        # timeout ERROR, and --no-record-timeouts keeps it OUT of the latency
-        # histogram — so latency reflects healthy load and overload shows as
-        # errors + achieved-shortfall, not a 30s+ tail.
+        # zrk's --timeout is a per-request WIRE timeout (bytes-out -> bytes-in on
+        # the socket), NOT a scheduled-latency timeout — it does NOT bound the
+        # CO-corrected tail. Past saturation a request waits for a free connection
+        # (open-loop backlog), but once it gets one it completes fast on the wire,
+        # so it never trips the timeout while its scheduled->response latency
+        # balloons to tens of seconds. So this only kills a genuinely HUNG
+        # connection; --no-record-timeouts drops those stalls from the histogram.
+        # Latency fairness is handled in the REPORT instead, by reading each
+        # proxy's p50/p99 at a common sub-knee reference rate (report REF_RATE);
+        # overload shows as achieved-shortfall (the shed pane), not as errors.
         "--timeout", f"{TIMEOUT_S}s",
         "--no-record-timeouts",
         "--interval", "1s",

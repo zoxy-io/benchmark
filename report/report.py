@@ -124,24 +124,24 @@ def load_merged(run_dir, proxy, tags):
     return out
 
 
-def capped_hist(run_dir, proxy, tags):
-    """Merge the per-window HdrHistogram blobs (zrk --timeseries-histogram) for
-    the windows where THIS proxy has near-zero backlog (achieved >= LAT_KEEPUP*
-    offered = 99%, after warmup) — its latency at HEALTHY load, PER PROXY,
-    excluding the near-saturation/post-collapse edge where the CO-corrected tail
-    balloons. hdr.Hdr or None."""
+def ref_hist(run_dir, proxy, tags):
+    """Merge the per-window HdrHistogram blobs (zrk --timeseries-histogram) for the
+    windows whose OFFERED rate sits within +/-REF_BAND of the common REF_RATE —
+    every proxy's latency at the SAME light, sub-knee load. Throughput keep-up is
+    NOT enough to isolate healthy latency: near its knee a proxy serves ~offered
+    rate while sitting on a huge standing queue, so the CO-corrected tail balloons
+    even though achieved tracks offered. A shared reference rate well below every
+    proxy's knee measures per-request COST instead of queueing delay. hdr.Hdr or
+    None (None if the proxy never reached the reference band)."""
+    lo, hi = REF_RATE * (1 - REF_BAND), REF_RATE * (1 + REF_BAND)
     for tag in tags:
         path = os.path.join(run_dir, f"{proxy}.{tag}.ndjson")
         if not os.path.exists(path):
             continue
         blobs = []
         for r in full_windows(read_ndjson(path)):
-            off, ach = float(r.get("target_rate", 0)), float(r.get("achieved_rate", 0))
-            # Same keep-up BAND as sustained(): near-zero backlog means achieved
-            # tracks offered from BOTH sides. A catch-up burst (achieved >> offered)
-            # carries balloon latencies and must not pollute the healthy histogram.
-            if r.get("t", 0) >= 3 and off > 0 and r.get("latency_histogram") and \
-                    LAT_KEEPUP * off <= ach <= off / LAT_KEEPUP:
+            off = float(r.get("target_rate", 0))
+            if r.get("t", 0) >= 3 and lo <= off <= hi and r.get("latency_histogram"):
                 blobs.append(r["latency_histogram"])
         return hdr.merge(blobs)
     return None
@@ -156,33 +156,15 @@ def hgrm_filename(run_dir, proxy, tags):
     return ""
 
 
-def whole_run_lat(run_dir, proxy, tags):
-    """Whole-run latency_us (µs) from the <proxy>.<tag>.json summary. The fallback
-    for a proxy that has NO keep-up window (it kneed below the ramp's start rate,
-    so capped_hist is empty) — covers the WHOLE run incl. its overloaded tail, so
-    it reads higher than the healthy-load number and is flagged as such."""
-    for tag in tags:
-        path = os.path.join(run_dir, f"{proxy}.{tag}.json")
-        if not os.path.exists(path):
-            continue
-        try:
-            return json.load(open(path)).get("latency_us")
-        except (ValueError, OSError):
-            return None
-    return None
-
-
 def lat_summary(d):
-    """(p50_ms, max_ms, source) for the summary table/JSON: the keep-up
-    histogram when present, else the whole-run json fallback, else (None,None,
-    None). source in {'keepup','whole',None} so consumers can flag the fallback."""
+    """(p50_ms, p99_ms, source) for the summary table/JSON, read from the
+    reference-rate histogram (latency at the common light load). p99 (not raw max)
+    because HdrHistogram .max() is a single worst sample — one GC/scheduling blip
+    ruins it even in a healthy window. source in {'ref', None}."""
     h = d["hist"]
     if h and h.total() > 0:
-        return h.value_at_percentile(50) / 1000.0, h.max() / 1000.0, "keepup"
-    lj = d.get("lat_json")
-    if lj and lj.get("p50") is not None:
-        mx = lj.get("max")
-        return lj["p50"] / 1000.0, (mx / 1000.0 if mx is not None else None), "whole"
+        return (h.value_at_percentile(50) / 1000.0,
+                h.value_at_percentile(99) / 1000.0, "ref")
     return None, None, None
 
 
@@ -200,12 +182,18 @@ def hdr_points(h):
 
 
 KEEPUP = 0.90  # throughput: "keeping up" = achieved >= KEEPUP * offered
-LAT_KEEPUP = 0.99  # latency DISTRIBUTION (capped_hist): stricter — only near-zero-
-# backlog windows count, so the tail isn't inflated by the 90%-keeping-up
-# (already-queuing) edge.
 P99_KEEPUP = 0.95  # p99-vs-offered CURVE only: looser than the histogram so the
 # line isn't starved — 0.99 drops ~78% of windows, leaving a sparse, low-res
 # curve; <=5% backlog is still a fair per-window p99 reading and ~triples points.
+REF_RATE = 2000    # SUMMARY-latency reference offered rate (req/s): a shared,
+# light load comfortably below every proxy's knee (~<35% util for the weakest
+# here). CO-corrected latency past ~70% of the knee is standing-queue wait — a
+# "how close to the cliff" signal already carried by the throughput axis and the
+# p99-vs-offered curve — so a single per-proxy latency number is only fair at a
+# common sub-knee load, where it reflects per-request COST, not queueing.
+REF_BAND = 0.20    # merge windows with offered within +/-REF_BAND of REF_RATE
+# ([1600,2400] rps): ~4 windows -> enough samples for a stable p99, still flat
+# (pre-knee) for every proxy.
 
 
 def sustained(rows):
@@ -324,15 +312,12 @@ def peak_mem(prom, proxy, run):
     return max((v for _, v in pts), default=None)
 
 
-def _series(present, data, key, keepup=False, keep_ratio=LAT_KEEPUP):
-    """One chart's series list: [(proxy, colors, [(offered, y)...], dashed)]. With
-    keepup, keep only windows within keep_ratio of offered (latency at healthy
-    load); a looser keep_ratio yields a denser, higher-resolution curve."""
+def _series(present, data, key):
+    """One chart's series list: [(proxy, colors, [(offered, y)...], dashed)] — the
+    raw per-window `key` against offered, one line per proxy."""
     out = []
     for p in present:
-        pts = [(r["offered"], r[key]) for r in data[p]["rows"]
-               if not keepup or (r["t"] >= 3 and r["offered"] > 0
-                                 and r["achieved"] >= keep_ratio * r["offered"])]
+        pts = [(r["offered"], r[key]) for r in data[p]["rows"]]
         if pts:
             out.append((p, PALETTE.get(p, ("#898781", "#898781")), pts, p == "direct"))
     return out
@@ -423,8 +408,7 @@ def gather(meta, run_dir, prom):
         tags = runs[p].get("loadgens", ["lg1"])
         rows = load_merged(run_dir, p, tags)
         data[p] = {"rows": rows, "sustained": sustained(rows),
-                   "hist": capped_hist(run_dir, p, tags),
-                   "lat_json": whole_run_lat(run_dir, p, tags),
+                   "hist": ref_hist(run_dir, p, tags),
                    "hgrm_file": hgrm_filename(run_dir, p, tags),
                    "mem": None if p == "direct" else peak_mem(prom, p, runs[p])}
 
@@ -489,15 +473,15 @@ def build(meta, present, data, series):
                    "shed", series["shed"], "pct", "", xmax=crop),
     ]
 
-    # summary table — max sustained throughput + median/max latency (per-proxy,
-    # healthy-load window; the full percentile curve is in the distribution below)
+    # summary table — max sustained throughput + p50/p99 latency at the common
+    # reference rate (per-request cost at a shared sub-knee load; the full
+    # latency-vs-offered story is the p99 pane + the distributions below)
     rows_html = ""
     for p in sorted(present, key=lambda p: data[p]["sustained"], reverse=True):
         s = data[p]["sustained"]
         h = data[p]["hist"]
         has_h = bool(h) and h.total() > 0
-        p50, mx, lat_src = lat_summary(data[p])
-        mark = "†" if lat_src == "whole" else ""   # whole-run fallback, reads high
+        p50, p99, _ = lat_summary(data[p])
         mem = data[p]["mem"]
         cls = ' class="baseline"' if p == "direct" else ""
         # color swatch (the report's only legend) + proxy name; the name links
@@ -506,20 +490,20 @@ def build(meta, present, data, series):
         name = (f'<a class="proxycell" href="#hist-{p}">{sw}{html.escape(p)}</a>' if has_h
                 else f'<span class="proxycell">{sw}{html.escape(p)}</span>')
         rows_html += (f"<tr{cls}><td>{name}</td><td>{fmt_si(s)}</td>"
-                      f"<td>{_ms(p50)}{mark}</td>"
-                      f"<td>{_ms(mx)}{mark}</td>"
+                      f"<td>{_ms(p50)}</td>"
+                      f"<td>{_ms(p99)}</td>"
                       f"<td>{fmt_bytes(mem) if mem else '—'}</td></tr>")
 
     # per-proxy latency-by-percentile distributions (from the .hgrm files),
     # anchored so the table's proxy names jump to them
     dist_cards = "".join(
         f'<section class="card" id="hist-{p}"><h2>{html.escape(p)}</h2>'
-        f'<p class="sub">latency by percentile — while keeping up · '
+        f'<p class="sub">latency by percentile — at {REF_RATE:,} req/s reference load · '
         f'raw <a href="{html.escape(data[p]["hgrm_file"])}" download>{html.escape(data[p]["hgrm_file"])}</a> = whole run</p>'
         f'<div class="chartwrap">{hist_svg(p, hdr_points(data[p]["hist"]))}</div></section>'
         for p in present if data[p]["hist"] and data[p]["hist"].total() > 0
     )
-    dist = (f'<h2 class="dist-h">Latency distribution · HdrHistogram (while keeping up)</h2>'
+    dist = (f'<h2 class="dist-h">Latency distribution · HdrHistogram (at {REF_RATE:,} req/s reference load)</h2>'
             f'<div class="grid2">{dist_cards}</div>') if dist_cards else ""
 
     rid = html.escape(meta.get("runid", ""))
@@ -532,11 +516,12 @@ def build(meta, present, data, series):
 <div class="eyebrow">HTTP (L7) proxy benchmark · open-loop ramp</div>
 <h1>request throughput <span class="rid">{rid}</span></h1>
 <p class="meta">Every proxy driven through the identical linear ramp (zrk, open-loop, coordinated-omission corrected).
-Throughput &amp; CPU span the full ramp; latency (table, p99 pane, distributions) is computed per-proxy over the windows where that proxy is
-keeping up (achieved &ge; 99% offered, near-zero backlog) — its latency at healthy load, since near/past its own ceiling the CO-corrected tail balloons.
-A <b>&dagger;</b> marks a proxy with no keep-up window (it kneed below the ramp's start rate); its latency is the whole-run figure incl. overload, so it reads high.</p>
+Throughput &amp; CPU span the full ramp. The table's <b>p50 / p99</b> are each proxy's latency at a common <b>{REF_RATE:,} req/s</b> reference load — a shared,
+light, sub-knee rate where the number reflects per-request <em>cost</em>, not queueing. (CO-corrected latency past ~70% of a proxy's knee is standing-queue wait, so
+it only compares fairly at a common sub-knee load; the full latency-vs-load story is the p99 pane and the distributions below, each line stopping where that proxy
+stops keeping up.)</p>
 <div class="tablewrap"><table><tr><th>proxy</th><th>max sustained req/s</th>
-<th>median</th><th>max</th><th>peak mem</th></tr>
+<th>p50 @ {REF_RATE//1000}k</th><th>p99 @ {REF_RATE//1000}k</th><th>peak mem</th></tr>
 {rows_html}</table></div>
 <div class="grid2">{''.join(cards)}</div>
 {dist}
@@ -555,18 +540,17 @@ def build_json(meta, present, data, series, generated):
     ramp_src = next((runs[p] for p in present if p in runs), {})
 
     def proxy_row(p):
-        p50, mx, lat_src = lat_summary(data[p])
+        p50, p99, lat_src = lat_summary(data[p])
         return {
             "name": p,
             "self": p == "zoxy",           # the subject of the benchmark
             "baseline": p == "direct",     # no-proxy origin calibration, not a competitor
             "sustained": round(data[p]["sustained"]),          # req/s
             "mem": data[p]["mem"],                             # peak working-set bytes | null
-            "latency_ms": {
+            "latency_ms": {                # at the REF_RATE reference load
                 "p50": round(p50, 4) if p50 is not None else None,
-                "max": round(mx, 4) if mx is not None else None,
-                # 'keepup' = healthy-load window; 'whole' = whole-run fallback
-                # (kneed below ramp start, reads high); null = no data
+                "p99": round(p99, 4) if p99 is not None else None,
+                # 'ref' = reference-rate window; null = never reached the ref band
                 "source": lat_src,
             },
             "hgrm_file": data[p]["hgrm_file"] or None,         # raw whole-run histogram
@@ -594,7 +578,8 @@ def build_json(meta, present, data, series, generated):
         "ramp": {"start_rate": ramp_src.get("start_rate"),
                  "max_rate": ramp_src.get("max_rate"),
                  "ramp_seconds": ramp_src.get("ramp_seconds")},
-        "keepup": {"throughput": KEEPUP, "latency": LAT_KEEPUP},
+        "keepup": {"throughput": KEEPUP},
+        "latency_ref": {"rate": REF_RATE, "band": REF_BAND},  # summary p50/p99 load
         "palette": {p: PALETTE[p][0] for p in present if p in PALETTE},
         # ordered by max sustained throughput, same as the HTML summary table
         "proxies": [proxy_row(p) for p in
