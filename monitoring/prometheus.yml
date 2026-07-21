@@ -28,3 +28,13 @@ scrape_configs:
     scrape_timeout: 900ms
     file_sd_configs:
       - files: ["/etc/prometheus/targets/zrk.yml"]
+
+  # zoxy's own admin/metrics listener (config `admin.bind`, Prometheus exposition
+  # text — zoxy_accepted/completed/l7_responses and the zoxy_shed_* counters that
+  # witness every admission shed). Up only while the zoxy proxy runs; file_sd
+  # tolerates the target file being absent between proxies. 1s to match the ramp.
+  - job_name: zoxy
+    scrape_interval: 1s
+    scrape_timeout: 900ms
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/zoxy.yml"]

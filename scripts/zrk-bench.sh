@@ -49,6 +49,12 @@ cat > monitoring/targets/cloud/cadvisor.yml <<EOF
 - targets: ["$PROXY_PRIV:8081"]
   labels: { role: proxy }
 EOF
+# zoxy's own admin/metrics listener (config admin.bind :9101); only up during a
+# zoxy ramp — file_sd tolerates it being "down" for the other proxies.
+cat > monitoring/targets/cloud/zoxy.yml <<EOF
+- targets: ["$PROXY_PRIV:9101"]
+  labels: { role: proxy, proxy: zoxy }
+EOF
 cat > monitoring/targets/cloud/node.yml <<EOF
 - targets: ["$LG_PRIV:9100"]
   labels: { role: loadgen }
@@ -69,10 +75,13 @@ done
 # on the backend, exporters on the proxy. Non-fatal — a `direct` run (loadgen ->
 # backend) needs neither prometheus nor the proxy VM.
 ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && PROM_TARGETS=cloud PROM_URL=http://$LG_PRIV:9090 $COMPOSE --profile monitoring up -d" >/dev/null 2>&1 || true
-# prometheus.yml is a bind mount: content edits don't recreate the container, so
-# ask the running instance to reload (requires --web.enable-lifecycle; harmless
-# no-op right after a fresh recreate)
-ssh -o BatchMode=yes "$SSH_USER@$LG" 'curl -fsS -X POST localhost:9090/-/reload' >/dev/null 2>&1 || true
+# prometheus.yml is a SINGLE-FILE bind mount and rsync replaces it via a temp file
+# + atomic rename (new inode), so a long-lived container keeps the OLD inode — a
+# /-/reload just re-reads the stale config and never sees job/scrape-config edits
+# (the targets/ DIR mount is fine — file adds there are live). Force-recreate
+# prometheus so the mount re-resolves to the current file; the named tsdb volume
+# survives the recreate. Do this before the ramp so the run scrapes clean.
+ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && PROM_TARGETS=cloud PROM_URL=http://$LG_PRIV:9090 $COMPOSE --profile monitoring up -d --force-recreate prometheus" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$BACKEND_PUB" "cd $REMOTE && $COMPOSE --profile backend up -d --wait" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile monitoring up -d cadvisor node_exporter" >/dev/null 2>&1 || true
 

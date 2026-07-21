@@ -3,6 +3,7 @@
   "clusters": {
     "origin": { "endpoints": ["@BACKEND_ADDR@"] }
   },
+  "admin": { "bind": "0.0.0.0:9101" },
   "timeouts": {
     "connect_ms": 5000,
     "idle_ms": 60000,

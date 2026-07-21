@@ -227,6 +227,82 @@
           "legendFormat": "{{role}}"
         }
       ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "zoxy \u2014 throughput (its own counters): accepts/s & L7 responses/s",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(zoxy_l7_responses[30s])",
+          "legendFormat": "L7 responses/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(zoxy_accepted[30s])",
+          "legendFormat": "accepted conns/s"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(zoxy_completed[30s])",
+          "legendFormat": "completed/s"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "zoxy \u2014 admission shedding (flat 0 = no conn-slot pressure; spikes = at the cap)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(zoxy_shed_conn_slots[30s])",
+          "legendFormat": "shed conn_slots/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(zoxy_shed_relay_buffers[30s])",
+          "legendFormat": "shed relay_buffers/s"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(zoxy_shed_draining[30s])",
+          "legendFormat": "shed draining/s"
+        }
+      ]
     }
   ],
   "annotations": {
