@@ -9,7 +9,7 @@
 set -eu
 
 ZRK_REPO=${ZRK_REPO:-zoxy-io/zrk}
-ZRK_VERSION=${ZRK_VERSION:-0.3.6}
+ZRK_VERSION=${ZRK_VERSION:-0.4.1}
 ZRK_ARCH=${ZRK_ARCH:-x86_64-linux}    # static binary: runs in alpine and glibc alike
 
 DIR=$(cd "$(dirname "$0")" && pwd)

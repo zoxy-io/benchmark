@@ -35,8 +35,8 @@ release's `SHA256SUMS.txt`. No build toolchain is needed. Pin a release version 
 bump it deliberately.
 
 ```sh
-./build.sh                          # fetches ./zrk at the pinned ZRK_VERSION (0.3.6)
-ZRK_VERSION=0.3.6 ./build.sh        # a specific release
+./build.sh                          # fetches ./zrk at the pinned ZRK_VERSION (0.4.1)
+ZRK_VERSION=0.4.1 ./build.sh        # a specific release
 ZRK_ARCH=aarch64-linux ./build.sh   # a different arch (default x86_64-linux)
 ```
 
