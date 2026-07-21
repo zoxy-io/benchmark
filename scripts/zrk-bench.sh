@@ -13,7 +13,7 @@ PROXIES=${PROXIES:-"direct zoxy haproxy envoy traefik nginx pingora"}
 MAX_RATE=${MAX_RATE:-67000}
 RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
-CONNECTIONS=${CONNECTIONS:-512}    # in-flight cap; comfortably under zoxy's ~1020 conn-slot cap (clean zone, still saturates its ~43k/1-CPU ceiling)
+CONNECTIONS=${CONNECTIONS:-500}    # in-flight cap; the sweet spot — past each proxy's throughput peak, before high-concurrency collapse; well under zoxy's ~1386 conn_slot default
 TIMEOUT_S=${TIMEOUT_S:-1}          # per-request WIRE timeout (hung-conn guard). It
                                    # does NOT bound the CO-corrected tail (that's a
                                    # scheduling delay, not wire time); latency
