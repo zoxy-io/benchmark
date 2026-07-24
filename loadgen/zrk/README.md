@@ -35,10 +35,20 @@ release's `SHA256SUMS.txt`. No build toolchain is needed. Pin a release version 
 bump it deliberately.
 
 ```sh
-./build.sh                          # fetches ./zrk at the pinned ZRK_VERSION (0.4.1)
-ZRK_VERSION=0.4.1 ./build.sh        # a specific release
+./build.sh                          # fetches ./zrk at the pinned ZRK_VERSION (1.1.1)
+ZRK_VERSION=1.1.1 ./build.sh        # a specific release
 ZRK_ARCH=aarch64-linux ./build.sh   # a different arch (default x86_64-linux)
 ```
+
+### Threading model (>=1.0.0)
+
+As of v1.0.0 zrk runs its load generation on a **zio coroutine engine**
+instead of `std.Io.Threaded`'s one-OS-thread-per-connection model — connections
+are now cheap coroutines multiplexed across a small, fixed pool of OS threads
+(`-t`/`--threads`, zrk default 2, like wrk). `run.py` exposes this as `THREADS`
+(default 4) and passes it straight through as `-t`; size it to the **loadgen
+VM's core count** (`loadgen_cores` in `cloud/variables.tf`, default 4), not to
+`CONNECTIONS` — connections no longer cost a thread each.
 
 ## Run
 
@@ -49,7 +59,7 @@ env:
 ```sh
 docker run --rm --network host --ulimit nofile=1048576 -v ~/zrk:/w -w /w \
   -e TARGET=http://PROXY:8080/1k -e MAX_RATE=67000 -e RAMP_SECONDS=300 \
-  -e START_RATE=200 -e CONNECTIONS=1024 -e OUT=/w/zoxy.lg1 -e NAME=zoxy -e RUNID=$RUNID \
+  -e START_RATE=200 -e CONNECTIONS=1024 -e THREADS=4 -e OUT=/w/zoxy.lg1 -e NAME=zoxy -e RUNID=$RUNID \
   python:3-alpine python3 /w/run.py
 ```
 

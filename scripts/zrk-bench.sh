@@ -14,13 +14,17 @@ MAX_RATE=${MAX_RATE:-67000}
 RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-500}    # in-flight cap; the sweet spot — past each proxy's throughput peak, before high-concurrency collapse; well under zoxy's ~1386 conn_slot default
+THREADS=${THREADS:-4}              # OS threads driving zrk's zio coroutine engine (>=1.0.0;
+                                   # replaces std.Io.Threaded's thread-per-connection model).
+                                   # Match the loadgen VM's core count (loadgen_cores, default 4
+                                   # in cloud/variables.tf), not CONNECTIONS.
 TIMEOUT_S=${TIMEOUT_S:-1}          # per-request WIRE timeout (hung-conn guard). It
                                    # does NOT bound the CO-corrected tail (that's a
                                    # scheduling delay, not wire time); latency
                                    # fairness lives in the report, sampled at a
                                    # common sub-knee REF_RATE. See run.py's note.
 ZOXY_REF=${ZOXY_REF:-main}
-ZRK_VERSION=${ZRK_VERSION:-0.4.1}  # pinned zrk release (see loadgen/zrk/build.sh)
+ZRK_VERSION=${ZRK_VERSION:-1.1.1}  # pinned zrk release (see loadgen/zrk/build.sh)
 COOLDOWN=${COOLDOWN:-8}
 RUNID=${RUNID:-zrk-$(date -u +%Y%m%d-%H%M%S)}
 
@@ -35,7 +39,7 @@ ln -sfn "$RUNID" results/latest   # `make report` renders results/latest
 COMPOSE="docker compose -f compose.yaml -f compose.cloud.yaml"
 PENV="ZOXY_REF=$ZOXY_REF BACKEND_IP=$BACKEND_PRIV"
 
-echo ">>> runid=$RUNID proxies=[$PROXIES] ramp=$START_RATE->${MAX_RATE}rps/${RAMP_SECONDS}s conns=$CONNECTIONS (proxies capped to 1 CPU)"
+echo ">>> runid=$RUNID proxies=[$PROXIES] ramp=$START_RATE->${MAX_RATE}rps/${RAMP_SECONDS}s conns=$CONNECTIONS threads=$THREADS (proxies capped to 1 CPU)"
 
 # --- cloud prometheus targets (file_sd): proxy cAdvisor :8081 for container
 # CPU/mem, node_exporter :9100 per host, and the loadgen's live zrk /metrics ----
@@ -123,10 +127,23 @@ for p in $PROXIES; do
 
     echo ">>> [$p] ramping ${RAMP_SECONDS}s"
     start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    ssh -o BatchMode=yes "$SSH_USER@$LG" "docker run --rm --network host --ulimit nofile=1048576 \
+    # wipe any prior outputs for this proxy first — if zrk dies early (e.g. the
+    # io_uring/seccomp trap above) it still exits 0 with "0 windows", and
+    # without this the scp below would silently re-collect a STALE result from
+    # an earlier run under the same proxy name instead of failing loudly.
+    ssh -o BatchMode=yes "$SSH_USER@$LG" "rm -f zrk/$p.lg1.ndjson zrk/$p.lg1.json zrk/$p.lg1.hgrm"
+    # zrk >=1.0.0 runs its coroutine io engine (zio) on io_uring, which Docker's
+    # default seccomp profile denies (io_uring_* blocked since engine 25.0) —
+    # same wall zoxy hit (see proxies/zoxy/seccomp-iouring.json); reuse that
+    # profile here (default profile + the three io_uring syscalls, not
+    # unconfined) plus an unlimited memlock (ring memory counts against it on
+    # kernels <5.12), or zrk silently exits with "error: PermissionDenied" and
+    # 0 windows, and the driver falls back to scp-ing a stale prior result.
+    ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && docker run --rm --network host --ulimit nofile=1048576 \
+        --ulimit memlock=-1 --security-opt seccomp=proxies/zoxy/seccomp-iouring.json \
         -v ~/zrk:/w -w /w \
         -e TARGET=$target -e MAX_RATE=$MAX_RATE -e RAMP_SECONDS=$RAMP_SECONDS -e START_RATE=$START_RATE \
-        -e CONNECTIONS=$CONNECTIONS -e TIMEOUT_S=$TIMEOUT_S \
+        -e CONNECTIONS=$CONNECTIONS -e THREADS=$THREADS -e TIMEOUT_S=$TIMEOUT_S \
         -e OUT=/w/$p.lg1 -e NAME=$p -e RUNID=$RUNID -e METRICS_ADDR=:8090 \
         python:3-alpine python3 /w/run.py" 2>&1 | grep -E 'peak|knee' || true
     end=$(date -u +%Y-%m-%dT%H:%M:%SZ)

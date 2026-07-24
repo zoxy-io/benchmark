@@ -20,6 +20,10 @@ change):
   RAMP_SECONDS  ramp length / run duration                         (default 120)
   START_RATE    req/s at t=0                                        (default 200)
   CONNECTIONS   open connections = in-flight cap (open-loop guard)  (default 2000)
+  THREADS       OS threads driving zrk's coroutine io engine (zio,  (default 4)
+                since v1.0.0; connections are multiplexed across
+                them, not one-thread-per-connection) — match the
+                loadgen's core count, not CONNECTIONS
   TIMEOUT_S     per-request WIRE timeout, s (hung-conn guard, NOT a
                 CO-tail bound — see the --timeout note in main())       (default 1)
   OUT           output BASE path, no extension                     (default /w/ramp)
@@ -57,6 +61,7 @@ MAX_RATE = envi("MAX_RATE", 200000)
 RAMP_SECONDS = envi("RAMP_SECONDS", 120)
 START_RATE = envi("START_RATE", 200)
 CONNECTIONS = envi("CONNECTIONS", 2000)
+THREADS = envi("THREADS", 4)
 TIMEOUT_S = envi("TIMEOUT_S", 1)
 OUT = env("OUT", "/w/ramp")
 NAME = env("NAME", "ramp")
@@ -156,6 +161,7 @@ def main():
         "-R", f"{START_RATE}:{MAX_RATE}",
         "-d", f"{RAMP_SECONDS}s",
         "-c", str(CONNECTIONS),
+        "-t", str(THREADS),
         # zrk's --timeout is a per-request WIRE timeout (bytes-out -> bytes-in on
         # the socket), NOT a scheduled-latency timeout — it does NOT bound the
         # CO-corrected tail. Past saturation a request waits for a free connection
@@ -181,7 +187,7 @@ def main():
     except FileNotFoundError:
         pass
     print(f"zrk[{NAME}]: {TARGET}  {START_RATE}..{MAX_RATE} rps over {RAMP_SECONDS}s, "
-          f"conns={CONNECTIONS}, metrics {METRICS_ADDR}", file=sys.stderr)
+          f"conns={CONNECTIONS}, threads={THREADS}, metrics {METRICS_ADDR}", file=sys.stderr)
     proc = subprocess.Popen(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     # Tail the NDJSON as zrk flushes each line; keep the last gauge live.
