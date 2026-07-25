@@ -53,14 +53,14 @@ resource "yandex_vpc_security_group" "bench" {
   }
 }
 
-data "yandex_compute_image" "ubuntu" {
-  family = "ubuntu-2404-lts-oslogin"
-}
-
 locals {
   # One loadgen: the open-loop zrk generator saturates a 1-CPU proxy from a
   # single 4-core box well under its own limit (it hits the proxy's
   # concurrency-collapse wall first). loadgen also hosts prometheus/grafana.
+  # (Tried 6 cores 2026-07-24 to give zrk's threads more headroom — reverted:
+  # loadgen's Grafana CPU% is dominated by iowait-accounting noise from
+  # Prometheus's 1s scrape interval hitting the network-ssd disk, not real
+  # compute pressure, so the extra cores didn't buy anything measurable.)
   hosts = {
     loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory, role = "loadgen" }
     proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, role = "proxy" }
@@ -89,7 +89,7 @@ resource "yandex_compute_instance" "host" {
 
   boot_disk {
     initialize_params {
-      image_id = data.yandex_compute_image.ubuntu.id
+      image_id = var.image_id
       size     = var.disk_size
       type     = "network-ssd"
     }

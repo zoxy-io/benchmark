@@ -42,6 +42,20 @@ variable "disk_size" {
   default = 30
 }
 
+variable "image_id" {
+  type        = string
+  default     = "fd8dcjve5vsdhbqs6nqj" # ubuntu-2404-lts-oslogin, pinned at fleet creation.
+  description = <<-EOT
+    Boot disk image, pinned rather than resolved live from the
+    ubuntu-2404-lts-oslogin family. Yandex republishes that family
+    periodically; resolving it live means an UNRELATED apply (e.g. a core-
+    count bump) silently picks up a newer image, which changes
+    boot_disk.image_id and forces a destroy+recreate of every host (new
+    external IPs, lost disks) instead of the in-place resize
+    allow_stopping_for_update is there for. Bump this deliberately.
+  EOT
+}
+
 # Sizing: the proxy container is capped to 1 CPU (one zoxy process), so the
 # proxy VM is 2 cores — core 0 for the proxy, core 1 left free for OS/cAdvisor
 # and hypervisor-steal absorption. backend gets 2x the proxy so the origin is
