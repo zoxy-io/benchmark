@@ -1,20 +1,42 @@
-# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# L7 HTTPS reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
 # build — every proxy now parses HTTP/1.1 and reverse-proxies requests). Worker
 # count is hardcoded to 1 via --concurrency in the compose command (1 CPU).
 # STRICT_DNS because the upstream is a hostname (compose service locally,
 # extra_hosts entry in cloud). No access log. Envoy keeps both the downstream
 # and the pooled upstream connections alive by default.
+#
+# TLS termination (phase-3a-ztls): the downstream (client) leg is HTTPS,
+# pinned to TLS 1.3 only — parity with zoxy's ztls engine, which is TLS
+# 1.3-only by construction; every proxy negotiates the identical protocol
+# version so the comparison measures reverse-proxy overhead, not handshake
+# choice. alpn_protocols is pinned to http/1.1 (zrk sends no ALPN and would
+# get http/1.1 by default anyway, but pin it explicitly — parity with the
+# other proxies' HTTP/1.1-only reverse-proxy behavior for anyone else probing
+# the stack with an ALPN-h2-first client). The upstream (backend) leg is
+# untouched plain HTTP.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9902 }
 
 static_resources:
   listeners:
-    - name: plain
+    - name: tls
       address:
         socket_address: { address: 0.0.0.0, port_value: 8080 }
       filter_chains:
-        - filters:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["http/1.1"]
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                tls_certificates:
+                  - certificate_chain: { filename: /etc/tls/cert.pem }
+                    private_key: { filename: /etc/tls/key.pem }
+          filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager

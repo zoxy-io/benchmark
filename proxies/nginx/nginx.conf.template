@@ -1,4 +1,4 @@
-# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# L7 HTTPS reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
 # build — every proxy now parses HTTP/1.1 and reverse-proxies requests, keeping
 # both client and upstream connections alive). This is an envsubst template
 # (official-image mechanism): worker count is hardcoded to 1 to match the 1-CPU
@@ -8,6 +8,11 @@
 # startup via the container's resolver (bridge DNS) or /etc/hosts (cloud
 # extra_hosts); the origin is already healthy by then (depends_on), so no
 # runtime resolver is needed — same as pingora.
+#
+# TLS termination (phase-3a-ztls): the client leg is HTTPS, pinned to TLS 1.3
+# only — parity with zoxy's ztls engine (TLS 1.3-only by construction), so
+# every proxy negotiates the identical protocol version. The upstream
+# (backend) leg is untouched plain HTTP.
 worker_processes 1;
 worker_rlimit_nofile 262144;
 error_log /var/log/nginx/error.log warn;
@@ -34,7 +39,11 @@ http {
     }
 
     server {
-        listen 8080;
+        listen 8080 ssl;
+        ssl_certificate /etc/tls/cert.pem;
+        ssl_certificate_key /etc/tls/key.pem;
+        ssl_protocols TLSv1.3;
+
         location / {
             proxy_pass http://origin;
             # keep-alive to the upstream requires HTTP/1.1 with the per-hop

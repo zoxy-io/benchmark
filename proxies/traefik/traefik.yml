@@ -1,9 +1,10 @@
 # Static config. GOMAXPROCS=1 comes from compose env (1 CPU, explicit — Go would
 # otherwise count HOST cores). accessLog omitted => disabled. The router is an
 # HTTP PathPrefix(`/`) catch-all — see dynamic.yml; the driver probes with a
-# real GET, which the HTTP router serves.
+# real GET, which the HTTPS router serves. TLS termination (cert/key, min/max
+# protocol version) is configured in dynamic.yml's `tls` section.
 entryPoints:
-  plain:
+  tls:
     address: ":8080"
 
 providers:

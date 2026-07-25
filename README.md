@@ -10,13 +10,17 @@ zoxy's phase-1 build adds an **HTTP (L7)** listener, so every proxy runs as an
 **HTTP/1.1 reverse proxy** (`mode http`, `http_connection_manager`, HTTP router,
 nginx `proxy_pass`, and a small Rust binary on Cloudflare's Pingora framework) —
 the same job for everyone: parse each request, forward it to the origin over a
-pooled keep-alive upstream, stream the response back. The generator speaks HTTP
-end-to-end and the origin nginx is the HTTP endpoint, as before — now the
-proxies parse it too instead of tunnelling bytes.
+pooled keep-alive upstream, stream the response back. zoxy's phase-3a-ztls
+build then adds **TLS termination**, so the client leg is now **HTTPS**:
+every proxy presents the same self-signed ECDSA P-256 cert (`certs/`), pinned
+to **TLS 1.3 only** for parity with zoxy's ztls engine (TLS 1.3-only by
+construction). The backend leg stays plain HTTP, untouched — only the
+generator-to-proxy hop is encrypted, and the origin nginx is still the HTTP
+endpoint it always was.
 
 ```
              0 ──────── linear ramp ────────► MAX_RATE
-        zrk ───────► proxy-under-test ───────────► nginx origin
+        zrk ──(https, TLS 1.3)─► proxy-under-test ──(http)──► nginx origin
  (open loop, CO-     (pinned cores, 512 MiB,       (canned 64B..100k
   corrected)          ONE at a time)                bodies, 8x cpus)
       │                       │ cAdvisor: cpu/mem per container
@@ -77,6 +81,20 @@ poking at the stack; the load driver itself is cloud-only.
   binary on Cloudflare's framework — `proxies/pingora`), zoxy's phase-1 `http`
   listener. Everyone parses each request and keeps both the client and the
   pooled upstream connection alive — nobody skips HTTP parsing that others pay.
+- **Same encryption for every proxy**: since phase-3a-ztls, every proxy
+  terminates TLS on the client leg with the identical self-signed ECDSA P-256
+  cert (`certs/`, `certs/gen.sh` regenerates it) pinned to **TLS 1.3 only**
+  (`ssl-min-ver`/`ssl-max-ver`, `tls_minimum/maximum_protocol_version`,
+  `minVersion`/`maxVersion`, `ssl_protocols`, `set_min/max_proto_version` —
+  one per proxy config). ECDSA P-256 and TLS 1.3-only aren't preferences,
+  they're zoxy's ztls engine's actual limits (RSA/Ed25519 certs and any
+  earlier protocol version are rejected at load) — every other proxy is
+  pinned to match so the comparison measures reverse-proxy overhead, not who
+  negotiated a cheaper handshake. The backend leg is never TLS — only the
+  generator-to-proxy hop is encrypted. Pin the zoxy build to a SHA at or past
+  `e26faab` (2026-07-25): earlier phase-3a-ztls commits only relayed
+  decrypted bytes blindly (no HTTP parsing behind TLS); L7-over-TLS landed in
+  `7aa7850`.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM` by
   cgroups, identical per proxy; thread counts hardcoded to 1 (`nbthread 1`,
   `--concurrency 1`, `GOMAXPROCS=1`, `worker_processes 1`, pingora `threads=1`).
@@ -114,6 +132,7 @@ poking at the stack; the load driver itself is cloud-only.
 ```
 compose.yaml              every service, proxies behind profiles, limits enforced
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
+certs/                    shared self-signed ECDSA P-256 cert+key every proxy TLS-terminates with (gen.sh regenerates)
 proxies/<p>/              one static config per proxy (upstream is always `backend`)
 backend/                  nginx origin, canned bodies generated at start
 loadgen/zrk/              open-loop linear-ramp generator (zrk, HdrHistogram) + /metrics bridge

@@ -13,8 +13,14 @@ path = "src/main.rs"
 # reverse-proxy state machine and upstream connection pool); pingora-core
 # carries Server / ServerConf / HttpPeer. Pin the minor here; bump to bench a
 # newer Pingora.
-pingora-core = "0.5"
-pingora-proxy = "0.5"
+#
+# `openssl` feature (phase-3a-ztls): pingora-core ships NO TLS backend by
+# default (bare `pingora-core = "0.5"` compiles a panic-stub `tls` module —
+# TlsSettings/add_tls_with_settings don't exist without a backend feature).
+# openssl over boringssl: matches the stock OpenSSL already pulled in for the
+# build (libssl-dev/libssl3 below), no extra cmake/Go toolchain needed.
+pingora-core = { version = "0.5", features = ["openssl"] }
+pingora-proxy = { version = "0.5", features = ["openssl"] }
 async-trait = "0.1"
 
 [profile.release]

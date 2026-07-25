@@ -1,15 +1,37 @@
-# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
+# L7 HTTPS reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
 # build — every proxy now parses HTTP/1.1 and reverse-proxies requests).
 # PathPrefix(`/`) is the catch-all HTTP rule; Traefik keeps client connections
 # alive and pools upstream connections by default.
+#
+# TLS termination (phase-3a-ztls): `tls: {}` on the router enables TLS on
+# entryPoint `tls` using the certificate below; the `default` TLSOption is
+# applied automatically (Traefik convention — no explicit `options:` needed
+# on the router) and pins TLS 1.3 only, matching zoxy's ztls engine (TLS
+# 1.3-only by construction) so every proxy negotiates the same protocol
+# version. alpnProtocols excludes h2 (Traefik's default ALPN list offers it) —
+# parity with the other proxies' HTTP/1.1-only reverse-proxy behavior; zrk
+# sends no ALPN and would get http/1.1 either way. The backend leg stays
+# plain HTTP.
 http:
   routers:
-    r-plain:
+    r-tls:
       rule: "PathPrefix(`/`)"
-      entryPoints: [plain]
+      entryPoints: [tls]
       service: origin
+      tls: {}
   services:
     origin:
       loadBalancer:
         servers:
           - url: "http://backend:9000"
+
+tls:
+  certificates:
+    - certFile: /etc/tls/cert.pem
+      keyFile: /etc/tls/key.pem
+  options:
+    default:
+      minVersion: VersionTLS13
+      maxVersion: VersionTLS13
+      alpnProtocols:
+        - http/1.1

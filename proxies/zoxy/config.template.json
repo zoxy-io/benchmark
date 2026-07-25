@@ -1,9 +1,15 @@
 {
-  "listeners": [{ "bind": "0.0.0.0:8080", "cluster": "origin", "protocol": "http" }],
+  "listeners": [{
+    "bind": "0.0.0.0:8080",
+    "cluster": "origin",
+    "protocol": "http",
+    "tls": { "cert": "/etc/tls/cert.pem", "key": "/etc/tls/key.pem" }
+  }],
   "clusters": {
     "origin": { "endpoints": ["@BACKEND_ADDR@"] }
   },
   "admin": { "bind": "0.0.0.0:9101" },
+  "limits": { "tls_engines": 1024 },
   "timeouts": {
     "connect_ms": 5000,
     "idle_ms": 60000,

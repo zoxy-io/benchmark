@@ -2,8 +2,10 @@
 # reverse-proxy) binary on it (src/main.rs). Pinned Rust for reproducibility;
 # the Pingora version lives in Cargo.toml. Build deps cover both TLS backends
 # pingora may pull (openssl via libssl-dev/pkg-config, boringssl via
-# cmake/clang) so the crate resolves regardless of the default feature — even
-# though this proxy never does TLS.
+# cmake/clang) so the crate resolves regardless of which feature is enabled —
+# Cargo.toml pins the `openssl` feature (phase-3a-ztls: this proxy now
+# terminates TLS 1.3, see src/main.rs); the boringssl deps stay harmless spare
+# capacity in case that pin ever changes.
 FROM rust:1.85-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -25,5 +27,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/pingora-http /usr/local/bin/pingora-http
-# LISTEN / UPSTREAM come from compose env; worker threads are hardcoded to 1.
+# LISTEN / UPSTREAM / TLS_CERT / TLS_KEY come from compose env; worker threads
+# are hardcoded to 1.
 ENTRYPOINT ["/usr/local/bin/pingora-http"]

@@ -15,7 +15,13 @@ zrk writes the source-of-record artifacts the report reads:
 
 Config via env (same contract the old vegeta-ramp used, so the drivers barely
 change):
-  TARGET        full URL, e.g. http://10.0.0.5:8080/1k             (required)
+  TARGET        full URL, e.g. https://10.0.0.5:8080/1k            (required)
+                A https:// TARGET automatically gets zrk's -k/--insecure (skip
+                cert verification) appended — every proxy under phase-3a-ztls
+                presents a self-signed cert (./certs), and zrk has no
+                --resolve-style flag to pin trust to it separately. Note zrk's
+                std.crypto.tls client omits the SNI extension entirely when -k
+                is set, which is fine here (one cert, no name-based routing).
   MAX_RATE      req/s at the end of the ramp                       (default 200000)
   RAMP_SECONDS  ramp length / run duration                         (default 120)
   START_RATE    req/s at t=0                                        (default 200)
@@ -179,8 +185,12 @@ def main():
         "--hdr", HGRM,
         "--format", "json", "-o", JSONP,
         "--plain",
-        TARGET,
     ]
+    if TARGET.startswith("https://"):
+        # self-signed cert (phase-3a-ztls terminates TLS at every proxy) — see
+        # the TARGET note above for the SNI caveat this carries.
+        cmd.append("-k")
+    cmd.append(TARGET)
     # start fresh so we only tail this run's windows
     try:
         os.remove(ND)

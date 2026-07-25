@@ -97,7 +97,25 @@ ssh -o BatchMode=yes "$SSH_USER@$LG" 'mkdir -p ~/zrk'
 rsync -az --exclude src loadgen/zrk/ "$SSH_USER@$LG:zrk/"
 
 meta="$RESULTS/meta.json"
-echo "{\"prom\":\"$PROM\",\"runid\":\"$RUNID\",\"runs\":{}}" > "$meta"
+# Seed fresh, but PRESERVE any existing runs: re-running a PROXIES subset
+# against an existing RUNID (README: `make cloud-bench PROXIES="zoxy"`, or
+# recovering a single broken proxy without redoing the whole suite) used to
+# stomp meta.json's "runs" back to {} here, orphaning every other proxy's
+# already-collected NDJSON/JSON/HDR — report.py only renders proxies listed
+# in meta["runs"], so their data silently vanished from the report despite
+# the files still being on disk.
+if [[ -f "$meta" ]]; then
+    python3 - "$meta" "$PROM" "$RUNID" <<'PY'
+import json, sys
+f, prom, runid = sys.argv[1:4]
+m = json.load(open(f))
+m["prom"], m["runid"] = prom, runid
+m.setdefault("runs", {})
+json.dump(m, open(f, "w"), indent=2)
+PY
+else
+    echo "{\"prom\":\"$PROM\",\"runid\":\"$RUNID\",\"runs\":{}}" > "$meta"
+fi
 
 record() { # proxy start end
     python3 - "$meta" "$1" "$2" "$3" "$MAX_RATE" "$RAMP_SECONDS" "$START_RATE" <<'PY'
@@ -112,15 +130,20 @@ PY
 
 for p in $PROXIES; do
     echo ">>> [$p] starting"
+    # direct hits the backend, which stays plain HTTP (phase-3a-ztls only
+    # terminates TLS at the proxies); every proxy target is HTTPS with a
+    # self-signed cert (./certs), hence -k on the warm probe below.
     if [[ $p == direct ]]; then
         target="http://$BACKEND_PRIV:9000/1k"
+        curlflags=""
     else
         ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile $p up -d --build --wait $p" >/dev/null
-        target="http://$PROXY_PRIV:8080/1k"
+        target="https://$PROXY_PRIV:8080/1k"
+        curlflags="-k"
     fi
     # warm probe
     for i in $(seq 1 20); do
-        ssh -o BatchMode=yes "$SSH_USER@$LG" "curl -sf -o /dev/null $target" && break
+        ssh -o BatchMode=yes "$SSH_USER@$LG" "curl -sf $curlflags -o /dev/null $target" && break
         [[ $i == 20 ]] && { echo "fatal: [$p] never served 200 at $target"; exit 1; }
         sleep 1
     done
