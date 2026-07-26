@@ -168,7 +168,7 @@ services:
     # worker thread; UPSTREAM is resolved once at startup and pooled/kept alive.
     build:
       context: ./proxies/pingora
-    image: zoxy-bench/pingora-http:0.5
+    image: zoxy-bench/pingora-http:0.8
     container_name: pingora
     profiles: [pingora]
     environment:

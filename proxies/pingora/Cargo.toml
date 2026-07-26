@@ -13,8 +13,8 @@ path = "src/main.rs"
 # reverse-proxy state machine and upstream connection pool); pingora-core
 # carries Server / ServerConf / HttpPeer. Pin the minor here; bump to bench a
 # newer Pingora.
-pingora-core = "0.5"
-pingora-proxy = "0.5"
+pingora-core = "0.8"
+pingora-proxy = "0.8"
 async-trait = "0.1"
 
 [profile.release]
