@@ -74,6 +74,13 @@ fn main() {
     // hardcoded to 1 worker thread — 1 CPU, thread parity with the other proxies.
     let mut conf = ServerConf::default();
     conf.threads = 1;
+    // Default work_stealing=true runs Tokio's multi-thread (work-stealing)
+    // scheduler even with threads=1, paying its cross-worker steal-queue/park
+    // machinery for zero benefit (nothing to steal from with one worker).
+    // false swaps in pingora-runtime's NoSteal flavor — a single current-thread
+    // runtime, which pingora's own docs call "as efficient as the
+    // single-threaded runtime" — pure upside at threads=1.
+    conf.work_stealing = false;
     // Default upstream_keepalive_pool_size is 128 (and it's a per-thread LRU,
     // so with threads=1 that's the effective cap) — well under CONNECTIONS=500,
     // so under load the idle-connection pool churns and reopens fresh upstream
