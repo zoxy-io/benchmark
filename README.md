@@ -96,14 +96,18 @@ poking at the stack; the load driver itself is cloud-only.
 - **zoxy does no DNS**: endpoints must be IP literals. The entrypoint resolves
   `backend` once at start (compose DNS locally, `extra_hosts` in cloud) and
   renders the literal into the config.
-- **zoxy caps admitted connections per process, compile-time**: on the phase-1
-  L7 path the bound is `conn_slots_max` (~1020, comptime-derived from the
-  io_uring completion-queue budget) plus a shared upstream keep-alive pool of
+- **zoxy caps admitted connections per process**: on the phase-1 L7 path the
+  bound is a configurable `limits.conn_slots` (default 1386, tuned to a ~32 MiB
+  footprint — zoxy prints the exact figure at startup; we don't set this, so it
+  runs on the default) up to a comptime ceiling of 14074 (the io_uring
+  completion-queue c10k budget), plus a shared upstream keep-alive pool of
   `upstream_slots_max`=1024; connections beyond the admission ceiling get a
-  static shed response. So keep `CONNECTIONS` (zrk's in-flight cap) at/under it —
-  the default 1024 matches. Past a proxy's sweet-spot concurrency *every* proxy
-  congestion-collapses (throughput falls as latency climbs), so `CONNECTIONS` is
-  set at the plateau, not maxed. Every other proxy has no such per-process cap.
+  static shed response. `CONNECTIONS` (zrk's in-flight cap) defaults to 500,
+  comfortably under the 1386 default. That's not chased up against zoxy's
+  ceiling — past a proxy's sweet-spot concurrency *every* proxy
+  congestion-collapses (throughput falls as latency climbs), so `CONNECTIONS`
+  is set at the plateau every proxy shares. Every other proxy has no such
+  per-process cap.
 - **Pin the zoxy build**: the Dockerfile caches its `git clone`, so `ZOXY_REF=main`
   can silently be a stale commit. Pin a SHA for anything version-sensitive.
 - **Origin headroom**: backend gets several times the proxy's cores; `direct`

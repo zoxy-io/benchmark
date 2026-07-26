@@ -92,10 +92,12 @@ services:
     # zoxy (libxev) has NO thread knob: one event loop per PROCESS. Capped to 1
     # CPU it runs a SINGLE process (ZOXY_WORKERS=1), pinned to core 0 by the cloud
     # overlay — thread parity with the others (all = 1). On the phase-1 L7 path
-    # concurrency is hard-capped at conn_slots_max PER PROCESS (~1020, comptime-
-    # derived from the io_uring CQ budget in constants.zig) with a shared
-    # upstream keep-alive pool of upstream_slots_max=1024; past the admission
-    # ceiling zoxy sheds with a static error. Every other proxy has no such cap.
+    # concurrency is capped PER PROCESS at a configurable limits.conn_slots
+    # (default 1386, ~32 MiB — config.template.json sets no `limits` block, so
+    # zoxy runs on this default) up to a comptime c10k ceiling of 14074, with a
+    # shared upstream keep-alive pool of upstream_slots_max=1024; past the
+    # admission ceiling zoxy sheds with a static error. Every other proxy has
+    # no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
     # resolves `backend` (env below) once at start and renders the template.
     environment:
