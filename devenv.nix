@@ -20,7 +20,15 @@
     pkgs.zig_0_16     # loadgen/zrk/build.sh cross-compiles zrk to a static musl
                       # binary that the drivers ship to the loadgen (zrk needs
                       # zig 0.16; pin the exact attr, not the bare `zig` alias)
+    pkgs.cmake        # proxies/pingora: flate2's zlib-ng feature vendors and
+                      # cmake-builds zlib-ng, even with no TLS feature enabled
   ];
+
+  # cargo/rustc for iterating on proxies/pingora locally without a Docker
+  # build — nixpkgs' rustc is plenty for a TLS-free (default-features=[])
+  # pingora build; the Dockerfile (pinned rust:1.85-bookworm) stays the
+  # authoritative build for actual benchmark runs.
+  languages.rust.enable = true;
 
   enterShell = ''
     echo "proxy-bench dev shell — run 'make help' for the workflow. (docker comes from the host)"

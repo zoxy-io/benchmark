@@ -24,3 +24,8 @@ __pycache__/
 loadgen/zrk/src/
 loadgen/zrk/zrk
 loadgen/zrk/.built-ref
+
+# rust build artifacts (proxies/pingora) — Cargo.toml floats on "0.8", no
+# committed lockfile on purpose (see its comment)
+proxies/pingora/target/
+proxies/pingora/Cargo.lock
