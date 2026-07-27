@@ -52,6 +52,7 @@ const LiveGauges = struct {
     mutex: Io.Mutex = .init,
     offered: f64 = 0,
     achieved: f64 = 0,
+    failed: f64 = 0,
     err_ratio: f64 = 0,
     p50_s: f64 = 0,
     p90_s: f64 = 0,
@@ -82,7 +83,8 @@ const ProgressCtx = struct {
     rows: *std.ArrayList(Row),
     arena: std.mem.Allocator,
     prev_completed: u64 = 0,
-    prev_errors: u64 = 0,
+    prev_status_errors: u64 = 0,
+    prev_other_errors: u64 = 0,
     prev_elapsed_s: f64 = 0,
 };
 
@@ -103,13 +105,25 @@ fn onProgress(
     // CLI would have written.
     ctx.ts.record(snapshot, elapsed_s) catch {};
 
+    // zrk's `completed` is wrk-lineage throughput: EVERY parsed response counts,
+    // 2xx/3xx or not (`status_errors` is an overlapping quality subset of it, not
+    // a disjoint category — see connection.zig's `recordStatus`). Socket errors
+    // and deadline misses never got a parsed response at all, so those ARE
+    // disjoint from `completed`. Splitting into a stacked ok/failed thus needs:
+    // ok = completed MINUS its status_errors subset; failed = status_errors plus
+    // the genuinely-disjoint socket/deadline failures. Getting this wrong double-
+    // counts non-2xx/3xx responses in both "achieved" and "failed" at once.
     const interval_s = elapsed_s - ctx.prev_elapsed_s;
     const d_completed = snapshot.counters.completed -| ctx.prev_completed;
-    const cur_errors = snapshot.counters.status_errors + snapshot.counters.socketErrors() + snapshot.counters.deadline_errors;
-    const d_errors = cur_errors -| ctx.prev_errors;
-    const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_completed)) / interval_s else 0;
-    const attempts = d_completed + d_errors;
-    const err_ratio: f64 = if (attempts > 0) @as(f64, @floatFromInt(d_errors)) / @as(f64, @floatFromInt(attempts)) else 0;
+    const d_status_errors = snapshot.counters.status_errors -| ctx.prev_status_errors;
+    const other_errors_now = snapshot.counters.socketErrors() + snapshot.counters.deadline_errors;
+    const d_other_errors = other_errors_now -| ctx.prev_other_errors;
+    const d_ok = d_completed -| d_status_errors;
+    const d_failed = d_status_errors + d_other_errors;
+    const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_ok)) / interval_s else 0;
+    const failed: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_failed)) / interval_s else 0;
+    const attempts = d_ok + d_failed;
+    const err_ratio: f64 = if (attempts > 0) @as(f64, @floatFromInt(d_failed)) / @as(f64, @floatFromInt(attempts)) else 0;
     const offered = targetRate(ctx.cfg, elapsed_s, total_s);
 
     {
@@ -117,6 +131,7 @@ fn onProgress(
         defer ctx.gauges.mutex.unlock(ctx.io);
         ctx.gauges.offered = offered;
         ctx.gauges.achieved = achieved;
+        ctx.gauges.failed = failed;
         ctx.gauges.err_ratio = err_ratio;
         // Cumulative-so-far percentiles, not this interval's delta (which
         // would need our own parallel delta-histogram tracker to match
@@ -133,7 +148,8 @@ fn onProgress(
     }
 
     ctx.prev_completed = snapshot.counters.completed;
-    ctx.prev_errors = cur_errors;
+    ctx.prev_status_errors = snapshot.counters.status_errors;
+    ctx.prev_other_errors = other_errors_now;
     ctx.prev_elapsed_s = elapsed_s;
 }
 
@@ -174,12 +190,14 @@ fn writeMetrics(io: Io, w: *Io.Writer, gauges: *LiveGauges, name: []const u8, ru
         defer gauges.mutex.unlock(io);
         g = gauges.*;
     }
-    var body_buf: [1024]u8 = undefined;
+    var body_buf: [1536]u8 = undefined;
     const body = try std.fmt.bufPrint(&body_buf,
         \\# TYPE zrk_offered_rps gauge
         \\zrk_offered_rps{{proxy="{s}",testid="{s}"}} {d:.3}
         \\# TYPE zrk_achieved_rps gauge
         \\zrk_achieved_rps{{proxy="{s}",testid="{s}"}} {d:.3}
+        \\# TYPE zrk_failed_rps gauge
+        \\zrk_failed_rps{{proxy="{s}",testid="{s}"}} {d:.3}
         \\# TYPE zrk_errors_ratio gauge
         \\zrk_errors_ratio{{proxy="{s}",testid="{s}"}} {d:.6}
         \\# TYPE zrk_latency_seconds gauge
@@ -191,6 +209,7 @@ fn writeMetrics(io: Io, w: *Io.Writer, gauges: *LiveGauges, name: []const u8, ru
     , .{
         name, runid, g.offered,
         name, runid, g.achieved,
+        name, runid, g.failed,
         name, runid, g.err_ratio,
         name, runid, g.p50_s,
         name, runid, g.p90_s,

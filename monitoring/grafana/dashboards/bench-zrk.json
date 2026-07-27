@@ -1,6 +1,6 @@
 {
   "uid": "proxy-bench-live-zrk",
-  "title": "Proxy bench \u2014 live run (zrk open-loop)",
+  "title": "Proxy bench — live run (zrk open-loop)",
   "description": "Watch a ramp as it runs. Cross-proxy comparison lives in the HTML report (make report), not here.",
   "schemaVersion": 39,
   "editable": true,
@@ -42,7 +42,8 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Achieved req/s per proxy (zrk)",
+      "title": "Requests/s: offered vs. completed (ok + failed stacked)",
+      "description": "The stacked area is every attempt that actually finished (ok or failed) this second; the dashed line is what the ramp was asking for. A gap between the line and the top of the stack is backlog building (requests not yet attempted), not the same thing as the red failed slice — those DID reach the wire and got a non-2xx/3xx, a socket error, or a timeout.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -55,15 +56,56 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal",
+              "group": "reqs"
+            }
+          }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "A" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byFrameRefID", "options": "B" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byFrameRefID", "options": "C" },
+            "properties": [
+              { "id": "custom.stacking", "value": { "mode": "none", "group": "reqs" } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } },
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "grey" } }
+            ]
+          }
+        ]
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (proxy) (zrk_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
-          "legendFormat": "{{proxy}}"
+          "legendFormat": "{{proxy}} ok"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (proxy) (zrk_failed_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "legendFormat": "{{proxy}} failed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (proxy) (zrk_offered_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "legendFormat": "{{proxy}} offered (target)"
         }
       ]
     },
@@ -113,7 +155,8 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Errors & offered-shortfall (saturation signals)",
+      "title": "Error ratio (failed / attempted)",
+      "description": "Share of this second's completed attempts that failed (non-2xx/3xx, socket error, or timeout). Zero during clean shedding — a proxy that falls behind but never errors shows up in the shortfall panel, not here.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -126,7 +169,9 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -134,24 +179,48 @@
         {
           "refId": "A",
           "expr": "max by (proxy) (zrk_errors_ratio{testid=~\"$testid\", proxy=~\"$proxy\"})",
-          "legendFormat": "{{proxy}} error ratio"
-        },
-        {
-          "refId": "B",
-          "expr": "sum by (proxy) (zrk_offered_rps{testid=~\"$testid\", proxy=~\"$proxy\"} - zrk_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
-          "legendFormat": "{{proxy}} shortfall"
+          "legendFormat": "{{proxy}}"
         }
       ]
     },
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Proxy container CPU (cores)",
+      "title": "Offered shortfall (backlogged, not yet attempted)",
+      "description": "offered - ok - failed: requests the ramp asked for that haven't reached the wire yet this second (queued behind a slower server). Distinct from \"failed\" above, which already made an attempt.",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
         "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (proxy) (zrk_offered_rps{testid=~\"$testid\", proxy=~\"$proxy\"} - zrk_achieved_rps{testid=~\"$testid\", proxy=~\"$proxy\"} - zrk_failed_rps{testid=~\"$testid\", proxy=~\"$proxy\"})",
+          "legendFormat": "{{proxy}} shortfall"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Proxy container CPU (cores)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
       },
       "datasource": {
         "type": "prometheus",
@@ -172,13 +241,13 @@
       ]
     },
     {
-      "id": 5,
+      "id": 6,
       "type": "timeseries",
       "title": "Proxy container memory (working set)",
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 16
       },
       "datasource": {
@@ -200,14 +269,14 @@
       ]
     },
     {
-      "id": 6,
+      "id": 7,
       "type": "timeseries",
       "title": "Host CPU busy % by role (excl. iowait; validity: loadgen/backend must have headroom)",
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 16
+        "x": 0,
+        "y": 24
       },
       "datasource": {
         "type": "prometheus",
@@ -229,13 +298,14 @@
       ]
     },
     {
-      "id": 7,
+      "id": 8,
       "type": "timeseries",
-      "title": "zoxy \u2014 throughput (its own counters): accepts/s & L7 responses/s",
+      "title": "zoxy — request throughput (its own counters)",
+      "description": "L7 responses/s and completed/s are request-level; see the connection panel for accept rate (a different unit of work — one connection can carry many requests).",
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 24
       },
       "datasource": {
@@ -256,25 +326,49 @@
         },
         {
           "refId": "B",
-          "expr": "rate(zoxy_accepted[30s])",
-          "legendFormat": "accepted conns/s"
-        },
-        {
-          "refId": "C",
           "expr": "rate(zoxy_completed[30s])",
           "legendFormat": "completed/s"
         }
       ]
     },
     {
-      "id": 8,
+      "id": 9,
       "type": "timeseries",
-      "title": "zoxy \u2014 admission shedding (flat 0 = no conn-slot pressure; spikes = at the cap)",
+      "title": "zoxy — connection accept rate",
+      "description": "Connections/s, not requests/s — kept off the request-throughput panel above so the two units of work aren't overlaid on one axis.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(zoxy_accepted[30s])",
+          "legendFormat": "accepted conns/s"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "zoxy — admission shedding (flat 0 = no conn-slot pressure; spikes = at the cap)",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 32
       },
       "datasource": {
         "type": "prometheus",
