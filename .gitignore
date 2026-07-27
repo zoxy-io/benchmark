@@ -20,10 +20,11 @@ devenv.local.nix
 __pycache__/
 *.pyc
 
-# zrk load generator build artifacts (loadgen/zrk/build.sh)
-loadgen/zrk/src/
-loadgen/zrk/zrk
-loadgen/zrk/.built-ref
+# zrk-runner build artifacts (loadgen/zrk-runner/build.sh) — build.zig.zon
+# pins the zrk/zio deps, no committed lockfile-equivalent needed beyond that
+loadgen/zrk-runner/.zig-cache/
+loadgen/zrk-runner/zig-out/
+loadgen/zrk-runner/zig-pkg/
 
 # rust build artifacts (proxies/pingora) — Cargo.toml floats on "0.8", no
 # committed lockfile on purpose (see its comment)

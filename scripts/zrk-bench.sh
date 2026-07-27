@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Single-loadgen, OPEN-LOOP suite driver: ramps each proxy with zrk
-# (loadgen/zrk) and writes per-proxy NDJSON/JSON/HDR + meta.json for
+# Single-loadgen, OPEN-LOOP suite driver: ramps each proxy with zrk-runner
+# (loadgen/zrk-runner — calls zrk's own runner.run in-process, see its
+# main.zig) and writes per-proxy NDJSON/JSON/HDR + meta.json for
 # report/report.py. One 4-core loadgen saturates a 1-CPU proxy under its own
 # limit, so there is no second loadgen.
 #
@@ -14,6 +15,7 @@ MAX_RATE=${MAX_RATE:-67000}
 RAMP_SECONDS=${RAMP_SECONDS:-300}
 START_RATE=${START_RATE:-200}
 CONNECTIONS=${CONNECTIONS:-500}    # in-flight cap; the sweet spot — past each proxy's throughput peak, before high-concurrency collapse; well under zoxy's ~1386 conn_slot default
+REQ_PATH=${REQ_PATH:-/1k}          # canned response body: /64 /1k /10k /100k (see backend/10-gen-bodies.sh)
 THREADS=${THREADS:-4}              # OS threads driving zrk's zio coroutine engine (>=1.0.0;
                                    # replaces std.Io.Threaded's thread-per-connection model).
                                    # Match the loadgen VM's core count (loadgen_cores, default 4
@@ -22,9 +24,30 @@ TIMEOUT_S=${TIMEOUT_S:-1}          # per-request WIRE timeout (hung-conn guard).
                                    # does NOT bound the CO-corrected tail (that's a
                                    # scheduling delay, not wire time); latency
                                    # fairness lives in the report, sampled at a
-                                   # common sub-knee REF_RATE. See run.py's note.
+                                   # common sub-knee REF_RATE. See report/report.py's note.
 ZOXY_REF=${ZOXY_REF:-main}
-ZRK_VERSION=${ZRK_VERSION:-1.1.1}  # pinned zrk release (see loadgen/zrk/build.sh)
+ZOXY_CONN_SLOTS=${ZOXY_CONN_SLOTS:-}  # opt-in: zoxy's limits.conn_slots (default
+                                   # 1386 when unset); raise toward the compiled
+                                   # ceiling (14074 by default, or CONN_SLOTS_MAX
+                                   # below if set) to test past it — pair with
+                                   # a much higher CONNECTIONS to actually reach it
+UPSTREAM_SLOTS_MAX=${UPSTREAM_SLOTS_MAX:-}  # opt-in build-time override of the
+                                   # comptime upstream-pool ceiling (default
+                                   # 1024). Shares the same io_uring completion-
+                                   # queue budget as conn_slots_max, so raising
+                                   # this LOWERS it (comptime-asserted
+                                   # self-consistent) - must be set together
+                                   # with the matching CONN_SLOTS_MAX or the
+                                   # zoxy build fails loudly.
+CONN_SLOTS_MAX=${CONN_SLOTS_MAX:-}  # the conn_slots_max that pairs with
+                                   # UPSTREAM_SLOTS_MAX above (see
+                                   # proxies/zoxy/Dockerfile); e.g. 8192/12282.
+HEAD_BYTES_MAX_KIB=${HEAD_BYTES_MAX_KIB:-}  # opt-in build-time override of
+                                   # zoxy's max L7 head size, in KiB (default
+                                   # 8; comptime floor 1). Shrinks the per-
+                                   # conn/upstream-slot memory footprint (see
+                                   # proxies/zoxy/Dockerfile) - fine for this
+                                   # bench's small headers, not safe in general.
 COOLDOWN=${COOLDOWN:-8}
 RUNID=${RUNID:-zrk-$(date -u +%Y%m%d-%H%M%S)}
 
@@ -37,9 +60,9 @@ PROM="http://$LG:9090"
 RESULTS="results/$RUNID"; mkdir -p "$RESULTS"
 ln -sfn "$RUNID" results/latest   # `make report` renders results/latest
 COMPOSE="docker compose -f compose.yaml -f compose.cloud.yaml"
-PENV="ZOXY_REF=$ZOXY_REF BACKEND_IP=$BACKEND_PRIV"
+PENV="ZOXY_REF=$ZOXY_REF ZOXY_CONN_SLOTS=$ZOXY_CONN_SLOTS UPSTREAM_SLOTS_MAX=$UPSTREAM_SLOTS_MAX CONN_SLOTS_MAX=$CONN_SLOTS_MAX HEAD_BYTES_MAX_KIB=$HEAD_BYTES_MAX_KIB BACKEND_IP=$BACKEND_PRIV"
 
-echo ">>> runid=$RUNID proxies=[$PROXIES] ramp=$START_RATE->${MAX_RATE}rps/${RAMP_SECONDS}s conns=$CONNECTIONS threads=$THREADS (proxies capped to 1 CPU)"
+echo ">>> runid=$RUNID proxies=[$PROXIES] ramp=$START_RATE->${MAX_RATE}rps/${RAMP_SECONDS}s conns=$CONNECTIONS threads=$THREADS path=$REQ_PATH (proxies capped to 1 CPU)"
 
 # --- cloud prometheus targets (file_sd): proxy cAdvisor :8081 for container
 # CPU/mem, node_exporter :9100 per host, and the loadgen's live zrk /metrics ----
@@ -89,23 +112,32 @@ ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && PROM_TARGETS=cloud PROM_URL=
 ssh -o BatchMode=yes "$SSH_USER@$BACKEND_PUB" "cd $REMOTE && $COMPOSE --profile backend up -d --wait" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile monitoring up -d cadvisor node_exporter" >/dev/null 2>&1 || true
 
-# fetch the pinned zrk release binary locally (build.sh self-skips if current),
-# ship the static binary + orchestrator to the loadgen — nothing built there
-echo ">>> fetching zrk release (v$ZRK_VERSION)"
-ZRK_VERSION=$ZRK_VERSION ./loadgen/zrk/build.sh
+# Cross-compile zrk-runner locally (static musl binary — no container, no
+# runtime deps) and ship just the binary to the loadgen; nothing built there.
+# The zrk/zio versions actually used are pinned in
+# loadgen/zrk-runner/build.zig.zon (via `zig fetch --save`), not here.
+echo ">>> building zrk-runner"
+./loadgen/zrk-runner/build.sh
 ssh -o BatchMode=yes "$SSH_USER@$LG" 'mkdir -p ~/zrk'
-rsync -az --exclude src loadgen/zrk/ "$SSH_USER@$LG:zrk/"
+rsync -az loadgen/zrk-runner/zig-out/bin/zrk-runner "$SSH_USER@$LG:zrk/zrk-runner"
 
 meta="$RESULTS/meta.json"
 echo "{\"prom\":\"$PROM\",\"runid\":\"$RUNID\",\"runs\":{}}" > "$meta"
 
-record() { # proxy start end
-    python3 - "$meta" "$1" "$2" "$3" "$MAX_RATE" "$RAMP_SECONDS" "$START_RATE" <<'PY'
+record() { # proxy start end zoxy_commit
+    python3 - "$meta" "$1" "$2" "$3" "$MAX_RATE" "$RAMP_SECONDS" "$START_RATE" "${4:-}" <<'PY'
 import json,sys
-f,p,s,e,mr,rs,sr=sys.argv[1:8]
+f,p,s,e,mr,rs,sr,zc=sys.argv[1:9]
 m=json.load(open(f))
-m["runs"][p]={"start":s,"end":e,"max_rate":int(mr),"ramp_seconds":int(rs),
-              "start_rate":int(sr),"loadgens":["lg1"]}
+entry={"start":s,"end":e,"max_rate":int(mr),"ramp_seconds":int(rs),
+       "start_rate":int(sr),"loadgens":["lg1"]}
+if zc:
+    entry["zoxy_commit"]=zc  # resolved HEAD from the running image (see
+                             # proxies/zoxy/Dockerfile's /etc/zoxy/zoxy-commit),
+                             # not the requested ZOXY_REF — a floating ref like
+                             # "main" would otherwise leave no record of which
+                             # commit actually ran.
+m["runs"][p]=entry
 json.dump(m,open(f,"w"),indent=2)
 PY
 }
@@ -113,10 +145,10 @@ PY
 for p in $PROXIES; do
     echo ">>> [$p] starting"
     if [[ $p == direct ]]; then
-        target="http://$BACKEND_PRIV:9000/1k"
+        target="http://$BACKEND_PRIV:9000$REQ_PATH"
     else
         ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $PENV $COMPOSE --profile $p up -d --build --wait $p" >/dev/null
-        target="http://$PROXY_PRIV:8080/1k"
+        target="http://$PROXY_PRIV:8080$REQ_PATH"
     fi
     # warm probe
     for i in $(seq 1 20); do
@@ -125,32 +157,44 @@ for p in $PROXIES; do
         sleep 1
     done
 
+    zoxy_commit=""
+    if [[ $p == zoxy ]]; then
+        zoxy_commit=$(ssh -o BatchMode=yes "$SSH_USER@$PROXY" "docker exec zoxy cat /etc/zoxy/zoxy-commit" 2>/dev/null || echo "")
+    fi
+
     echo ">>> [$p] ramping ${RAMP_SECONDS}s"
     start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    # wipe any prior outputs for this proxy first — if zrk dies early (e.g. the
-    # io_uring/seccomp trap above) it still exits 0 with "0 windows", and
-    # without this the scp below would silently re-collect a STALE result from
-    # an earlier run under the same proxy name instead of failing loudly.
+    # wipe any prior outputs for this proxy first — a genuinely stale result
+    # under the same proxy name should never look like this run's data.
     ssh -o BatchMode=yes "$SSH_USER@$LG" "rm -f zrk/$p.lg1.ndjson zrk/$p.lg1.json zrk/$p.lg1.hgrm"
-    # zrk >=1.0.0 runs its coroutine io engine (zio) on io_uring, which Docker's
-    # default seccomp profile denies (io_uring_* blocked since engine 25.0) —
-    # same wall zoxy hit (see proxies/zoxy/seccomp-iouring.json); reuse that
-    # profile here (default profile + the three io_uring syscalls, not
-    # unconfined) plus an unlimited memlock (ring memory counts against it on
-    # kernels <5.12), or zrk silently exits with "error: PermissionDenied" and
-    # 0 windows, and the driver falls back to scp-ing a stale prior result.
-    ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && docker run --rm --network host --ulimit nofile=1048576 \
-        --ulimit memlock=-1 --security-opt seccomp=proxies/zoxy/seccomp-iouring.json \
-        -v ~/zrk:/w -w /w \
-        -e TARGET=$target -e MAX_RATE=$MAX_RATE -e RAMP_SECONDS=$RAMP_SECONDS -e START_RATE=$START_RATE \
-        -e CONNECTIONS=$CONNECTIONS -e THREADS=$THREADS -e TIMEOUT_S=$TIMEOUT_S \
-        -e OUT=/w/$p.lg1 -e NAME=$p -e RUNID=$RUNID -e METRICS_ADDR=:8090 \
-        python:3-alpine python3 /w/run.py" 2>&1 | grep -E 'peak|knee' || true
+    # zrk-runner statically links musl and runs directly on the host — no
+    # container, so no seccomp profile to reconcile with io_uring. nofile
+    # needs raising (SSH sessions default low); memlock is already generous
+    # on this fleet's images, but the explicit unlimited is cheap insurance
+    # against a differently-configured host.
+    #
+    # Unlike the old subprocess+CLI setup, zrk-runner calls zrk's own
+    # `runner.run` in-process and propagates its real error (see zrk's fix
+    # for a canceled run silently reporting a truncated success) — so a
+    # non-zero exit here is a genuine, meaningful signal, not something to
+    # swallow. Capture it via PIPESTATUS (grep's own exit code is irrelevant)
+    # and warn rather than silently trusting a bad result.
+    set +e
+    ssh -o BatchMode=yes "$SSH_USER@$LG" "cd $REMOTE && ulimit -n 1048576; ulimit -l unlimited 2>/dev/null; \
+        TARGET=$target MAX_RATE=$MAX_RATE RAMP_SECONDS=$RAMP_SECONDS START_RATE=$START_RATE \
+        CONNECTIONS=$CONNECTIONS THREADS=$THREADS TIMEOUT_S=$TIMEOUT_S \
+        OUT=~/zrk/$p.lg1 NAME=$p RUNID=$RUNID METRICS_ADDR=:8090 \
+        ~/zrk/zrk-runner" 2>&1 | grep -E 'peak|knee|interrupt|zrk: '
+    zrk_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $zrk_rc -ne 0 ]]; then
+        echo ">>> [$p] WARNING: zrk-runner exited $zrk_rc — result may be incomplete, treat with suspicion"
+    fi
     end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     for ext in ndjson json hgrm; do
         scp -q "$SSH_USER@$LG:zrk/$p.lg1.$ext" "$RESULTS/" 2>/dev/null || true
     done
-    record "$p" "$start" "$end"
+    record "$p" "$start" "$end" "$zoxy_commit"
 
     if [[ $p != direct ]]; then
         ssh -o BatchMode=yes "$SSH_USER@$PROXY" "cd $REMOTE && $COMPOSE --profile $p stop $p && $COMPOSE --profile $p rm -f $p" >/dev/null 2>&1 || true

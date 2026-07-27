@@ -36,7 +36,7 @@ static config and the *same* enforced cpu/memory limits (service-level `cpus` /
 one compose project, in the cloud the very same `compose.yaml` runs across three
 VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset, peer
 IPs). **The measurement is one deterministic open-loop ramp** —
-`loadgen/zrk` (wrk2-lineage, HdrHistogram) offers `START_RATE → MAX_RATE`
+`loadgen/zrk-runner` (wrk2-lineage, HdrHistogram, calling zrk's `runner.run` in-process) offers `START_RATE → MAX_RATE`
 over `RAMP_SECONDS`, and keeps offering at the scheduled rate even when the proxy
 falls behind (coordinated-omission corrected), so the offered axis is analytic
 (`offered = start_rate + slope·t`) and the saturation knee is exact and sharp.
@@ -120,7 +120,7 @@ compose.yaml              every service, proxies behind profiles, limits enforce
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
 proxies/<p>/              one static config per proxy (upstream is always `backend`)
 backend/                  nginx origin, canned bodies generated at start
-loadgen/zrk/              open-loop linear-ramp generator (zrk, HdrHistogram) + /metrics bridge
+loadgen/zrk-runner/       open-loop linear-ramp generator (embeds zrk's runner.run) + /metrics bridge
 scripts/zrk-bench.sh      the driver: build -> per-proxy up/probe/ramp/NDJSON/down
 monitoring/               prometheus (+file_sd targets), grafana (live dashboard)
 report/charts.py          shared inline-SVG chart engine + prometheus helpers

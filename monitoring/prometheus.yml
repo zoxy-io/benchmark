@@ -1,5 +1,5 @@
 # One Prometheus for the whole benchmark. cAdvisor, node_exporter, and the zrk
-# load generator's live /metrics (bridged by loadgen/zrk/run.py) are all scraped.
+# load generator's live /metrics (bridged by loadgen/zrk-runner) are all scraped.
 # Targets come from file_sd so local and cloud differ only by the mounted targets
 # directory (compose: PROM_TARGETS env).
 global:

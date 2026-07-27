@@ -17,9 +17,10 @@
     pkgs.openssh      # ssh/scp to the cloud fleet
     pkgs.curl         # health checks in scripts/*.sh
     pkgs.python3      # report/report.py (stdlib only)
-    pkgs.zig_0_16     # loadgen/zrk/build.sh cross-compiles zrk to a static musl
-                      # binary that the drivers ship to the loadgen (zrk needs
-                      # zig 0.16; pin the exact attr, not the bare `zig` alias)
+    pkgs.zig_0_16     # loadgen/zrk-runner/build.sh cross-compiles to a static
+                      # musl binary every run (it embeds zrk's runner.run as a
+                      # library, see its main.zig); pin the exact attr, not
+                      # the bare `zig` alias — needs zig >= 0.16
     pkgs.cmake        # proxies/pingora: flate2's zlib-ng feature vendors and
                       # cmake-builds zlib-ng, even with no TLS feature enabled
   ];
