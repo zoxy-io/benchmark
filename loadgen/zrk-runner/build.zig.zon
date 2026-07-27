@@ -33,12 +33,12 @@
     // internet connectivity.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.2.2#e609d28448fde6ee26cb2afd4cea8af81140d12b",
-            .hash = "zrk-1.2.2-WqdFOwZjBAB4vc0rqrIWem78AYgtcQ89oh1aiwSWhLC_",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.3.1#3940a4570c02ff70094c46d1507ecebadf3e6404",
+            .hash = "zrk-1.3.1-WqdFOzSEBABi11K0XkWd67ny1dp-nYFBXRtIOLqLBiB7",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#a8a88c0e85ba87525ec9555aa409544873443142",
-            .hash = "zio-0.16.0-xHbVVGNDIwDYoZmY7GkL3RMCKuyc4JjK2hv_4TOBx8x2",
+            .url = "git+https://github.com/lalinsky/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
+            .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
         },
     },
     .paths = .{

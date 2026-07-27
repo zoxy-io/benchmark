@@ -325,7 +325,7 @@ pub fn main(init: std.process.Init) !void {
     var rows: std.ArrayList(Row) = .empty;
     var ctx: ProgressCtx = .{ .io = io, .ts = &ts, .gauges = &gauges, .cfg = &cfg, .rows = &rows, .arena = arena };
 
-    const result = runner.run(arena, io, &cfg, 0, &ctx, onProgress) catch |err| {
+    const result = runner.run(arena, io, &cfg, 0, &ctx, onProgress, null) catch |err| {
         const msg: []const u8 = switch (err) {
             error.Canceled => "run was interrupted before --duration elapsed; no report written",
             error.NoConnectionsLaunched => "could not launch any connections",
@@ -342,7 +342,7 @@ pub fn main(init: std.process.Init) !void {
     defer jf.close(io);
     var jbuf: [8192]u8 = undefined;
     var jfw: Io.File.Writer = .init(jf, io, &jbuf);
-    try report.writeJson(arena, &jfw.interface, &cfg, &result.snapshot, result.elapsed_s, result.launched);
+    try report.writeJson(arena, &jfw.interface, &cfg, &result.snapshot, result.elapsed_s, result.launched, result.interrupted);
     try jfw.interface.flush();
 
     const hf = try Io.Dir.cwd().createFile(io, hgrm_path, .{});
