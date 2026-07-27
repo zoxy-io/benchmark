@@ -22,6 +22,23 @@ ARG TARGETARCH
 # Leave EMPTY for L7 runs (the default); kept only for L4-listener A/B builds.
 # Empty = upstream default; the image tag carries the value when set.
 ARG RELAY_BUFFERS_MAX=
+# Benchmark-only override of the compile-time upstream-pool ceiling (default
+# 1024). conn_slots_max is a HARDCODED literal derived from this value (via
+# the shared io_uring completion-queue budget — more upstream slots leaves
+# less queue for conn slots) and asserted self-consistent at comptime, so
+# both must be set together to the exact correct pair or the build fails
+# loudly rather than silently drifting. Leave EMPTY for the compiled default.
+ARG UPSTREAM_SLOTS_MAX=
+ARG CONN_SLOTS_MAX=
+# Benchmark-only override of the max L7 request/response head (default 8KiB;
+# also floors the upstream buffer, upstream_bytes >= head_bytes_max). Smaller
+# heads shrink the per-conn-slot and per-upstream-slot memory footprint —
+# less to touch per event-loop pass at a given pool size. Value is a KiB
+# coefficient (the source literal is `N * 1024`); comptime-asserted >= 1024
+# bytes, i.e. N >= 1. A request/response head over the new bound gets a
+# 414/431/torn-down exchange instead of served — fine for this bench's plain
+# GETs and small canned bodies, not a safe default for arbitrary traffic.
+ARG HEAD_BYTES_MAX_KIB=
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils \
@@ -48,6 +65,31 @@ RUN if [ -n "$RELAY_BUFFERS_MAX" ]; then \
           || { echo "relay_buffers_max decl not found — constants.zig changed" >&2; exit 1; }; \
         sed -i -E "s/(relay_buffers_max: u32 = )[0-9]+/\1${RELAY_BUFFERS_MAX}/" src/constants.zig; \
         echo "patched: $(grep -E 'pub const relay_buffers_max' src/constants.zig)"; \
+    fi
+
+# Both or neither: upstream_slots_max and conn_slots_max are asserted
+# self-consistent at comptime (see constants.zig's comptime block), so a
+# lone override just moves the build failure from "clear mismatch" to
+# "confusing partial patch". zig build below is the actual correctness
+# check — this only guards against patching a moved/renamed declaration.
+RUN if [ -n "$UPSTREAM_SLOTS_MAX" ] || [ -n "$CONN_SLOTS_MAX" ]; then \
+        if [ -z "$UPSTREAM_SLOTS_MAX" ] || [ -z "$CONN_SLOTS_MAX" ]; then \
+            echo "UPSTREAM_SLOTS_MAX and CONN_SLOTS_MAX must be set together" >&2; exit 1; \
+        fi; \
+        grep -qE 'upstream_slots_max: u32 = [0-9]+' src/constants.zig \
+          || { echo "upstream_slots_max decl not found — constants.zig changed" >&2; exit 1; }; \
+        grep -qE 'conn_slots_max: u32 = [0-9]+' src/constants.zig \
+          || { echo "conn_slots_max decl not found — constants.zig changed" >&2; exit 1; }; \
+        sed -i -E "s/(upstream_slots_max: u32 = )[0-9]+/\1${UPSTREAM_SLOTS_MAX}/" src/constants.zig; \
+        sed -i -E "s/(conn_slots_max: u32 = )[0-9]+/\1${CONN_SLOTS_MAX}/" src/constants.zig; \
+        echo "patched: $(grep -E 'pub const upstream_slots_max|pub const conn_slots_max' src/constants.zig)"; \
+    fi
+
+RUN if [ -n "$HEAD_BYTES_MAX_KIB" ]; then \
+        grep -qE 'head_bytes_max: u32 = [0-9]+ \* 1024' src/constants.zig \
+          || { echo "head_bytes_max decl not found — constants.zig changed" >&2; exit 1; }; \
+        sed -i -E "s/(head_bytes_max: u32 = )[0-9]+( \* 1024)/\1${HEAD_BYTES_MAX_KIB}\2/" src/constants.zig; \
+        echo "patched: $(grep -E 'pub const head_bytes_max' src/constants.zig)"; \
     fi
 
 # Optimize mode. Default ReleaseFast for PARITY with the other proxies, which

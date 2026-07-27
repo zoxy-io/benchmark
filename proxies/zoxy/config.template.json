@@ -8,5 +8,6 @@
     "connect_ms": 5000,
     "idle_ms": 60000,
     "drain_deadline_ms": 10000
-  }
+  },
+  "limits": @LIMITS@
 }

@@ -11,6 +11,9 @@ wall-clock time -> elapsed -> offered, so every curve shares one offered-load ax
 Layout of a run dir (see scripts/zrk-bench.sh):
   <dir>/meta.json                 {"prom": "...", "runid": "...", "runs": {proxy: {...}}}
      runs[proxy] = {start, end (ISO Z), max_rate, ramp_seconds, start_rate, loadgens:[tag,...]}
+     runs["zoxy"] also carries zoxy_commit: the running image's resolved
+       HEAD (proxies/zoxy/Dockerfile's /etc/zoxy/zoxy-commit), not the
+       requested ZOXY_REF - which commit actually ran if ZOXY_REF floats.
   <dir>/<proxy>.<tag>.ndjson      per-interval NDJSON, one per loadgen tag (merged here)
   <dir>/<proxy>.<tag>.json        whole-run summary (latency_us incl. p99.99, max)
 

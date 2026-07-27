@@ -12,6 +12,17 @@ BACKEND=${BACKEND:-backend:9000}
 host=${BACKEND%:*}
 port=${BACKEND##*:}
 
+# Optional c10k knob: config.zig's `limits.conn_slots` defaults to 1386
+# (~32 MiB); omitting the key or passing `{}` is identical (all `Limits`
+# fields default). ZOXY_CONN_SLOTS unset => `{}`, i.e. today's default
+# behavior, byte-for-byte. relay_buffers isn't set here on purpose — it
+# defaults to conn_slots when omitted (constants.zig), and upstream_slots /
+# cq_fill_eighths are already at their compiled max by default.
+LIMITS='{}'
+if [ -n "${ZOXY_CONN_SLOTS:-}" ]; then
+    LIMITS="{\"conn_slots\": ${ZOXY_CONN_SLOTS}}"
+fi
+
 ip=""
 for i in $(seq 1 40); do # ~20s ceiling; compose gates backend healthy first
     ip=$(getent ahostsv4 "$host" | head -n1 | cut -d' ' -f1) || ip=""
@@ -24,8 +35,8 @@ if [ -z "$ip" ]; then
     exit 1
 fi
 
-sed "s/@BACKEND_ADDR@/$ip:$port/" /etc/zoxy/config.template.json \
-    > /etc/zoxy/config.json
+sed -e "s/@BACKEND_ADDR@/$ip:$port/" -e "s/@LIMITS@/$LIMITS/" \
+    /etc/zoxy/config.template.json > /etc/zoxy/config.json
 
 # One event loop per PROCESS (no thread/worker knob), capped to 1 CPU and pinned
 # to core 0 by the cloud overlay: run a SINGLE zoxy, exec'd so it stays PID 1.
