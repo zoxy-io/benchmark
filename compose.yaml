@@ -97,16 +97,19 @@ services:
     # overlay — thread parity with the others (all = 1). On the phase-1 L7 path
     # concurrency is capped PER PROCESS at a configurable limits.conn_slots
     # (default 1386, ~32 MiB; ZOXY_CONN_SLOTS below opts up toward the comptime
-    # c10k ceiling of 14074 — unset leaves the default, byte-for-byte) with a
-    # shared upstream keep-alive pool of upstream_slots_max=1024 (already at its
-    # compiled max); past the admission ceiling zoxy sheds with a static error.
-    # Every other proxy has no such cap.
+    # c10k ceiling, 12282 by default) with a shared upstream keep-alive pool of
+    # limits.upstream_slots (default 1024, deliberately NOT tracking its own
+    # ceiling of 8192 — an operator opts up explicitly via ZOXY_UPSTREAM_SLOTS,
+    # trading conn_slots_max down the same comptime-paired CQ budget). Past the
+    # admission ceiling zoxy sheds with a static error. Every other proxy has
+    # no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
     # resolves `backend` (env below) once at start and renders the template.
     environment:
       BACKEND: backend:9000
       ZOXY_WORKERS: 1
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
+      ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:

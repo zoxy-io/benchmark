@@ -28,20 +28,30 @@ TIMEOUT_S=${TIMEOUT_S:-1}          # per-request WIRE timeout (hung-conn guard).
 ZOXY_REF=${ZOXY_REF:-main}
 ZOXY_CONN_SLOTS=${ZOXY_CONN_SLOTS:-}  # opt-in: zoxy's limits.conn_slots (default
                                    # 1386 when unset); raise toward the compiled
-                                   # ceiling (14074 by default, or CONN_SLOTS_MAX
+                                   # ceiling (12282 by default, or CONN_SLOTS_MAX
                                    # below if set) to test past it — pair with
                                    # a much higher CONNECTIONS to actually reach it
+ZOXY_UPSTREAM_SLOTS=${ZOXY_UPSTREAM_SLOTS:-}  # opt-in: zoxy's limits.upstream_slots
+                                   # (default 1024 when unset, deliberately NOT
+                                   # tracking its own ceiling — an operator opts
+                                   # up explicitly). Raise toward the compiled
+                                   # ceiling (8192 by default) for a c10k-scale
+                                   # run; 1024 pins and sheds ~1/3 of responses
+                                   # at 10k connections, 8192 doesn't (zoxy #107).
 UPSTREAM_SLOTS_MAX=${UPSTREAM_SLOTS_MAX:-}  # opt-in build-time override of the
                                    # comptime upstream-pool ceiling (default
-                                   # 1024). Shares the same io_uring completion-
-                                   # queue budget as conn_slots_max, so raising
-                                   # this LOWERS it (comptime-asserted
-                                   # self-consistent) - must be set together
-                                   # with the matching CONN_SLOTS_MAX or the
-                                   # zoxy build fails loudly.
+                                   # 8192 as of zoxy #107 — this is for pushing
+                                   # PAST that, not reaching it; use
+                                   # ZOXY_UPSTREAM_SLOTS for that). Shares the
+                                   # same io_uring completion-queue budget as
+                                   # conn_slots_max, so raising this LOWERS it
+                                   # (comptime-asserted self-consistent) - must
+                                   # be set together with the matching
+                                   # CONN_SLOTS_MAX or the zoxy build fails loudly.
 CONN_SLOTS_MAX=${CONN_SLOTS_MAX:-}  # the conn_slots_max that pairs with
                                    # UPSTREAM_SLOTS_MAX above (see
-                                   # proxies/zoxy/Dockerfile); e.g. 8192/12282.
+                                   # proxies/zoxy/Dockerfile); e.g. 8192/12282
+                                   # is now the compiled default, not an override.
 HEAD_BYTES_MAX_KIB=${HEAD_BYTES_MAX_KIB:-}  # opt-in build-time override of
                                    # zoxy's max L7 head size, in KiB (default
                                    # 8; comptime floor 1). Shrinks the per-
@@ -60,7 +70,7 @@ PROM="http://$LG:9090"
 RESULTS="results/$RUNID"; mkdir -p "$RESULTS"
 ln -sfn "$RUNID" results/latest   # `make report` renders results/latest
 COMPOSE="docker compose -f compose.yaml -f compose.cloud.yaml"
-PENV="ZOXY_REF=$ZOXY_REF ZOXY_CONN_SLOTS=$ZOXY_CONN_SLOTS UPSTREAM_SLOTS_MAX=$UPSTREAM_SLOTS_MAX CONN_SLOTS_MAX=$CONN_SLOTS_MAX HEAD_BYTES_MAX_KIB=$HEAD_BYTES_MAX_KIB BACKEND_IP=$BACKEND_PRIV"
+PENV="ZOXY_REF=$ZOXY_REF ZOXY_CONN_SLOTS=$ZOXY_CONN_SLOTS ZOXY_UPSTREAM_SLOTS=$ZOXY_UPSTREAM_SLOTS UPSTREAM_SLOTS_MAX=$UPSTREAM_SLOTS_MAX CONN_SLOTS_MAX=$CONN_SLOTS_MAX HEAD_BYTES_MAX_KIB=$HEAD_BYTES_MAX_KIB BACKEND_IP=$BACKEND_PRIV"
 
 echo ">>> runid=$RUNID proxies=[$PROXIES] ramp=$START_RATE->${MAX_RATE}rps/${RAMP_SECONDS}s conns=$CONNECTIONS threads=$THREADS path=$REQ_PATH (proxies capped to 1 CPU)"
 

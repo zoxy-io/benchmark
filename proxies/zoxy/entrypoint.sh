@@ -12,16 +12,22 @@ BACKEND=${BACKEND:-backend:9000}
 host=${BACKEND%:*}
 port=${BACKEND##*:}
 
-# Optional c10k knob: config.zig's `limits.conn_slots` defaults to 1386
-# (~32 MiB); omitting the key or passing `{}` is identical (all `Limits`
-# fields default). ZOXY_CONN_SLOTS unset => `{}`, i.e. today's default
-# behavior, byte-for-byte. relay_buffers isn't set here on purpose — it
-# defaults to conn_slots when omitted (constants.zig), and upstream_slots /
-# cq_fill_eighths are already at their compiled max by default.
-LIMITS='{}'
+# Optional c10k knobs: config.zig's `limits.conn_slots`/`limits.upstream_slots`
+# default to 1386/1024 (~32 MiB); omitting a key or passing `{}` is identical
+# to leaving it at its compiled default (all `Limits` fields default; see
+# constants.zig's upstream_slots_default, deliberately NOT tracking the
+# compiled ceiling — a deployment opts up explicitly, here). Neither set =>
+# `{}`, today's default behavior, byte-for-byte. relay_buffers isn't set on
+# purpose — it defaults to conn_slots when omitted.
+fields=""
 if [ -n "${ZOXY_CONN_SLOTS:-}" ]; then
-    LIMITS="{\"conn_slots\": ${ZOXY_CONN_SLOTS}}"
+    fields="\"conn_slots\": ${ZOXY_CONN_SLOTS}"
 fi
+if [ -n "${ZOXY_UPSTREAM_SLOTS:-}" ]; then
+    [ -n "$fields" ] && fields="$fields, "
+    fields="${fields}\"upstream_slots\": ${ZOXY_UPSTREAM_SLOTS}"
+fi
+LIMITS="{${fields}}"
 
 ip=""
 for i in $(seq 1 40); do # ~20s ceiling; compose gates backend healthy first
