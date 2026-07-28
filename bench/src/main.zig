@@ -74,6 +74,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(init, rest);
     if (std.mem.eql(u8, cmd, "fetch")) return cmdFetch(init, rest);
     if (std.mem.eql(u8, cmd, "suite")) return cmdSuite(init, rest);
+    if (std.mem.eql(u8, cmd, "notify")) return cmdNotify(init, rest);
+    if (std.mem.eql(u8, cmd, "index")) return cmdIndex(init, rest);
 
     std.debug.print("bench: unknown command '{s}'\n\n{s}", .{ cmd, usage });
     std.process.exit(2);
@@ -129,6 +131,65 @@ fn cmdSuite(init: std.process.Init, args: []const [:0]const u8) !void {
     if (runid.len == 0) return fail("bench suite: --runid or BENCH_RUNID is required", .{});
 
     exit(try commands.runSuite(init.gpa, arena, init.io, environ, prof, proxies, runid));
+}
+
+fn cmdNotify(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    var env = commands.Env.read(init.minimal.environ);
+    const dir = positional(args) orelse return fail("bench notify: <rundir> is required", .{});
+    env.runid = try flagValue(args, "--runid") orelse env.runid;
+    if (env.runid.len == 0) env.runid = std.fs.path.basename(dir);
+
+    exit(try commands.notify(
+        init.gpa,
+        arena,
+        init.io,
+        env,
+        dir,
+        env.runid,
+        try flagValue(args, "--history") orelse "",
+        try flagValue(args, "--base-url") orelse "",
+        hasFlag(args, "--dry-run"),
+    ));
+}
+
+fn cmdIndex(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    const env = commands.Env.read(init.minimal.environ);
+    const dir = positional(args) orelse return fail("bench index: <rundir> is required", .{});
+    var runid = try flagValue(args, "--runid") orelse env.runid;
+    if (runid.len == 0) runid = std.fs.path.basename(dir);
+
+    exit(try commands.buildIndex(
+        init.gpa,
+        arena,
+        init.io,
+        dir,
+        runid,
+        try flagValue(args, "--out") orelse "_site",
+        try flagValue(args, "--history") orelse "",
+    ));
+}
+
+/// The first argument that is not a flag or a flag's value.
+fn positional(args: []const [:0]const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.startsWith(u8, args[i], "--")) {
+            // --dry-run takes no value; everything else does.
+            if (!std.mem.eql(u8, args[i], "--dry-run")) i += 1;
+            continue;
+        }
+        return args[i];
+    }
+    return null;
+}
+
+fn hasFlag(args: []const [:0]const u8, name: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
 }
 
 /// Value of `--name <value>`, or null when absent.

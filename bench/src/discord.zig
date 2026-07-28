@@ -289,9 +289,9 @@ pub fn post(
         switch (res.status) {
             .ok, .no_content => return,
             .too_many_requests => {
-                // Discord's own backoff. A fixed retry would just be rate
-                // limited again.
-                std.Thread.sleep(std.time.ns_per_s * @as(u64, attempt + 1) * 2);
+                // Back off before retrying; hammering straight away just gets
+                // rate limited again.
+                io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
                 continue;
             },
             else => {
