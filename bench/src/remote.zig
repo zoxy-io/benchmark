@@ -195,19 +195,32 @@ pub const Ssh = struct {
     }
 };
 
+/// Where a control command runs.
+///
+/// The two arms differ only in how the command string is delivered — over ssh to
+/// a fleet VM, or to a local shell for `bench suite --local`. Both hand the
+/// command to a shell, so `cd x && docker compose ...` means the same thing
+/// either way and the suite needs no separate code path per mode.
+pub const Host = union(enum) {
+    remote: struct { ssh: Ssh, addr: []const u8 },
+    local,
+};
+
 /// Run a command on `host`, returning an error if it did not succeed. The
 /// child's stderr is passed through the redaction filter before being logged.
-pub fn sshCheck(
+pub fn check(
     gpa: Allocator,
     arena: Allocator,
     io: Io,
-    ssh: Ssh,
-    host: []const u8,
+    host: Host,
     what: []const u8,
-    remote_cmd: []const u8,
+    cmd: []const u8,
     deadline_ns: u64,
 ) !Outcome {
-    const argv = try ssh.argv(arena, host, remote_cmd);
+    const argv = switch (host) {
+        .remote => |r| try r.ssh.argv(arena, r.addr, cmd),
+        .local => try arena.dupe([]const u8, &.{ "sh", "-c", cmd }),
+    };
     const res = try exec(gpa, io, argv, .{ .deadline_ns = deadline_ns });
     if (!res.ok()) {
         var buf: [64]u8 = undefined;

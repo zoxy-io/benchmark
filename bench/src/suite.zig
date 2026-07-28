@@ -29,9 +29,46 @@ const Allocator = std.mem.Allocator;
 pub const Fleet = struct {
     proxy_ip: []const u8,
     backend_ip: []const u8,
-    ssh: remote.Ssh,
-    /// Directory on the proxy/backend hosts holding the extracted payload.
+    /// null selects LOCAL mode: compose runs against this machine's docker
+    /// daemon and both peers are loopback. The numbers a local run produces are
+    /// NOT comparable to a fleet run — the generator shares CPU, cache and
+    /// memory bandwidth with the proxy it is measuring, and the network the
+    /// fleet crosses is replaced by loopback, which removes a ceiling the cloud
+    /// `direct` baseline demonstrably sits near. Local mode is for working on
+    /// the harness, not for producing results; everything downstream is
+    /// labelled so a local run cannot be mistaken for a nightly.
+    ssh: ?remote.Ssh,
+    /// Directory holding the payload — `~/bench` on a fleet VM, the repo root
+    /// locally.
     remote_dir: []const u8 = "bench",
+
+    pub fn isLocal(self: Fleet) bool {
+        return self.ssh == null;
+    }
+
+    fn host(self: Fleet, addr: []const u8) remote.Host {
+        const ssh = self.ssh orelse return .local;
+        return .{ .remote = .{ .ssh = ssh, .addr = addr } };
+    }
+
+    pub fn proxyHost(self: Fleet) remote.Host {
+        return self.host(self.proxy_ip);
+    }
+
+    pub fn backendHost(self: Fleet) remote.Host {
+        return self.host(self.backend_ip);
+    }
+
+    /// Locally the base compose file IS the local configuration — bridge
+    /// networking, published ports, docker DNS for `backend`. The cloud overlay
+    /// is what swaps in host networking and peer IP literals, so it must not be
+    /// applied here.
+    pub fn composeCmd(self: Fleet) []const u8 {
+        return if (self.isLocal())
+            "docker compose -f compose.yaml"
+        else
+            "docker compose -f compose.yaml -f compose.cloud.yaml";
+    }
 };
 
 pub const Options = struct {
@@ -55,6 +92,13 @@ const deadline = struct {
 
 const warm_probe_attempts = 30;
 const warm_probe_interval_ns = 2 * std.time.ns_per_s;
+/// Bounds the probe LOOP, because a single connect cannot be bounded:
+/// `Io.Threaded` panics outright on `netConnectIp` with a timeout ("TODO
+/// implement netConnectIpPosix with timeout"), so the per-attempt timeout has to
+/// be `.none` and a black-holed peer costs the OS SYN timeout — minutes, not
+/// seconds. Counting attempts alone would then let a wedged host hold the suite
+/// for the better part of an hour.
+const warm_probe_deadline_ns = 90 * std.time.ns_per_s;
 
 pub const Result = struct {
     records: []artifact.ProxyRecord,
@@ -77,6 +121,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         .io = io,
         .dir = opts.out_dir,
         .prof = p,
+        .origin = if (opts.fleet.isLocal()) .local else .cloud,
         .runid = opts.runid,
         .started = started,
         .records = &records,
@@ -107,15 +152,14 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     // 25s later on the first proxy's warm probe, because `curl -sf` fails on the
     // 502 a proxy returns with a dead origin. That bought nothing except moving
     // the diagnosis away from the cause.
-    _ = remote.sshCheck(
+    _ = remote.check(
         gpa,
         arena,
         io,
-        opts.fleet.ssh,
-        opts.fleet.backend_ip,
+        opts.fleet.backendHost(),
         "backend up",
         try std.fmt.allocPrint(arena, "cd {s} && {s} --profile backend up -d --wait", .{
-            opts.fleet.remote_dir, compose_cmd,
+            opts.fleet.remote_dir, opts.fleet.composeCmd(),
         }),
         deadline.backend_up,
     ) catch |e| {
@@ -143,15 +187,14 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
         if (isDirect(name)) continue;
-        _ = remote.sshCheck(
+        _ = remote.check(
             gpa,
             arena,
             io,
-            opts.fleet.ssh,
-            opts.fleet.proxy_ip,
+            opts.fleet.proxyHost(),
             try std.fmt.allocPrint(arena, "build {s}", .{name}),
             try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
-                opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", compose_cmd, name, name,
+                opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", opts.fleet.composeCmd(), name, name,
             }),
             deadline.build,
         ) catch {
@@ -225,15 +268,14 @@ fn runOne(
 
     if (!direct) {
         stage.* = .start;
-        _ = try remote.sshCheck(
+        _ = try remote.check(
             gpa,
             arena,
             io,
-            opts.fleet.ssh,
-            opts.fleet.proxy_ip,
+            opts.fleet.proxyHost(),
             try std.fmt.allocPrint(arena, "start {s}", .{name}),
             try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
-                opts.fleet.remote_dir, try envPrefix(arena, p, opts.fleet), compose_cmd, name, name,
+                opts.fleet.remote_dir, try envPrefix(arena, p, opts.fleet), opts.fleet.composeCmd(), name, name,
             }),
             deadline.start,
         );
@@ -249,12 +291,11 @@ fn runOne(
             // Record which commit actually ran. The Dockerfile caches its git
             // clone, so a floating ref can silently be an older commit than the
             // one requested; the image records its own resolved HEAD.
-            if (remote.sshCheck(
+            if (remote.check(
                 gpa,
                 arena,
                 io,
-                opts.fleet.ssh,
-                opts.fleet.proxy_ip,
+                opts.fleet.proxyHost(),
                 "zoxy commit",
                 "docker exec zoxy cat /etc/zoxy/zoxy-commit",
                 deadline.inspect,
@@ -371,9 +412,16 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
         .percent_encoded => |s| s,
     };
 
+    const started = Io.Timestamp.now(io, .awake);
     var attempt: usize = 0;
     while (attempt < warm_probe_attempts) : (attempt += 1) {
         if (probeOnce(io, addr, path)) |_| return else |_| {}
+
+        const elapsed = started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
+        if (elapsed >= warm_probe_deadline_ns) {
+            redact.log("bench: [{s}] never served 200 within {d}s", .{ name, warm_probe_deadline_ns / std.time.ns_per_s });
+            return error.WarmProbeFailed;
+        }
         io.sleep(.fromNanoseconds(warm_probe_interval_ns), .awake) catch {};
     }
     redact.log("bench: [{s}] never served 200 after {d} attempts", .{ name, warm_probe_attempts });
@@ -381,7 +429,7 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
 }
 
 fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
-    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } } });
+    var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
     var wbuf: [512]u8 = undefined;
@@ -405,12 +453,11 @@ fn assertOnlyProxy(
     fleet: Fleet,
     expected: []const u8,
 ) !void {
-    const res = try remote.sshCheck(
+    const res = try remote.check(
         gpa,
         arena,
         io,
-        fleet.ssh,
-        fleet.proxy_ip,
+        fleet.proxyHost(),
         "list containers",
         "docker ps --format '{{.Names}}'",
         deadline.inspect,
@@ -453,12 +500,11 @@ fn sweepProxyHost(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) !void 
     // exit here — the point is the post-condition, which assertOnlyProxy checks.
     try cmd.appendSlice(arena, " 2>/dev/null; true");
 
-    _ = try remote.sshCheck(
+    _ = try remote.check(
         gpa,
         arena,
         io,
-        fleet.ssh,
-        fleet.proxy_ip,
+        fleet.proxyHost(),
         "sweep proxy host",
         cmd.items,
         deadline.teardown,
@@ -476,19 +522,16 @@ fn teardownProxy(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: [
             "! docker ps --format '{{{{.Names}}}}' | grep -qx {s}",
         .{ name, name, name },
     );
-    _ = try remote.sshCheck(
+    _ = try remote.check(
         gpa,
         arena,
         io,
-        fleet.ssh,
-        fleet.proxy_ip,
+        fleet.proxyHost(),
         try std.fmt.allocPrint(arena, "teardown {s}", .{name}),
         cmd,
         deadline.teardown,
     );
 }
-
-const compose_cmd = "docker compose -f compose.yaml -f compose.cloud.yaml";
 
 /// Environment prefix for a remote `docker compose` invocation.
 ///
@@ -500,7 +543,9 @@ const compose_cmd = "docker compose -f compose.yaml -f compose.cloud.yaml";
 /// a warm probe that never gets a 200.
 fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
-    try buf.print(arena, "BACKEND_IP={s} ", .{fleet.backend_ip});
+    // Only the cloud overlay interpolates BACKEND_IP; locally the proxies reach
+    // the origin by its compose service name over docker DNS.
+    if (!fleet.isLocal()) try buf.print(arena, "BACKEND_IP={s} ", .{fleet.backend_ip});
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
     }
@@ -516,6 +561,7 @@ const Flusher = struct {
     io: Io,
     dir: []const u8,
     prof: profile.Profile,
+    origin: artifact.Origin,
     runid: []const u8,
     started: []const u8,
     finished: []const u8 = "",
@@ -525,6 +571,7 @@ const Flusher = struct {
         try artifact.write(self.gpa, self.io, self.dir, .{
             .runid = self.runid,
             .prof = self.prof,
+            .origin = self.origin,
             .started = self.started,
             .finished = self.finished,
             .proxies = self.records.items,

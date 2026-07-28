@@ -70,7 +70,10 @@ pub fn scrape(
     proxy: []const u8,
     scratch: []u8,
 ) !Observation {
-    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } } });
+    // No connect timeout: Io.Threaded panics on one, and a scrape that stalls
+    // costs a sample rather than the run — the poller retries every second and
+    // records the failure count.
+    var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
     {

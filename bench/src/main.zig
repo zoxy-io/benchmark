@@ -36,7 +36,8 @@ pub const index = @import("index.zig");
 const usage =
     \\usage: bench <command> [options]
     \\
-    \\  suite   --profile <c1k|c10k> [--proxies a,b,c]   run the suite (loadgen VM)
+    \\  suite   --profile <c1k|c10k> [--proxies a,b,c] [--local]
+    \\                                                   run the suite
     \\  report  <rundir>                                 render report.json + report.html
     \\  index   <rundir>                                 build the Pages site
     \\  notify  <rundir> [--dry-run]                     post to Discord
@@ -128,7 +129,7 @@ fn cmdSuite(init: std.process.Init, args: []const [:0]const u8) !void {
     const runid = try flagValue(args, "--runid") orelse commands.Env.get(environ, "BENCH_RUNID");
     if (runid.len == 0) return fail("bench suite: --runid or BENCH_RUNID is required", .{});
 
-    exit(try commands.runSuite(init.gpa, arena, init.io, environ, prof, proxies, runid));
+    exit(try commands.runSuite(init.gpa, arena, init.io, environ, prof, proxies, runid, hasFlag(args, "--local")));
 }
 
 fn cmdNotify(init: std.process.Init, args: []const [:0]const u8) !void {
@@ -174,8 +175,10 @@ fn positional(args: []const [:0]const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.startsWith(u8, args[i], "--")) {
-            // --dry-run takes no value; everything else does.
-            if (!std.mem.eql(u8, args[i], "--dry-run")) i += 1;
+            // These take no value; every other flag does.
+            const valueless = std.mem.eql(u8, args[i], "--dry-run") or
+                std.mem.eql(u8, args[i], "--local");
+            if (!valueless) i += 1;
             continue;
         }
         return args[i];
@@ -259,9 +262,11 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     var g = try report.gather(gpa, arena, io, run_dir, inputs, prof.ref_rate, prof.ref_band);
     defer g.deinit();
 
-    // profile.json carries per-proxy status; a legacy meta.json run dir has
-    // none, in which case every present proxy is treated as ok.
+    // profile.json carries per-proxy status and which fleet produced the run; a
+    // legacy meta.json run dir has neither, in which case every present proxy is
+    // treated as ok and the run as a cloud one.
     const statuses = readStatuses(arena, io, run_dir) catch &.{};
+    const origin = readOrigin(arena, io, run_dir);
 
     const path = try std.fmt.allocPrint(arena, "{s}/report.json", .{run_dir});
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
@@ -301,6 +306,7 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         .connections = prof.connections,
         .deadline_ms = prof.deadline_ms,
         .base_url = base_url,
+        .origin = origin,
     });
 
     // This file is attached to a public Discord channel and served from a public
@@ -371,6 +377,18 @@ fn readMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
         .tags = try tags.toOwnedSlice(arena),
         .ramp = ramp_meta,
     };
+}
+
+/// Which fleet produced this run. A legacy run dir predates the field, and
+/// every one of those came off the real fleet.
+fn readOrigin(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) artifact.Origin {
+    const path = std.fmt.allocPrint(arena, "{s}/profile.json", .{run_dir}) catch return .cloud;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch
+        return .cloud;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return .cloud;
+    const f = parsed.object.get("fleet") orelse return .cloud;
+    if (f != .string) return .cloud;
+    return std.meta.stringToEnum(artifact.Origin, f.string) orelse .cloud;
 }
 
 /// Per-proxy status from profile.json, or an empty slice for a legacy run dir.

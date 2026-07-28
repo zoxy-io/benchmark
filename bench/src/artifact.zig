@@ -91,9 +91,27 @@ pub const ProxyRecord = struct {
     notes: []const []const u8 = &.{},
 };
 
+/// Which fleet produced a profile's numbers.
+///
+/// Recorded rather than inferred, because a `local` run is not comparable to a
+/// `cloud` one and the difference is invisible in the numbers themselves: the
+/// generator shares CPU and memory bandwidth with the proxy, and loopback
+/// removes a network ceiling the cloud baseline sits near. Everything
+/// downstream keys off this — the report banners it, and the trend chart
+/// refuses to plot it.
+pub const Origin = enum {
+    cloud,
+    local,
+
+    pub fn str(self: Origin) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const Profile = struct {
     runid: []const u8,
     prof: profile.Profile,
+    origin: Origin = .cloud,
     started: []const u8,
     finished: []const u8 = "",
     proxies: []const ProxyRecord = &.{},
@@ -140,6 +158,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.string(p.runid);
     try j.key("profile");
     try j.string(p.prof.name);
+    try j.key("fleet");
+    try j.string(p.origin.str());
     try j.key("started");
     try j.string(p.started);
     try j.key("finished");
@@ -233,6 +253,18 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.endObject();
 
     try j.endObject();
+}
+
+test "the fleet origin is recorded, and defaults to cloud" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try render(&w, .{ .runid = "r", .prof = profile.c1k, .started = "t" });
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"fleet\":\"cloud\"") != null);
+
+    var buf2: [4096]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    try render(&w2, .{ .runid = "r", .prof = profile.c1k, .origin = .local, .started = "t" });
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "\"fleet\":\"local\"") != null);
 }
 
 test "render emits a usable record for a healthy proxy" {

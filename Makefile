@@ -7,6 +7,7 @@
 #
 #   make build       build the bench binary (static musl)
 #   make test        bench unit tests
+#   make local       run the benchmark on THIS machine (see the caveat below)
 #   make report      render results/latest -> report.json + report.html
 #   make up / down   local: start/stop the backend origin
 #
@@ -25,11 +26,12 @@ ZIG_TARGET ?= x86_64-linux-musl
 ZIG_PKG ?= zig-pkg
 PROFILE ?= c1k
 RUN ?= results/latest
+LOCAL_PROXIES ?= direct,zoxy
 
-.PHONY: help build test report up down clean
+.PHONY: help build test local report up down clean
 
 help:
-	@sed -n '8,12p' $(MAKEFILE_LIST)
+	@sed -n '8,13p' $(MAKEFILE_LIST)
 
 build:
 	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) --system $(ZIG_PKG)
@@ -38,6 +40,18 @@ build:
 test:
 	cd bench && $(ZIG) build test --system $(ZIG_PKG) --summary all
 
+
+# A whole run against this machine's docker daemon — no cloud, no ssh, ~6 min
+# for one profile. NOT a benchmark result: the generator shares CPU, cache and
+# memory bandwidth with the proxy it is measuring, and the fleet's network is
+# replaced by loopback, which removes a ceiling the real `direct` baseline sits
+# near. It exists to iterate on the harness, a proxy config or the report
+# without paying cloud time. Everything downstream knows — the run records
+# fleet=local, the report is banner-marked, and `bench index` keeps it out of
+# the trend.
+local: build
+	bench/zig-out/bin/bench suite --local --profile $(PROFILE) \
+	  --proxies $(LOCAL_PROXIES) --runid local-$$(date -u +%Y%m%d-%H%M%S)
 
 report:
 	cd bench && $(ZIG) build --system $(ZIG_PKG)

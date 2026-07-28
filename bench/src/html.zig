@@ -30,6 +30,8 @@ const js = @embedFile("assets/report.js");
 pub const Options = struct {
     runid: []const u8,
     profile_name: []const u8,
+    /// A local run is banner-marked; see the note at the banner itself.
+    origin: artifact.Origin = .cloud,
     ref_rate: f64,
     connections: u32,
     deadline_ms: u64,
@@ -70,6 +72,17 @@ pub fn render(
         .{opts.profile_name},
     );
     try out.print("<h1>request throughput <span class=\"rid\">{s}</span></h1>", .{opts.runid});
+    if (opts.origin == .local) {
+        // Someone will eventually screenshot one of these. The page has to say
+        // what it is without being read carefully.
+        try out.writeAll(
+            "<p class=\"meta\"><b class=\"warn\">Local run — not a benchmark result.</b> " ++
+                "The load generator shared CPU, cache and memory bandwidth with the proxy it was " ++
+                "measuring, and the fleet's network was replaced by loopback, which removes a " ++
+                "ceiling the real baseline sits near. Useful for working on the harness; not " ++
+                "comparable to a nightly, and deliberately absent from the trend.</p>",
+        );
+    }
 
     var buf: [64]u8 = undefined;
     try out.print(
@@ -396,6 +409,26 @@ test "a failed proxy renders no numbers and names its stage" {
     const s = out.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "failed · warm") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "12.3k") == null);
+}
+
+test "a local run is banner-marked, and a cloud run is not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const empty: report.Gathered = .{ .present = &.{}, .rps = &.{}, .cpu = &.{}, .p99 = &.{}, .shed = &.{} };
+    const base: Options = .{ .runid = "r", .profile_name = "c1k", .ref_rate = 2000, .connections = 1000, .deadline_ms = 0 };
+
+    var lbuf: [128 * 1024]u8 = undefined;
+    var lout: std.Io.Writer = .fixed(&lbuf);
+    var local_opts = base;
+    local_opts.origin = .local;
+    try render(arena_state.allocator(), &lout, empty, &.{}, local_opts);
+    try std.testing.expect(std.mem.indexOf(u8, lout.buffered(), "not a benchmark result") != null);
+
+    var cbuf: [128 * 1024]u8 = undefined;
+    var cout: std.Io.Writer = .fixed(&cbuf);
+    try render(arena_state.allocator(), &cout, empty, &.{}, base);
+    try std.testing.expect(std.mem.indexOf(u8, cout.buffered(), "not a benchmark result") == null);
 }
 
 test "the c10k deadline is stated, because it changes what p99 means" {

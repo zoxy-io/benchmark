@@ -205,21 +205,48 @@ pub fn runSuite(
     prof: profile.Profile,
     proxies: []const []const u8,
     runid: []const u8,
+    local: bool,
 ) !u8 {
-    const proxy_ip = Env.get(environ, "PROXY_IP");
-    const backend_ip = Env.get(environ, "BACKEND_IP");
-    const ssh_key = Env.get(environ, "SSH_KEY");
-    if (proxy_ip.len == 0 or backend_ip.len == 0 or ssh_key.len == 0) {
-        std.debug.print("bench suite: PROXY_IP, BACKEND_IP and SSH_KEY are required\n", .{});
-        return 2;
-    }
+    const fleet: suite.Fleet = if (local) blk: {
+        // Everything is this machine: the base compose file publishes 8080 and
+        // 9000 on the host, and cAdvisor on 8081.
+        std.debug.print(
+            "bench suite: LOCAL run — the generator shares this machine with the proxy it is\n" ++
+                "  measuring and the network is loopback, so these numbers are not comparable to a\n" ++
+                "  fleet run. Recorded as fleet=local, banner-marked, and kept out of the trend.\n",
+            .{},
+        );
+        break :blk .{
+            .proxy_ip = "127.0.0.1",
+            .backend_ip = "127.0.0.1",
+            .ssh = null,
+            .remote_dir = ".",
+        };
+    } else blk: {
+        const proxy_ip = Env.get(environ, "PROXY_IP");
+        const backend_ip = Env.get(environ, "BACKEND_IP");
+        const ssh_key = Env.get(environ, "SSH_KEY");
+        if (proxy_ip.len == 0 or backend_ip.len == 0 or ssh_key.len == 0) {
+            std.debug.print("bench suite: PROXY_IP, BACKEND_IP and SSH_KEY are required (or pass --local)\n", .{});
+            return 2;
+        }
 
-    // Registered so any address that reaches a log line is scrubbed, and so CI
-    // masks them if this ever runs somewhere with a console.
-    redact.register(proxy_ip);
-    redact.register(backend_ip);
+        // Registered so any address that reaches a log line is scrubbed, and so
+        // CI masks them if this ever runs somewhere with a console.
+        redact.register(proxy_ip);
+        redact.register(backend_ip);
 
-    const known_hosts = Env.get(environ, "SSH_KNOWN_HOSTS");
+        const known_hosts = Env.get(environ, "SSH_KNOWN_HOSTS");
+        break :blk .{
+            .proxy_ip = proxy_ip,
+            .backend_ip = backend_ip,
+            .ssh = .{
+                .key_path = ssh_key,
+                .known_hosts = if (known_hosts.len > 0) known_hosts else "/home/ubuntu/.ssh/known_hosts",
+            },
+        };
+    };
+
     const out_dir = try std.fmt.allocPrint(arena, "results/{s}/{s}", .{ runid, prof.name });
     try Io.Dir.cwd().createDirPath(io, out_dir);
 
@@ -228,14 +255,7 @@ pub fn runSuite(
         .proxies = proxies,
         .runid = runid,
         .out_dir = out_dir,
-        .fleet = .{
-            .proxy_ip = proxy_ip,
-            .backend_ip = backend_ip,
-            .ssh = .{
-                .key_path = ssh_key,
-                .known_hosts = if (known_hosts.len > 0) known_hosts else "/home/ubuntu/.ssh/known_hosts",
-            },
-        },
+        .fleet = fleet,
     });
 
     var ok: usize = 0;
@@ -325,6 +345,7 @@ const index = @import("index.zig");
 pub const ProfileView = struct {
     name: []const u8,
     prof: profile.Profile,
+    origin: artifact.Origin,
     rows: []discord.Row,
     html: []const u8,
     ok: usize,
@@ -348,6 +369,10 @@ pub fn readProfile(
     const pj = Io.Dir.cwd().readFileAlloc(io, pj_path, arena, .limited(4 << 20)) catch return null;
     const pv = try std.json.parseFromSliceLeaky(std.json.Value, arena, pj, .{});
     const proxies = (pv.object.get("proxies") orelse return null).object;
+    const origin: artifact.Origin = if (pv.object.get("fleet")) |f|
+        (std.meta.stringToEnum(artifact.Origin, f.string) orelse .cloud)
+    else
+        .cloud;
 
     const rj_path = try std.fmt.allocPrint(arena, "{s}/{s}/report.json", .{ dir, name });
     const rj = Io.Dir.cwd().readFileAlloc(io, rj_path, arena, .limited(64 << 20)) catch return null;
@@ -399,6 +424,7 @@ pub fn readProfile(
     return .{
         .name = name,
         .prof = prof,
+        .origin = origin,
         .rows = try rows.toOwnedSlice(arena),
         .html = html_bytes,
         .ok = ok,
@@ -531,6 +557,17 @@ pub fn buildIndex(
             .deadline_ms = p.deadline_ms,
         });
 
+        // A local run contributes NOTHING to history. Its numbers are not
+        // comparable to a fleet run, and the trend is exactly where an
+        // incomparable point would do the most damage — it would read as a
+        // regression or a win rather than as a different experiment.
+        if (view.origin == .local) {
+            std.debug.print(
+                "bench index: {s} was a local run; excluded from history and the trend\n",
+                .{p.name},
+            );
+            continue;
+        }
         for (view.rows) |r| {
             try tonight.append(arena, .{
                 .runid = runid,

@@ -78,9 +78,19 @@ Locally you can work on everything except the load generation itself:
 ```sh
 make build     # the bench binary (static musl)
 make test      # unit tests
+make local     # a whole run on THIS machine — see the caveat below
 make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
 make up/down   # the backend origin, for poking at a proxy by hand
 ```
+
+`make local` drives the same suite against your own docker daemon, with no
+cloud and no ssh — a ~6 minute loop for working on the harness, a proxy config
+or the report. **It is not a benchmark result**: the load generator shares CPU,
+cache and memory bandwidth with the proxy it is measuring, and the fleet's
+network is replaced by loopback, which removes a ceiling the real `direct`
+baseline demonstrably sits near. That is enforced rather than documented — the
+run records `fleet: local`, the report carries a banner, and the trend chart
+refuses the data.
 
 **Ramp parameters are not knobs.** They are compiled into
 [`bench/src/profile.zig`](bench/src/profile.zig), because the previous
