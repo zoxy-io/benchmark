@@ -35,25 +35,8 @@ services:
       # the (bridge-only) 127.0.0.11 resolvers section inert under host net
       BACKEND_ADDR: ${BACKEND_IP}:9000
 
-  envoy:
-    <<: *host-net
-    cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
 
-  traefik:
-    <<: *host-net
-    cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
 
-  nginx:
-    <<: *host-net
-    cpuset: "0"
-    extra_hosts:
-      # nginx resolves `backend` once at startup via getaddrinfo, which reads
-      # this /etc/hosts entry — no runtime resolver needed (like pingora)
-      - "backend:${BACKEND_IP}"
 
   pingora:
     <<: *host-net

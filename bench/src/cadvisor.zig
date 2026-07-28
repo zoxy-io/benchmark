@@ -45,7 +45,7 @@ pub const Error = error{
 /// has a live container while one proxy is being measured, which is what makes
 /// a leftover from the previous iteration detectable.
 pub const known_proxies = [_][]const u8{
-    "zoxy", "haproxy", "envoy", "traefik", "nginx", "pingora",
+    "zoxy", "haproxy", "pingora",
 };
 
 pub const Observation = struct {

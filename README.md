@@ -9,8 +9,9 @@ It runs **unattended every night** ([`.github/workflows/nightly.yml`](.github/wo
 CI creates a throwaway three-VM fleet with no public addresses, the loadgen
 drives the whole suite itself, results come back through Object Storage, the
 fleet is destroyed, and the summary is posted to Discord and published to Pages.
-Envoy, Traefik and nginx keep their configs and can still be named explicitly,
-but are out of the nightly comparison.
+Envoy, Traefik and nginx were part of an earlier comparison and have been
+removed; `git log` restores any of them exactly, which is a better starting
+point than a config that has sat unexercised.
 
 zoxy's phase-1 build adds an **HTTP (L7)** listener, so every proxy runs as an
 **HTTP/1.1 reverse proxy** (`mode http`, `http_connection_manager`, HTTP router,
@@ -77,7 +78,6 @@ Locally you can work on everything except the load generation itself:
 ```sh
 make build     # the bench binary (static musl)
 make test      # unit tests
-make gate      # prove the measurement port against the old Python (from git history)
 make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
 make up/down   # the backend origin, for poking at a proxy by hand
 ```
@@ -147,7 +147,6 @@ bench/src/cadvisor.zig    1Hz container sampling + the identity witness
 bench/src/analysis.zig    the measurement math (ported from the old report.py)
 bench/src/{svg,html}.zig  inline-SVG charts -> a self-contained report.html
 bench/src/{ycs,commands}  Object Storage, the compute sweep, the CLI
-bench/tools/gate.py       proves analysis.zig still matches the old Python
 compose.yaml              every service, proxies behind profiles, limits enforced
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
 proxies/<p>/              one static config per proxy (upstream is always `backend`)

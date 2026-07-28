@@ -272,7 +272,7 @@ pub fn parseProxies(arena: Allocator, spec: []const u8) ![]const []const u8 {
 }
 
 const all_proxies = [_][]const u8{
-    "direct", "zoxy", "haproxy", "pingora", "envoy", "traefik", "nginx",
+    "direct", "zoxy", "haproxy", "pingora",
 };
 
 fn knownProxy(name: []const u8) bool {
@@ -302,13 +302,14 @@ test "parseProxies rejects a typo rather than silently dropping it" {
     try std.testing.expectError(error.NoProxies, parseProxies(arena_state.allocator(), ""));
 }
 
-test "parseProxies still accepts the proxies dropped from the default set" {
+test "parseProxies rejects proxies whose configs were removed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // envoy/traefik/nginx left the nightly comparison but their configs stayed,
-    // so a one-off run must still be able to name them.
-    const got = try parseProxies(arena_state.allocator(), "envoy,traefik,nginx");
-    try std.testing.expectEqual(@as(usize, 3), got.len);
+    // envoy/traefik/nginx were deleted rather than parked. Naming one must fail
+    // here — at argument parsing, with the name in the message — rather than
+    // later as a compose service that does not exist.
+    try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "envoy"));
+    try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "nginx"));
 }
 
 // ---------------------------------------------------------------------------

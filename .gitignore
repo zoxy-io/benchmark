@@ -15,10 +15,6 @@ devenv.local.nix
 # direnv
 .direnv
 
-# python bytecode (bench/tools/gate.py)
-__pycache__/
-*.pyc
-
 # zig build artifacts — build.zig.zon pins the zrk/zio deps, so no committed
 # lockfile-equivalent is needed beyond that. zig-pkg/ is a local `--system`
 # package dir (vendored copies of the pinned deps), not source.

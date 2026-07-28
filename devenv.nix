@@ -14,7 +14,6 @@
     pkgs.opentofu     # `tofu` — cloud/ terraform (Makefile TF ?= tofu)
     pkgs.openssh      # ssh/scp to the cloud fleet
     pkgs.curl         # health checks in scripts/*.sh
-    pkgs.python3      # bench/tools/gate.py only (stdlib); nothing ships Python
     pkgs.zig_0_16     # bench cross-compiles to a static
                       # musl binary every run (it embeds zrk's runner.run as a
                       # library, see its main.zig); pin the exact attr, not

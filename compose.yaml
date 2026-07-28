@@ -2,10 +2,11 @@
 #
 # One file describes every role; compose profiles pick what runs where:
 #   backend     nginx origin                    (local: always; cloud: backend VM)
-#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|nginx|pingora)
-# The default comparison is a subset — direct/zoxy/haproxy/pingora (.env.example
-# PROXIES). envoy, traefik and nginx keep their service and their proxies/*
-# config, so putting one back in the run is a name in that list, not a revert.
+#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|pingora)
+# The comparison is direct/zoxy/haproxy/pingora. envoy, traefik and nginx were
+# removed rather than parked: an unexercised proxy config rots — its TLS/ALPN
+# pinning and its healthcheck probe go stale unnoticed — so git history is a
+# better starting point for re-adding one than a stale file is.
 # The load generator is not a compose service: the `bench` binary runs directly
 # on the loadgen host (static musl, no container, so no seccomp profile to
 # reconcile with io_uring) and drives this file over ssh.
@@ -60,13 +61,13 @@ x-healthcheck-timing: &healthcheck-timing
 
 # The probe must already exist inside each proxy's own image — no extra package
 # may be installed into a container whose memory footprint is a published
-# number. That splits the six in two, checked image by image rather than
-# assumed: the alpine-based ones (haproxy, nginx, traefik) carry busybox wget.
+# number. That splits them in two, checked image by image rather than
+# assumed: the alpine-based one (haproxy) carries busybox wget.
 x-healthcheck-wget: &healthcheck-wget
   <<: *healthcheck-timing
   test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/1k"]
 
-# The debian/ubuntu-based ones (zoxy, pingora, envoy) have neither — zoxy's
+# The debian-based ones (zoxy, pingora) have neither — zoxy's
 # runtime stage is a bare debian-slim carrying the binary and its entrypoint,
 # and nothing is being added to it just to be probed. What they do have is bash,
 # and Debian/Ubuntu build it WITH network redirections, so /dev/tcp opens the
@@ -181,49 +182,8 @@ services:
       - "8080:8080"
     healthcheck: *healthcheck-wget
 
-  envoy:
-    <<: *proxy-common
-    image: envoyproxy/envoy:v1.33-latest
-    container_name: envoy
-    profiles: [envoy]
-    command:
-      ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "1"]
-    volumes:
-      - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
-    ports:
-      - "8080:8080"
-    healthcheck: *healthcheck-bash
 
-  traefik:
-    <<: *proxy-common
-    image: traefik:v3.3
-    container_name: traefik
-    profiles: [traefik]
-    environment:
-      GOMAXPROCS: 1
-    volumes:
-      - ./proxies/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./proxies/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
-    ports:
-      - "8080:8080"
-    healthcheck: *healthcheck-wget
 
-  nginx:
-    <<: *proxy-common
-    # nginx runs as an HTTP reverse proxy (proxy_pass) with an upstream
-    # keepalive pool — the stock official image, no custom build. The image's
-    # envsubst hook renders the template into /etc/nginx at start;
-    # worker_processes is hardcoded to 1 (1 CPU).
-    image: nginx:1.27-alpine
-    container_name: nginx
-    profiles: [nginx]
-    environment:
-      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
-    volumes:
-      - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
-    ports:
-      - "8080:8080"
-    healthcheck: *healthcheck-wget
 
   pingora:
     <<: *proxy-common
@@ -246,7 +206,7 @@ services:
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.52.1
     container_name: cadvisor
-    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, nginx, pingora]
+    profiles: [monitoring, backend, zoxy, haproxy, pingora]
     # The proxy host's cAdvisor is the run's ONLY source of container CPU and
     # memory — the driver polls /metrics on :8081 at 1Hz — so this service is
     # part of the measurement, not a convenience. It also names the container it
