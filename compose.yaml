@@ -119,19 +119,17 @@ services:
     build:
       context: ./proxies/zoxy
       args:
+        # `bench` passes ZOXY_REF explicitly; the default here is what a bare
+        # `docker compose build` gets. Both are `main` on purpose — see
+        # bench/src/profile.zig's zoxy_ref.
         ZOXY_REF: ${ZOXY_REF:-main}
         ZOXY_OPTIMIZE: ${ZOXY_OPTIMIZE:-ReleaseFast}
-        RELAY_BUFFERS_MAX: ${RELAY_BUFFERS_MAX:-}
-        UPSTREAM_SLOTS_MAX: ${UPSTREAM_SLOTS_MAX:-}
-        CONN_SLOTS_MAX: ${CONN_SLOTS_MAX:-}
-        HEAD_BYTES_MAX_KIB: ${HEAD_BYTES_MAX_KIB:-}
-        # Generic baseline for every proxy, so the comparison is not decided by
-        # which of them happened to be compiled for this exact CPU. Override to
-        # `native` only if you also build haproxy from source.
-        ZOXY_TARGET_CPU: ${ZOXY_TARGET_CPU:-baseline}
-    # tag carries every override so each variant is a distinct image (forces
-    # rebuild; recorded in runs.json versions)
-    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}${RELAY_BUFFERS_MAX:+-rb${RELAY_BUFFERS_MAX}}${UPSTREAM_SLOTS_MAX:+-us${UPSTREAM_SLOTS_MAX}-cs${CONN_SLOTS_MAX}}${HEAD_BYTES_MAX_KIB:+-hb${HEAD_BYTES_MAX_KIB}}
+    # The ref and optimize mode are the only two inputs that change the binary,
+    # so they are the whole tag. Slot ceilings used to be here too, patched into
+    # zoxy's source at build time and encoded in the tag; they are runtime config
+    # now (entrypoint.sh writes conn_slots/upstream_slots), so the same image
+    # serves c1k and c10k.
+    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}
     container_name: zoxy
     profiles: [zoxy]
     # Docker's default seccomp profile denies io_uring_* since engine 25.0.

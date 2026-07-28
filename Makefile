@@ -67,4 +67,4 @@ down:
 	docker compose --profile '*' down
 
 clean:
-	rm -rf results/* .env.cloud bench/zig-out bench/.zig-cache
+	rm -rf results/* bench/zig-out bench/.zig-cache

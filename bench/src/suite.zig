@@ -63,11 +63,24 @@ pub const Fleet = struct {
     /// networking, published ports, docker DNS for `backend`. The cloud overlay
     /// is what swaps in host networking and peer IP literals, so it must not be
     /// applied here.
+    ///
+    /// `--env-file /dev/null` disables compose's implicit `.env` auto-load.
+    /// Nothing opts into that file — being in the working directory is enough —
+    /// and it is gitignored, so it never reaches a VM. Its only reachable effect
+    /// is to make a developer's local run differ from the nightly they are
+    /// trying to reproduce, invisibly and with no mention at the call site. It
+    /// really happened: a stale `.env` pinned an old TLS-era ZOXY_REF and every
+    /// local build produced a different zoxy than the benchmark measures.
+    ///
+    /// Everything a run depends on is therefore passed explicitly (see
+    /// `envPrefix`) or committed as a compose default. Same rule, same reason as
+    /// profile.zig's ramp constants: a parameter that decides the result may not
+    /// come from ambient state.
     pub fn composeCmd(self: Fleet) []const u8 {
         return if (self.isLocal())
-            "docker compose -f compose.yaml"
+            "docker compose --env-file /dev/null -f compose.yaml"
         else
-            "docker compose -f compose.yaml -f compose.cloud.yaml";
+            "docker compose --env-file /dev/null -f compose.yaml -f compose.cloud.yaml";
     }
 };
 
