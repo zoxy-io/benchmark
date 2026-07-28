@@ -45,6 +45,19 @@ pub const Client = struct {
         return std.fmt.bufPrint(buf, "Bearer {s}", .{self.token});
     }
 
+    /// Every `fetch` MUST be given a `response_writer`, even when the body is
+    /// of no interest.
+    ///
+    /// Without one, std.http.Client takes an internal discard path that
+    /// segfaults in `Reader.discardRemaining`. It does not reproduce in a Debug
+    /// build against glibc — only in the ReleaseFast static-musl binary CI
+    /// actually ships, which is how it reached a real run: the first `bench
+    /// wait` died two seconds in, on a HEAD, immediately after tofu had brought
+    /// up the whole fleet.
+    fn sink(buf: []u8) std.Io.Writer.Discarding {
+        return .init(buf);
+    }
+
     /// PUT an object. `key` is the full path within the bucket.
     pub fn put(self: *Client, bucket: []const u8, key: []const u8, body: []const u8) !void {
         const url = try std.fmt.allocPrint(
@@ -57,11 +70,14 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
+        var discard_buf: [1024]u8 = undefined;
+        var discard = sink(&discard_buf);
         const res = try self.http.fetch(.{
             .location = .{ .url = url },
             .method = .PUT,
             .payload = body,
             .headers = .{ .authorization = .{ .override = auth } },
+            .response_writer = &discard.writer,
         });
         if (res.status != .ok and res.status != .created) {
             // The status alone — a storage error body can echo request content.
@@ -109,10 +125,13 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
+        var discard_buf: [1024]u8 = undefined;
+        var discard = sink(&discard_buf);
         const res = try self.http.fetch(.{
             .location = .{ .url = url },
             .method = .HEAD,
             .headers = .{ .authorization = .{ .override = auth } },
+            .response_writer = &discard.writer,
         });
         return res.status == .ok;
     }
@@ -152,10 +171,13 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
+        var discard_buf: [1024]u8 = undefined;
+        var discard = sink(&discard_buf);
         const res = try self.http.fetch(.{
             .location = .{ .url = url },
             .method = .DELETE,
             .headers = .{ .authorization = .{ .override = auth } },
+            .response_writer = &discard.writer,
         });
         if (res.status != .ok) return error.DeleteInstanceFailed;
     }

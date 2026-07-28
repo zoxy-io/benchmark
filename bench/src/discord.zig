@@ -280,11 +280,18 @@ pub fn post(
 
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
+        // The response body is of no interest, but a `response_writer` is still
+        // mandatory: without one std.http.Client segfaults in its own discard
+        // path, and only in a ReleaseFast musl build. Discord's 429 body IS read
+        // here rather than discarded — see below.
+        var discard_buf: [1024]u8 = undefined;
+        var discard: std.Io.Writer.Discarding = .init(&discard_buf);
         const res = try client.fetch(.{
             .location = .{ .url = webhook },
             .method = .POST,
             .payload = body,
             .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
+            .response_writer = &discard.writer,
         });
         switch (res.status) {
             .ok, .no_content => return,
