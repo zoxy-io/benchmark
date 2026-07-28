@@ -78,6 +78,17 @@ pub const Gathered = struct {
     cpu: []Series,
     p99: []Series,
     shed: []Series,
+
+    /// Frees the reference histograms. Everything else lives in the caller's
+    /// arena, but a Histogram owns a counts array from the general-purpose
+    /// allocator (zrk allocates it in `Histogram.init`), so it needs releasing
+    /// explicitly.
+    pub fn deinit(self: *Gathered) void {
+        for (self.present) |*p| {
+            if (p.hist) |*h| h.deinit();
+            p.hist = null;
+        }
+    }
 };
 
 pub const Ramp = struct {

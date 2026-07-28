@@ -1,4 +1,0 @@
-# Local mode: everything on one docker host, one cadvisor.
-- targets: ["cadvisor:8080"]
-  labels:
-    role: all

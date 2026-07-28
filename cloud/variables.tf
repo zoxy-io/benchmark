@@ -1,6 +1,13 @@
 variable "service_account_key_file" {
-  type        = string
-  description = "yc iam key create ... --output sa-key.json"
+  type    = string
+  default = null
+  description = <<-EOT
+    Path to (or the contents of) a Yandex SA key file — `yc iam key create ...
+    --output sa-key.json`. Optional, and unset in CI: the nightly workflow has
+    no static key at all, it exchanges a GitHub OIDC token for a short-lived IAM
+    token and exports YC_TOKEN, which the provider reads from the environment.
+    Keep it for laptop-driven runs.
+  EOT
 }
 
 variable "cloud_id" {
@@ -11,6 +18,58 @@ variable "folder_id" {
   type = string
 }
 
+variable "runid" {
+  type        = string
+  description = <<-EOT
+    Identifies one run everywhere it has to be identified: the
+    `runs/<runid>/` object prefix, the `runid` label that `bench sweep` reads,
+    and the suffix on every resource name — so a fleet orphaned by a run that
+    died between apply and destroy cannot collide with, or block, the next one.
+    The charset is the intersection of two namespaces: Yandex resource names
+    reject the underscore that labels accept, and neither accepts uppercase.
+  EOT
+
+  validation {
+    # Length caps at 40 so the longest derived name ("backend-<runid>") stays
+    # inside Yandex's 63-character limit with room to spare.
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", var.runid))
+    error_message = "runid must be 1-40 characters of [a-z0-9-], starting and ending alphanumeric."
+  }
+}
+
+variable "service_account_id" {
+  type        = string
+  description = <<-EOT
+    Service account attached to every instance. It needs write access to
+    var.bench_bucket and nothing else. This is the ONLY credential path off a
+    VM: with it attached, the metadata service mints IAM tokens on demand (see
+    metadata_options in main.tf), so no key material for the cloud is ever
+    written to a benchmark host. Terraform does not create it or its bucket
+    grant — both outlive any single run.
+  EOT
+}
+
+variable "bench_bucket" {
+  type        = string
+  description = <<-EOT
+    Object Storage bucket holding `runs/<runid>/`. The runner puts payload.tar
+    there before apply; the loadgen reads it back and writes log/results.tar/DONE
+    to the same prefix. See bench/CONTRACT.md.
+  EOT
+}
+
+variable "bench_profiles" {
+  type        = string
+  default     = "c1k,c10k"
+  description = "BENCH_PROFILES — comma-separated, run in order, one `bench suite` per profile."
+}
+
+variable "bench_proxies" {
+  type        = string
+  default     = "direct,zoxy,haproxy,envoy,traefik,nginx,pingora"
+  description = "BENCH_PROXIES — comma-separated, passed straight to `bench suite --proxies`."
+}
+
 variable "zone" {
   type        = string
   default     = "ru-central1-a"
@@ -18,23 +77,13 @@ variable "zone" {
 }
 
 variable "platform_id" {
-  type        = string
-  default     = "standard-v3" # keep every role on ONE platform
-}
-
-variable "ssh_public_key" {
-  type = string
-}
-
-variable "allowed_cidr" {
-  type        = string
-  default     = "0.0.0.0/0"
-  description = "CIDR allowed to reach ssh/grafana/prometheus — narrow to YOUR.IP/32"
+  type    = string
+  default = "standard-v3" # keep every role on ONE platform
 }
 
 variable "docker_version" {
-  type        = string
-  default     = "28.0" # apt version prefix pinned by cloud-init; same compose CLI everywhere
+  type    = string
+  default = "28.0" # apt version prefix pinned by cloud-init; same compose CLI everywhere
 }
 
 variable "disk_size" {
@@ -53,6 +102,11 @@ variable "image_id" {
     boot_disk.image_id and forces a destroy+recreate of every host (new
     external IPs, lost disks) instead of the in-place resize
     allow_stopping_for_update is there for. Bump this deliberately.
+
+    A nightly fleet is recreated anyway, so the destroy+recreate no longer
+    hurts — but the image is still pinned, because an image that changes under
+    you changes the kernel and therefore the numbers, and a benchmark that
+    silently re-baselines itself overnight is worse than one that fails.
   EOT
 }
 

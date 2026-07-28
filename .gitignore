@@ -1,7 +1,6 @@
 .env
 .env.cloud
 results/
-monitoring/targets/cloud/
 cloud/.terraform/
 cloud/.terraform.lock.hcl
 cloud/terraform.tfstate*

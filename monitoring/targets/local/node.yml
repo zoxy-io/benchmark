@@ -1,4 +1,0 @@
-# Local mode: the docker VM / host itself.
-- targets: ["node_exporter:9100"]
-  labels:
-    role: all

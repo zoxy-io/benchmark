@@ -1,15 +1,20 @@
 # zoxy-benchmark v2 — containers ARE the deploy spec.
 #
 # One file describes every role; compose profiles pick what runs where:
-#   monitoring  prometheus + grafana            (local: always; cloud: loadgen VM)
 #   backend     nginx origin                    (local: always; cloud: backend VM)
 #   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|envoy|traefik|nginx|pingora)
+# The default comparison is a subset — direct/zoxy/haproxy/pingora (.env.example
+# PROXIES). envoy, traefik and nginx keep their service and their proxies/*
+# config, so putting one back in the run is a name in that list, not a revert.
 # The load generator is not a compose service: loadgen/zrk-runner runs on the
 # loadgen host, driven by scripts/zrk-bench.sh.
 # cadvisor + node_exporter carry every profile so each docker host exports
-# per-container CPU/mem and host metrics no matter which role it plays.
+# per-container CPU/mem and host metrics no matter which role it plays. cAdvisor
+# is no longer optional observability: the run driver polls its /metrics on :8081
+# at 1Hz and folds the proxy container's CPU/memory into the run's own
+# artifacts, which is why there is no Prometheus and no Grafana here.
 #
-# Local:  docker compose --profile monitoring --profile backend --profile haproxy up -d
+# Local:  docker compose --profile backend --profile haproxy up -d
 # Cloud:  the same file + compose.cloud.yaml (host networking, cpuset, peer IPs).
 # Resource limits are ENFORCED here (service-level cpus/mem_limit — no swarm
 # needed); they are the fairness mechanism that replaces v1's "identical VMs".
@@ -31,6 +36,48 @@ x-proxy-common: &proxy-common
     backend:
       condition: service_healthy
       required: false # cloud: backend runs on another VM, service absent there
+
+# Every proxy is healthchecked, and the check is a real request THROUGH it to
+# the backend's /1k — the very body the benchmark asks for. Without one,
+# `up --wait` returned as soon as the container was *running*: a leftover
+# container from the previous proxy, still holding host :8080, would answer the
+# next proxy's warm probe and the ramp got recorded under the wrong proxy's
+# name. Serving, not merely bound, is the condition worth waiting on; a proxy
+# that listens but cannot reach its upstream is not ready to be measured.
+#
+# One timing block for all six, because the check runs INSIDE the proxy's own
+# cgroup: its fork+exec is charged to the CPU number cAdvisor reports, so the
+# cadence has to be identical for every proxy or it is a fairness leak. Probe
+# hard while starting (start_interval), then back off to 30s ≈ 10 execs across
+# a 5-minute ramp.
+x-healthcheck-timing: &healthcheck-timing
+  interval: 30s
+  timeout: 2s
+  retries: 3
+  start_period: 30s
+  start_interval: 250ms
+
+# The probe must already exist inside each proxy's own image — no extra package
+# may be installed into a container whose memory footprint is a published
+# number. That splits the six in two, checked image by image rather than
+# assumed: the alpine-based ones (haproxy, nginx, traefik) carry busybox wget.
+x-healthcheck-wget: &healthcheck-wget
+  <<: *healthcheck-timing
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/1k"]
+
+# The debian/ubuntu-based ones (zoxy, pingora, envoy) have neither — zoxy's
+# runtime stage is a bare debian-slim carrying the binary and its entrypoint,
+# and nothing is being added to it just to be probed. What they do have is bash,
+# and Debian/Ubuntu build it WITH network redirections, so /dev/tcp opens the
+# socket and grep reads the status line back. Exec form, so no shell parses
+# this: bash is argv[0] and the whole program is one argument.
+x-healthcheck-bash: &healthcheck-bash
+  <<: *healthcheck-timing
+  test:
+    - CMD
+    - bash
+    - -c
+    - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
 
 services:
   # ---------------------------------------------------------------- origin --
@@ -116,6 +163,7 @@ services:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:
       - "8080:8080"
+    healthcheck: *healthcheck-bash
 
   haproxy:
     <<: *proxy-common
@@ -130,6 +178,7 @@ services:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "8080:8080"
+    healthcheck: *healthcheck-wget
 
   envoy:
     <<: *proxy-common
@@ -142,6 +191,7 @@ services:
       - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
       - "8080:8080"
+    healthcheck: *healthcheck-bash
 
   traefik:
     <<: *proxy-common
@@ -155,6 +205,7 @@ services:
       - ./proxies/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
     ports:
       - "8080:8080"
+    healthcheck: *healthcheck-wget
 
   nginx:
     <<: *proxy-common
@@ -171,6 +222,7 @@ services:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
     ports:
       - "8080:8080"
+    healthcheck: *healthcheck-wget
 
   pingora:
     <<: *proxy-common
@@ -187,48 +239,17 @@ services:
       UPSTREAM: backend:9000
     ports:
       - "8080:8080"
-
-  # ------------------------------------------------------------- monitoring --
-  prometheus:
-    image: prom/prometheus:v3.2.1
-    container_name: prometheus
-    profiles: [monitoring]
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.retention.time=30d
-      # allow `curl -X POST /-/reload`: the config is a bind mount, so content
-      # edits don't recreate the container and would otherwise need a restart
-      - --web.enable-lifecycle
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # local/ ships in-repo; zrk-bench.sh generates cloud/ from terraform IPs
-      - ./monitoring/targets/${PROM_TARGETS:-local}:/etc/prometheus/targets:ro
-      - prom-data:/prometheus
-    ports:
-      - "9090:9090"
-
-  grafana:
-    image: grafana/grafana:11.6.0
-    container_name: grafana
-    profiles: [monitoring]
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-      # datasource url (see provisioning/datasources/prometheus.yml); local
-      # default here, zrk-bench.sh overrides via .env with the loadgen address.
-      PROM_URL: ${PROM_URL:-http://prometheus:9090}
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports:
-      - "3000:3000"
+    healthcheck: *healthcheck-bash
 
   # ------------------------------------------- per-host exporters (all roles) --
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.52.1
     container_name: cadvisor
     profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, nginx, pingora]
+    # The proxy host's cAdvisor is the run's ONLY source of container CPU and
+    # memory — the driver polls /metrics on :8081 at 1Hz — so this service is
+    # part of the measurement, not a convenience. It also names the container it
+    # is reporting, which is how a ramp catches an imposter still holding :8080.
     # Disk metrics off — only cpu/memory/network matter here. NOTE: the
     # docker host must run the classic overlay2 graphdriver
     # ({"features":{"containerd-snapshotter":false}} in daemon.json — see
@@ -239,8 +260,8 @@ services:
     command:
       - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
       # hard 1s sampling: dynamic housekeeping backs off (up to 60s) on "stable"
-      # containers, which would cap the report's 1s-scraped CPU curve at the
-      # backoff cadence rather than the prometheus scrape_interval
+      # containers, which would flatten the run's 1Hz CPU curve to the backoff
+      # cadence no matter how often the driver polls
       - --housekeeping_interval=1s
       - --allow_dynamic_housekeeping=false
     privileged: true
@@ -252,6 +273,11 @@ services:
     ports:
       - "8081:8080"
 
+  # Host-level metrics. UNCLAIMED as of the Prometheus removal: its only readers
+  # were the deleted scrape config and report.py's node_cpu cpuset fallback for
+  # proxy CPU, which the driver now takes from cAdvisor instead. Kept because
+  # nothing else answers "was the HOST itself saturated" — decide to keep or
+  # drop it deliberately, not by forgetting it exists.
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.9.0
     container_name: node_exporter
@@ -263,11 +289,8 @@ services:
     ports:
       - "9100:9100"
 
-  # The load generator is loadgen/zrk-runner (an open-loop linear-ramp,
-  # calling zrk's own runner.run in-process), run on the loadgen host by
-  # scripts/zrk-bench.sh — not a compose service. It bridges live stats to a
-  # /metrics endpoint scraped by the `zrk` job in prometheus.yml; results land
-  # as per-proxy NDJSON/JSON/HDR for report/report.py.
-
-volumes:
-  prom-data:
+  # The load generator is not a compose service: it runs on the loadgen host
+  # (loadgen/zrk-runner, driven by scripts/zrk-bench.sh) and writes per-proxy
+  # NDJSON/HDR straight to disk. Nothing scrapes anything any more — the proxy's
+  # CPU and memory come from the cadvisor above, polled into those same
+  # per-run artifacts, so a report is readable without any live service.
