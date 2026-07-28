@@ -183,21 +183,23 @@ This is the piece that replaces the static key. GitHub signs a short-lived JWT
 describing the workflow run; Yandex is configured to trust that issuer, and to
 map one exact subject onto `bench-ci`.
 
-**[verify]** Create the federation:
+Create the federation. Note the command path is `oidc federation` — `oidc` is a
+command group with `federation` beneath it, so `oidc-federation` (hyphenated) is
+not a command and will fail with an unknown-command error:
 
 ```sh
-yc iam workload-identity oidc-federation create \
+yc iam workload-identity oidc federation create \
   --name github-actions \
   --description "GitHub Actions OIDC for $GH_REPO" \
   --issuer   "https://token.actions.githubusercontent.com" \
   --jwks-url "https://token.actions.githubusercontent.com/.well-known/jwks" \
   --audiences "https://github.com/zoxy-io"
 
-export FED_ID="$(yc iam workload-identity oidc-federation get --name github-actions \
+export FED_ID="$(yc iam workload-identity oidc federation get --name github-actions \
   --format json | jq -r .id)"
 ```
 
-**[verify]** Bind one subject to the CI service account:
+Bind one subject to the CI service account:
 
 ```sh
 yc iam workload-identity federated-credential create \
