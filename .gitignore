@@ -15,7 +15,7 @@ devenv.local.nix
 # direnv
 .direnv
 
-# python bytecode (report.py imports charts.py)
+# python bytecode (bench/tools/gate.py)
 __pycache__/
 *.pyc
 
@@ -25,12 +25,6 @@ __pycache__/
 bench/.zig-cache/
 bench/zig-out/
 bench/zig-pkg/
-
-# zrk-runner build artifacts (loadgen/zrk-runner/build.sh) — being replaced by
-# bench/; removed in the Phase 7 cleanup
-loadgen/zrk-runner/.zig-cache/
-loadgen/zrk-runner/zig-out/
-loadgen/zrk-runner/zig-pkg/
 
 # rust build artifacts (proxies/pingora) — Cargo.toml floats on "0.8", no
 # committed lockfile on purpose (see its comment)

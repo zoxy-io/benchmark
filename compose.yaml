@@ -6,9 +6,10 @@
 # The default comparison is a subset — direct/zoxy/haproxy/pingora (.env.example
 # PROXIES). envoy, traefik and nginx keep their service and their proxies/*
 # config, so putting one back in the run is a name in that list, not a revert.
-# The load generator is not a compose service: loadgen/zrk-runner runs on the
-# loadgen host, driven by scripts/zrk-bench.sh.
-# cadvisor + node_exporter carry every profile so each docker host exports
+# The load generator is not a compose service: the `bench` binary runs directly
+# on the loadgen host (static musl, no container, so no seccomp profile to
+# reconcile with io_uring) and drives this file over ssh.
+# cadvisor carries every profile so each docker host exports
 # per-container CPU/mem and host metrics no matter which role it plays. cAdvisor
 # is no longer optional observability: the run driver polls its /metrics on :8081
 # at 1Hz and folds the proxy container's CPU/memory into the run's own
@@ -278,19 +279,3 @@ services:
   # proxy CPU, which the driver now takes from cAdvisor instead. Kept because
   # nothing else answers "was the HOST itself saturated" — decide to keep or
   # drop it deliberately, not by forgetting it exists.
-  node_exporter:
-    image: quay.io/prometheus/node-exporter:v1.9.0
-    container_name: node_exporter
-    profiles: [monitoring, backend, zoxy, haproxy, envoy, traefik, nginx, pingora]
-    command: ["--path.rootfs=/host"]
-    pid: host
-    volumes:
-      - /:/host:ro,rslave
-    ports:
-      - "9100:9100"
-
-  # The load generator is not a compose service: it runs on the loadgen host
-  # (loadgen/zrk-runner, driven by scripts/zrk-bench.sh) and writes per-proxy
-  # NDJSON/HDR straight to disk. Nothing scrapes anything any more — the proxy's
-  # CPU and memory come from the cadvisor above, polled into those same
-  # per-run artifacts, so a report is readable without any live service.

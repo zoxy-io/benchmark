@@ -7,7 +7,7 @@
 #     makes thread autodetection agree with the cpu limit.
 #  3. peer addressing via env: proxy configs always dial the hostname
 #     `backend`; here extra_hosts maps it to the backend VM's private IP
-#     (zrk-bench.sh writes BACKEND_IP/PROXY_IP into .env from terraform).
+#     (`bench suite` passes BACKEND_IP to each remote compose invocation).
 #     zoxy itself does no DNS — its entrypoint resolves `backend` (via this
 #     same extra_hosts entry) and renders the IP literal into its config.
 
@@ -80,5 +80,3 @@ services:
       # marks cadvisor unhealthy forever and aborts the run.
       CADVISOR_HEALTHCHECK_URL: http://localhost:8081/healthz
 
-  node_exporter:
-    <<: *host-net

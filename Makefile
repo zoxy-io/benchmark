@@ -7,7 +7,7 @@
 #
 #   make build       build the bench binary (static musl)
 #   make test        bench unit tests
-#   make gate        prove bench's report matches report/report.py on real runs
+#   make gate        prove the measurement port against the old Python (from git)
 #   make report      render results/latest -> report.json + report.html
 #   make up / down   local: start/stop the backend origin
 #
@@ -39,13 +39,20 @@ build:
 test:
 	cd bench && $(ZIG) build test --system $(ZIG_PKG) --summary all
 
-# The Phase 0 gate: diff `bench report` against report/report.py over real run
-# directories. This is the only proof that the Zig port of the measurement math
-# is correct, so report/*.py stays until a live nightly has validated the new
-# path end to end. It stubs Prometheus (report.py crashes without one, and that
-# fleet is gone) and works on copies, so archived runs are never modified.
+# The gate that proved the measurement port: diff `bench report` against the OLD
+# report/report.py over real run directories. Those .py files were deleted once
+# the port was proven, so the reference is extracted from the last commit that
+# carried them — the gate stays runnable forever without the dead Python living
+# in the tree. It stubs Prometheus (report.py crashes without one, and that fleet
+# is gone) and works on copies, so archived runs are never modified.
+GATE_REF ?= 18a78b1
 gate:
-	python3 bench/tools/gate.py $(wildcard results/zrk-2026*)
+	tmp=$$(mktemp -d)
+	trap 'rm -rf "$$tmp"' EXIT
+	for f in report.py charts.py hdr.py; do
+	  git show $(GATE_REF):report/$$f > "$$tmp/$$f"
+	done
+	BENCH_REPORT_PY="$$tmp" python3 bench/tools/gate.py $(wildcard results/zrk-2026*)
 
 report:
 	cd bench && $(ZIG) build --system $(ZIG_PKG)

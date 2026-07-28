@@ -2,7 +2,7 @@
 
 {
   # The project's .env is sourced by scripts/*.sh and auto-loaded by docker
-  # compose, and zrk-bench.sh manages .env-vs-CLI-override precedence itself —
+  # compose, and the ramp parameters are compiled into bench/src/profile.zig —
   # so we deliberately do NOT pre-load it into the shell (just quiet the hint).
   dotenv.disableHint = true;
 
@@ -11,13 +11,11 @@
   # fresh checkout can `make cloud-bench` / `make report` without manual installs.
   packages = [
     pkgs.gnumake      # make — the entrypoint for every workflow
-    pkgs.jq           # scripts/*.sh JSON wrangling
     pkgs.opentofu     # `tofu` — cloud/ terraform (Makefile TF ?= tofu)
-    pkgs.rsync        # scripts/zrk-bench.sh fleet sync
     pkgs.openssh      # ssh/scp to the cloud fleet
     pkgs.curl         # health checks in scripts/*.sh
-    pkgs.python3      # report/report.py (stdlib only)
-    pkgs.zig_0_16     # loadgen/zrk-runner/build.sh cross-compiles to a static
+    pkgs.python3      # bench/tools/gate.py only (stdlib); nothing ships Python
+    pkgs.zig_0_16     # bench cross-compiles to a static
                       # musl binary every run (it embeds zrk's runner.run as a
                       # library, see its main.zig); pin the exact attr, not
                       # the bare `zig` alias — needs zig >= 0.16

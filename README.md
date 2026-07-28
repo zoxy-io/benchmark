@@ -46,7 +46,7 @@ static config and the *same* enforced cpu/memory limits (service-level `cpus` /
 one compose project, in the cloud the very same `compose.yaml` runs across three
 VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset, peer
 IPs). **The measurement is one deterministic open-loop ramp** —
-`loadgen/zrk-runner` (wrk2-lineage, HdrHistogram, calling zrk's `runner.run` in-process) offers `START_RATE → MAX_RATE`
+`bench` (wrk2-lineage, HdrHistogram, calling zrk's `runner.run` in-process) offers `START_RATE → MAX_RATE`
 over `RAMP_SECONDS`, and keeps offering at the scheduled rate even when the proxy
 falls behind (coordinated-omission corrected), so the offered axis is analytic
 (`offered = start_rate + slope·t`) and the saturation knee is exact and sharp.
@@ -77,7 +77,7 @@ Locally you can work on everything except the load generation itself:
 ```sh
 make build     # the bench binary (static musl)
 make test      # unit tests
-make gate      # prove bench's report matches report/report.py on archived runs
+make gate      # prove the measurement port against the old Python (from git history)
 make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
 make up/down   # the backend origin, for poking at a proxy by hand
 ```
@@ -139,14 +139,20 @@ noticed.
 ## Layout
 
 ```
+bench/CONTRACT.md         the interfaces terraform, cloud-init and CI code against
+bench/src/profile.zig     c1k and c10k — the ramp parameters, compiled in
+bench/src/suite.zig       the per-proxy loop; the only place an error is caught
+bench/src/ramp.zig        one ramp, embedding zrk's runner.run in-process
+bench/src/cadvisor.zig    1Hz container sampling + the identity witness
+bench/src/analysis.zig    the measurement math (ported from the old report.py)
+bench/src/{svg,html}.zig  inline-SVG charts -> a self-contained report.html
+bench/src/{ycs,commands}  Object Storage, the compute sweep, the CLI
+bench/tools/gate.py       proves analysis.zig still matches the old Python
 compose.yaml              every service, proxies behind profiles, limits enforced
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
 proxies/<p>/              one static config per proxy (upstream is always `backend`)
 backend/                  nginx origin, canned bodies generated at start
-loadgen/zrk-runner/       open-loop linear-ramp generator (embeds zrk's runner.run) + /metrics bridge
-scripts/zrk-bench.sh      the driver: build -> per-proxy up/probe/ramp/NDJSON/down
-monitoring/               prometheus (+file_sd targets), grafana (live dashboard)
-report/charts.py          shared inline-SVG chart engine + prometheus helpers
-report/report.py          NDJSON + meta.json + prometheus CPU -> self-contained report.html
-cloud/                    terraform: VPC + 3 VMs + pinned-docker cloud-init
+cloud/                    terraform: VPC + 3 ephemeral VMs, no public IPs
+docs/SETUP.md             the one-time cloud setup CI cannot do for you
+.github/workflows/        the nightly
 ```

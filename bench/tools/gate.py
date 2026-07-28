@@ -10,9 +10,16 @@ of the two implementations' report.json over REAL run directories.
 
 Usage:
     python3 bench/tools/gate.py results/<rundir> [...]
+    BENCH_REPORT_PY=<dir> python3 bench/tools/gate.py results/<rundir> [...]
 
 Runs report.py (against a stub Prometheus, see below) and `bench report` over
 each directory and compares the results field by field.
+
+report/*.py was DELETED from the working tree once the port was proven, so
+`BENCH_REPORT_PY` points at a directory holding it — `make gate` extracts it
+from the commit that last carried it. Keeping the reference in git rather than
+in the tree means this gate stays runnable forever without the dead Python
+sitting in the repo.
 
 Two intentional exemptions:
 
@@ -148,6 +155,13 @@ def main():
         print(__doc__)
         return 2
 
+    report_dir = os.environ.get("BENCH_REPORT_PY", "report")
+    reference = os.path.join(report_dir, "report.py")
+    if not os.path.exists(reference):
+        print(f"gate: no reference implementation at {reference}")
+        print("gate: run `make gate`, which extracts it from git history")
+        return 2
+
     srv = HTTPServer(("127.0.0.1", 9099), StubProm)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -176,7 +190,7 @@ def main():
                     shutil.copy2(f, work)
 
             subprocess.run(
-                [sys.executable, "report/report.py", work],
+                [sys.executable, reference, work],
                 check=True, capture_output=True,
                 env={"PATH": "/usr/bin:/bin", "PROM_URL": "http://127.0.0.1:9099"},
             )
