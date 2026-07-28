@@ -1,4 +1,5 @@
 .env
+.env.cloud
 results/
 cloud/.terraform/
 # cloud/.terraform.lock.hcl is COMMITTED on purpose — see cloud/versions.tf
