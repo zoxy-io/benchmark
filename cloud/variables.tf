@@ -1,6 +1,6 @@
 variable "service_account_key_file" {
-  type    = string
-  default = null
+  type        = string
+  default     = null
   description = <<-EOT
     Path to (or the contents of) a Yandex SA key file — `yc iam key create ...
     --output sa-key.json`. Optional, and unset in CI: the nightly workflow has

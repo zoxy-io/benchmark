@@ -1,6 +1,13 @@
 #cloud-config
-# Deliberately dumb: pinned docker + sysctls + ssh key. The benchmark repo is
-# rsynced by scripts/zrk-bench.sh — no images to build, nothing baked in.
+# ONE template for all three roles, switched on ${role}. Everything above the
+# switch — the docker pin, the sysctls, the fd limits, the payload — has to be
+# provably identical on loadgen/proxy/backend, or the benchmark is measuring
+# hosts instead of proxies. Keeping it in a single file is how that stays true
+# under editing; three templates would drift the first time someone fixed a bug
+# in two of them. Only the tail differs, behind one `if role == "loadgen"`.
+#
+# NOTE: this file is templatefile() input, so every `$${...}` a shell would
+# expand has to be written with a doubled dollar. Bare `$VAR` is untouched.
 
 users:
   - name: ubuntu
@@ -9,6 +16,17 @@ users:
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - ${ssh_public_key}
+
+# Host keys come from terraform instead of first boot, so the loadgen's
+# known_hosts is already correct before its peers have finished booting and it
+# can drive them with ssh's default StrictHostKeyChecking rather than accepting
+# whatever answers on :22. Only ed25519 is generated, so there is exactly one
+# key a peer can offer and no algorithm negotiation to reason about.
+ssh_keys:
+  ed25519_private: |
+    ${indent(4, ssh_host_private_key)}
+  ed25519_public: ${ssh_host_public_key}
+ssh_genkeytypes: [ed25519]
 
 write_files:
   # Classic overlay2 graphdriver: cAdvisor's docker handler cannot resolve
@@ -31,6 +49,194 @@ write_files:
       fs.file-max = 2097152
       fs.nr_open = 2097152
 
+  # The c10k profile wants ~10k sockets on the loadgen and two per connection on
+  # the proxy. `ulimit -n` in a script can only ever LOWER the hard limit, so
+  # the inline bump zrk-bench.sh used to do silently no-op'd whenever the login
+  # session's hard limit was smaller — set it where it actually takes effect.
+  # pam_limits governs LOGIN sessions only; systemd units inherit the manager's
+  # limits and ignore this file entirely, which is why bench-suite.service below
+  # restates LimitNOFILE/LimitMEMLOCK.
+  - path: /etc/security/limits.d/99-bench.conf
+    content: |
+      ubuntu soft nofile 1048576
+      ubuntu hard nofile 1048576
+      ubuntu soft memlock unlimited
+      ubuntu hard memlock unlimited
+
+  # The contract's VM-side environment, in one file so the scripts below and the
+  # systemd unit read the same thing. Nothing secret lives here.
+  - path: /etc/bench/env
+    content: |
+      BENCH_BUCKET=${bench_bucket}
+      BENCH_RUNID=${runid}
+      BENCH_PROFILES=${bench_profiles}
+      BENCH_PROXIES=${bench_proxies}
+      PROXY_IP=${proxy_ip}
+      BACKEND_IP=${backend_ip}
+      SSH_KEY=${ssh_key_path}
+      BENCH_ROLE=${role}
+      # Not in the contract, which names only SSH_KEY — but remote.Ssh passes
+      # UserKnownHostsFile explicitly, so it needs to be told where the pinned
+      # file is. It is also in ssh's default location, so a bare `ssh` works too.
+      BENCH_KNOWN_HOSTS=/home/ubuntu/.ssh/known_hosts
+
+  # Object Storage over an IAM token minted by the metadata service — the whole
+  # reason the instances carry a service account and no key file. Tokens are
+  # short-lived and a run outlives one by a wide margin, so every call mints a
+  # fresh one rather than caching. Yandex accepts the bearer token directly:
+  # no SigV4, no access key, nothing to leak.
+  - path: /usr/local/bin/bench-os
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      set -a; . /etc/bench/env; set +a
+      base="https://storage.yandexcloud.net/$BENCH_BUCKET/runs/$BENCH_RUNID"
+      tok=$(curl -sfS -H 'Metadata-Flavor: Google' \
+        http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+      case "$1" in
+        get) curl -sfS -H "Authorization: Bearer $tok" -o "$3" "$base/$2" ;;
+        put) curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary "@$3" "$base/$2" ;;
+        say) printf '%s\n' "$3" | curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary @- "$base/$2" ;;
+        *)   echo "usage: bench-os get|put|say <object> <file|text>" >&2; exit 2 ;;
+      esac
+
+  # payload.tar is uploaded BEFORE apply, so it is already in the bucket when
+  # this runs. The retry loop is for this end, not that one: the default route
+  # through the NAT gateway and the instance's service-account binding both
+  # become usable a few seconds after the guest starts running commands.
+  - path: /usr/local/bin/bench-payload
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      install -d -o ubuntu -g ubuntu /home/ubuntu/bench
+      for _ in $(seq 1 60); do
+        if bench-os get payload.tar /tmp/payload.tar; then break; fi
+        sleep 5
+      done
+      test -s /tmp/payload.tar
+      tar -xf /tmp/payload.tar -C /home/ubuntu/bench
+      chown -R ubuntu:ubuntu /home/ubuntu/bench
+%{~ if role == "loadgen" }
+
+  # The per-run ssh identity. It exists in exactly two places — terraform's
+  # state in the CI workspace, and here — and both are gone when the job ends.
+  # deferred, because write_files normally runs before the users module and
+  # `owner: ubuntu` would not resolve yet; deferred writes still land before
+  # runcmd, which is all this needs.
+  - path: ${ssh_key_path}
+    owner: "ubuntu:ubuntu"
+    permissions: "0600"
+    defer: true
+    content: |
+      ${indent(6, fleet_private_key)}
+
+  # In the default location on purpose: anything that shells out to ssh picks it
+  # up without being told, so peer verification does not depend on `bench`
+  # passing the right -o flags.
+  - path: /home/ubuntu/.ssh/known_hosts
+    owner: "ubuntu:ubuntu"
+    permissions: "0644"
+    defer: true
+    content: |
+      ${indent(6, known_hosts)}
+
+  # The run, end to end. Ordering here is the contract's: results.tar goes up
+  # before DONE, so the runner never polls into a marker that points at a
+  # half-uploaded object.
+  - path: /usr/local/bin/bench-drive
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+      set -a; . /etc/bench/env; set +a
+
+      LOG=/home/ubuntu/bench.log
+      exec > >(tee -a "$LOG") 2>&1
+
+      fail() {
+        echo "FAILED: $*"
+        bench-os put log "$LOG" || true
+        bench-os say FAILED "$*" || true
+        exit 1
+      }
+
+      # after fail() exists, so a payload that never landed is a FAILED marker
+      # rather than a suite that quietly runs in the wrong directory
+      cd /home/ubuntu/bench || fail "payload never unpacked into ~/bench"
+
+      # the same pinning bench's remote.Ssh uses: the host keys came from
+      # terraform, so there is no first use to trust
+      peer() {
+        timeout 900 ssh -i "$SSH_KEY" \
+          -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+          -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$BENCH_KNOWN_HOSTS" \
+          "ubuntu@$1" "$2"
+      }
+
+      # sshd answers minutes before docker and the payload are in place, so gate
+      # on the peer's own cloud-init and then on the two things actually needed.
+      # `cloud-init status --wait` exits 2 for recoverable warnings, which is not
+      # a reason to abandon a 40-minute run — hence the discarded status.
+      wait_peer() {
+        for _ in $(seq 1 120); do
+          if peer "$1" 'cloud-init status --wait >/dev/null 2>&1; test -d ~/bench && docker info >/dev/null 2>&1'; then
+            return 0
+          fi
+          sleep 10
+        done
+        return 1
+      }
+
+      wait_peer "$PROXY_IP" || fail "proxy never became ready"
+      wait_peer "$BACKEND_IP" || fail "backend never became ready"
+
+      # the contract's `log`: re-uploaded every ~30s so the runner can stream a
+      # run it has no other way to watch.
+      ( while sleep 30; do bench-os put log "$LOG" || true; done ) &
+      tailer=$!
+      trap 'kill $tailer 2>/dev/null || true' EXIT
+
+      rc=0
+      IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
+      for p in "$${profiles[@]}"; do
+        ./bench suite --profile "$p" --proxies "$BENCH_PROXIES" || rc=$?
+      done
+
+      tar -cf /tmp/results.tar -C results "$BENCH_RUNID" || fail "suite produced no results/$BENCH_RUNID"
+      bench-os put results.tar /tmp/results.tar || fail "results.tar upload failed"
+      kill $tailer 2>/dev/null || true
+      bench-os put log "$LOG" || true
+      bench-os say DONE "rc=$rc"
+      exit $rc
+
+  # A unit rather than a backgrounded runcmd, so the whole run lands in the
+  # journal and can be pulled off a host that never reached DONE.
+  - path: /etc/systemd/system/bench-suite.service
+    content: |
+      [Unit]
+      Description=zoxy-benchmark self-driving suite
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      User=ubuntu
+      Group=ubuntu
+      WorkingDirectory=/home/ubuntu/bench
+      EnvironmentFile=/etc/bench/env
+      ExecStart=/usr/local/bin/bench-drive
+      # limits.d is pam_limits, which a unit never goes through: without these
+      # two lines the c10k profile hits systemd's 1024 default and the run looks
+      # like a proxy failure instead of a harness failure.
+      LimitNOFILE=1048576
+      LimitMEMLOCK=infinity
+      TimeoutStartSec=infinity
+%{~ endif }
+
 apt:
   sources:
     docker:
@@ -48,3 +254,20 @@ runcmd:
     docker-buildx-plugin docker-compose-plugin
   - apt-mark hold docker-ce docker-ce-cli
   - systemctl enable --now docker
+  - /usr/local/bin/bench-payload
+  # One object per role (bench's ycs.Keys.bootOk, which exists so cloud-init and
+  # the runner cannot disagree about a key). A single shared `boot-ok` would be
+  # last-writer-wins and could not answer the only question it is ever asked:
+  # which host failed to get here.
+  - bench-os say boot-ok.${role} "${role} ready"
+%{~ if role == "loadgen" }
+  # a root-owned ~/.ssh is a failure that only shows up an hour later, as an
+  # unexplained ssh error in the middle of a ramp
+  - chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+  - chmod 700 /home/ubuntu/.ssh
+  # --no-block: the suite runs for the better part of an hour, and cloud-init
+  # has to be able to report "done" long before that — the peers' readiness gate
+  # is exactly that signal, and blocking here would deadlock the fleet.
+  - systemctl daemon-reload
+  - systemctl start --no-block bench-suite.service
+%{~ endif }
