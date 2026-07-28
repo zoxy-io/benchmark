@@ -32,6 +32,7 @@ pub const svg = @import("svg.zig");
 pub const html = @import("html.zig");
 pub const discord = @import("discord.zig");
 pub const commands = @import("commands.zig");
+pub const index = @import("index.zig");
 
 const usage =
     \\usage: bench <command> [options]
