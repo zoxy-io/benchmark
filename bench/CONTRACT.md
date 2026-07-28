@@ -41,20 +41,22 @@ Read on the **VM** (set by cloud-init from instance metadata):
 | `BENCH_RUNID` | Run id; the object prefix is `runs/<runid>/`. |
 | `BENCH_PROFILES` | Comma-separated profiles to run, in order. |
 | `BENCH_PROXIES` | Comma-separated proxy names. |
-| `PROXY_IP`, `BACKEND_IP` | Private addresses of the other two VMs. |
+| `PROXY_IP`, `BACKEND_IP` | Private addresses of the other two VMs (static .11/.12/.13 — a `for_each` instance cannot reference its siblings). |
 | `SSH_KEY` | Path to the per-run private key used to drive proxy/backend. |
 
 No cloud credential is ever stored on a VM: `bench` fetches an IAM token from
 `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token`
-with the `Metadata-Flavor: Google` header, which requires the instance to have a
-service account attached and the `gce-http-token` metadata key set.
+with the `Metadata-Flavor: Google` header. That endpoint is enabled by the
+instance's `metadata_options` block (`gce_http_endpoint = 1`,
+`gce_http_token = 1`) plus an attached service account — it is a first-class
+provider block, NOT a `gce-http-token` metadata key.
 
 ## Object Storage layout
 
 ```
 s3://$BENCH_BUCKET/runs/<runid>/
   payload.tar          uploaded by the runner BEFORE apply; bench + compose + proxy configs
-  boot-ok              written by each VM once cloud-init finishes (diagnoses a boot failure)
+  boot-ok.<role>       written by each VM once cloud-init finishes (diagnoses a boot failure)
   log                  the suite's running log, re-uploaded every ~30s
   results.tar          every artifact, uploaded once the suite finishes
   DONE                 written last, after results.tar; its presence means "complete"
@@ -76,6 +78,8 @@ is cancelled between `apply` and `destroy` and terraform's per-run state is lost
 with the runner.
 
 ## Artifact layout inside `results.tar`
+
+Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
 
 ```
 <runid>/

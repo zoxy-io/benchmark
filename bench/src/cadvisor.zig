@@ -70,7 +70,7 @@ pub fn scrape(
     proxy: []const u8,
     scratch: []u8,
 ) !Observation {
-    var stream = try addr.connect(io, .{});
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } } });
     defer stream.close(io);
 
     {
@@ -235,7 +235,7 @@ pub const Poller = struct {
                 self.scrape_failures += 1;
             }
 
-            self.io.sleep(.fromNanos(std.time.ns_per_s), .awake) catch break;
+            self.io.sleep(.fromNanoseconds(std.time.ns_per_s), .awake) catch break;
         }
     }
 };

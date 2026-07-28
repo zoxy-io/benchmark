@@ -30,6 +30,8 @@ pub const suite = @import("suite.zig");
 pub const ycs = @import("ycs.zig");
 pub const svg = @import("svg.zig");
 pub const html = @import("html.zig");
+pub const discord = @import("discord.zig");
+pub const commands = @import("commands.zig");
 
 const usage =
     \\usage: bench <command> [options]
@@ -53,11 +55,93 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // GitHub masks any value passed to ::add-mask::, so registering the fleet's
+    // addresses there covers output this process never sees — a child's stderr,
+    // an action's own logging.
+    redact.setCiMasking(std.process.Environ.getPosix(init.minimal.environ, "CI") != null);
+
     const cmd = args[1];
-    if (std.mem.eql(u8, cmd, "report")) return cmdReport(init, args[2..]);
+    const rest = args[2..];
+
+    if (std.mem.eql(u8, cmd, "report")) return cmdReport(init, rest);
+    if (std.mem.eql(u8, cmd, "sweep")) return exit(try commands.sweep(
+        init.gpa,
+        arena,
+        init.io,
+        commands.Env.read(init.minimal.environ),
+    ));
+    if (std.mem.eql(u8, cmd, "wait")) return cmdWait(init, rest);
+    if (std.mem.eql(u8, cmd, "fetch")) return cmdFetch(init, rest);
+    if (std.mem.eql(u8, cmd, "suite")) return cmdSuite(init, rest);
 
     std.debug.print("bench: unknown command '{s}'\n\n{s}", .{ cmd, usage });
     std.process.exit(2);
+}
+
+fn exit(code: u8) noreturn {
+    std.process.exit(code);
+}
+
+fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    var env = commands.Env.read(init.minimal.environ);
+    env.runid = try flagValue(args, "--runid") orelse env.runid;
+    if (env.runid.len == 0) return fail("bench wait: --runid or BENCH_RUNID is required", .{});
+
+    const res = try commands.wait(init.gpa, arena, init.io, env, .{});
+    switch (res) {
+        .done => {
+            std.debug.print("bench wait: run complete\n", .{});
+            exit(0);
+        },
+        // Distinguished in the exit code so the workflow can tell "the suite ran
+        // and reported failure" (there may still be partial artifacts worth
+        // publishing) from "nothing ever came back".
+        .failed => exit(3),
+        .never_booted, .timed_out => exit(1),
+    }
+}
+
+fn cmdFetch(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    var env = commands.Env.read(init.minimal.environ);
+    env.runid = try flagValue(args, "--runid") orelse env.runid;
+    const out = try flagValue(args, "--out") orelse "results";
+    if (env.runid.len == 0) return fail("bench fetch: --runid or BENCH_RUNID is required", .{});
+    exit(try commands.fetch(init.gpa, arena, init.io, env, out));
+}
+
+fn cmdSuite(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    const environ = init.minimal.environ;
+
+    const prof_name = try flagValue(args, "--profile") orelse
+        return fail("bench suite: --profile is required", .{});
+    const prof = profile.byName(prof_name) orelse
+        return fail("bench suite: unknown profile '{s}'", .{prof_name});
+
+    const spec = try flagValue(args, "--proxies") orelse
+        commands.Env.get(environ, "BENCH_PROXIES");
+    const proxies = try commands.parseProxies(arena, if (spec.len > 0) spec else "direct,zoxy,haproxy,pingora");
+
+    const runid = try flagValue(args, "--runid") orelse commands.Env.get(environ, "BENCH_RUNID");
+    if (runid.len == 0) return fail("bench suite: --runid or BENCH_RUNID is required", .{});
+
+    exit(try commands.runSuite(init.gpa, arena, init.io, environ, prof, proxies, runid));
+}
+
+/// Value of `--name <value>`, or null when absent.
+fn flagValue(args: []const [:0]const u8, name: []const u8) !?[]const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], name)) continue;
+        if (i + 1 >= args.len) {
+            std.debug.print("bench: {s} needs a value\n", .{name});
+            return error.MissingFlagValue;
+        }
+        return args[i + 1];
+    }
+    return null;
 }
 
 /// `bench report <rundir> [--profile <name>] [--generated <iso>]`

@@ -26,16 +26,14 @@ pub const compute_host = "compute.api.cloud.yandex.net";
 
 pub const Client = struct {
     gpa: Allocator,
-    io: Io,
     token: []const u8,
     http: std.http.Client,
 
     pub fn init(gpa: Allocator, io: Io, token: []const u8) Client {
         return .{
             .gpa = gpa,
-            .io = io,
             .token = token,
-            .http = .{ .allocator = gpa },
+            .http = .{ .allocator = gpa, .io = io },
         };
     }
 
@@ -209,7 +207,7 @@ pub fn parseInstances(arena: Allocator, json: []const u8) ![]Instance {
 /// credential: the token is minted on demand, scoped to that service account,
 /// and expires on its own.
 pub fn metadataToken(gpa: Allocator, io: Io, arena: Allocator) ![]const u8 {
-    var client: std.http.Client = .{ .allocator = gpa };
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var body: std.Io.Writer.Allocating = .init(arena);
@@ -221,7 +219,6 @@ pub fn metadataToken(gpa: Allocator, io: Io, arena: Allocator) ![]const u8 {
         .extra_headers = &.{.{ .name = "Metadata-Flavor", .value = "Google" }},
         .response_writer = &body.writer,
     });
-    _ = io;
     if (res.status != .ok) return error.MetadataTokenFailed;
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body.written(), .{});

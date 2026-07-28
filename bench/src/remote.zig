@@ -106,7 +106,7 @@ pub fn exec(
             child.kill(io);
             break;
         }
-        io.sleep(.fromNanos(step_ns), .awake) catch break;
+        io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
         waited += step_ns;
     }
     wait_group.cancel(io);

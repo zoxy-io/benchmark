@@ -127,7 +127,7 @@ pub fn write(gpa: Allocator, io: Io, dir: []const u8, p: Profile) !void {
         try fw.interface.flush();
         try f.sync(io);
     }
-    try Io.Dir.cwd().rename(io, tmp, final);
+    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), final, io);
 }
 
 fn render(w: *std.Io.Writer, p: Profile) !void {

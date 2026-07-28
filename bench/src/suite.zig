@@ -192,7 +192,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
             redact.log("bench: [{s}] teardown failed: {s}", .{ name, @errorName(e) });
         };
 
-        io.sleep(.fromNanos(p.cooldown_s * std.time.ns_per_s), .awake) catch {};
+        io.sleep(.fromNanoseconds(p.cooldown_s * std.time.ns_per_s), .awake) catch {};
     }
 
     flush.finished = try nowIso(io, arena);
@@ -374,14 +374,14 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
     var attempt: usize = 0;
     while (attempt < warm_probe_attempts) : (attempt += 1) {
         if (probeOnce(io, addr, path)) |_| return else |_| {}
-        io.sleep(.fromNanos(warm_probe_interval_ns), .awake) catch {};
+        io.sleep(.fromNanoseconds(warm_probe_interval_ns), .awake) catch {};
     }
     redact.log("bench: [{s}] never served 200 after {d} attempts", .{ name, warm_probe_attempts });
     return error.WarmProbeFailed;
 }
 
 fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
-    var stream = try addr.connect(io, .{});
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } } });
     defer stream.close(io);
 
     var wbuf: [512]u8 = undefined;

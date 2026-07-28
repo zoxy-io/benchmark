@@ -105,7 +105,7 @@ fn onProgress(
 /// run stopped producing rows while the process stayed alive and kept serving —
 /// this converts an unbounded hang into a truncated but real result.
 fn raiseAfter(io: Io, flag: *std.atomic.Value(bool), ns: u64) void {
-    io.sleep(.fromNanos(ns), .awake) catch {};
+    io.sleep(.fromNanoseconds(ns), .awake) catch {};
     flag.store(true, .monotonic);
 }
 
