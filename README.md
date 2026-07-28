@@ -1,4 +1,4 @@
-# proxy-bench
+# benchmark
 
 Compares **zoxy** against **HAProxy** and **Pingora**: every proxy gets the
 *identical* linearly-growing **open-loop** load ramp until it stops keeping up,
