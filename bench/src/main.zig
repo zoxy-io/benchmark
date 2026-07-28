@@ -251,12 +251,27 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
 
     try prof.validate();
 
-    const meta = try readMeta(arena, io, run_dir);
+    // profile.json is what `bench suite` writes; meta.json is the bash
+    // harness's, kept working so archived run dirs still render.
+    const meta = readProfileMeta(arena, io, run_dir) catch
+        try readMeta(arena, io, run_dir);
     const ordered = try report.orderPresent(arena, meta.proxies);
 
     const inputs = try arena.alloc(report.ProxyInput, ordered.len);
     for (ordered, 0..) |name, k| {
-        inputs[k] = .{ .name = name, .tags = meta.tagsFor(name) };
+        const tags = meta.tagsFor(name);
+        // cAdvisor samples replace the Prometheus CPU/memory queries. `direct`
+        // has no container, and an archived run predates the poller — both come
+        // back empty, which the report renders as absent rather than as zero.
+        const cad = try report.loadCadvisor(
+            arena,
+            io,
+            run_dir,
+            name,
+            if (tags.len > 0) tags[0] else "",
+            meta.ramp,
+        );
+        inputs[k] = .{ .name = name, .tags = tags, .cpu = cad.cpu, .mem = cad.mem };
     }
 
     var g = try report.gather(gpa, arena, io, run_dir, inputs, prof.ref_rate, prof.ref_band);
@@ -373,6 +388,44 @@ fn readMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
 
     return .{
         .runid = runid,
+        .proxies = try names.toOwnedSlice(arena),
+        .tags = try tags.toOwnedSlice(arena),
+        .ramp = ramp_meta,
+    };
+}
+
+/// Read a run dir written by `bench suite`. Its files are untagged
+/// (`<proxy>.ndjson`), and the proxy list is the profile.json `proxies` map —
+/// which, unlike the bash harness's meta.json, distinguishes a proxy that failed
+/// from one that served nothing.
+fn readProfileMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
+    const path = try std.fmt.allocPrint(arena, "{s}/profile.json", .{run_dir});
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(8 * 1024 * 1024));
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+    const obj = parsed.object;
+    const proxies = (obj.get("proxies") orelse return error.NoProxies).object;
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var tags: std.ArrayList([]const []const u8) = .empty;
+    const untagged: []const []const u8 = &.{""};
+
+    var it = proxies.iterator();
+    while (it.next()) |e| {
+        try names.append(arena, e.key_ptr.*);
+        try tags.append(arena, untagged);
+    }
+
+    var ramp_meta: report.Ramp = .{};
+    if (obj.get("ramp")) |r| {
+        const ro = r.object;
+        if (ro.get("start_rate")) |v| ramp_meta.start_rate = v.integer;
+        if (ro.get("max_rate")) |v| ramp_meta.max_rate = v.integer;
+        if (ro.get("ramp_seconds")) |v| ramp_meta.ramp_seconds = v.integer;
+    }
+
+    return .{
+        .runid = if (obj.get("runid")) |v| v.string else "",
         .proxies = try names.toOwnedSlice(arena),
         .tags = try tags.toOwnedSlice(arena),
         .ramp = ramp_meta,

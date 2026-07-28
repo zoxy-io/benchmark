@@ -115,7 +115,7 @@ pub fn gather(
         // from each before they are aligned by interval index.
         const per_tag = try arena.alloc([]analysis.TsRow, in.tags.len);
         for (in.tags, 0..) |tag, i| {
-            const path = try std.fmt.allocPrint(arena, "{s}/{s}.{s}.ndjson", .{ dir, in.name, tag });
+            const path = try artifactPath(arena, dir, in.name, tag, "ndjson");
             per_tag[i] = try analysis.fullWindows(arena, try analysis.readNdjson(arena, io, path));
         }
         const per_tag_const = try arena.alloc([]const analysis.TsRow, per_tag.len);
@@ -219,6 +219,82 @@ pub fn gather(
     };
 }
 
+/// Load a proxy's cAdvisor samples into the shape `gather` wants: container
+/// cores against OFFERED load, plus peak working-set bytes.
+///
+/// This is the half of the Prometheus replacement that lives in the report. The
+/// poller records raw counters on the ramp's own clock, so mapping a sample onto
+/// the offered axis is analytic — `offered(t)` straight from the ramp — with no
+/// wall-clock-to-elapsed remap and no clock skew between two machines, which is
+/// what the Prometheus path needed.
+pub fn loadCadvisor(
+    arena: Allocator,
+    io: std.Io,
+    dir: []const u8,
+    proxy: []const u8,
+    tag: []const u8,
+    ramp: Ramp,
+) !struct { cpu: []Point, mem: ?f64 } {
+    const path = try artifactPath(arena, dir, proxy, tag, "cadvisor.ndjson");
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch
+        return .{ .cpu = &.{}, .mem = null };
+
+    const Row = struct { t: f64 = 0, cpu_seconds_total: f64 = 0, mem_ws: u64 = 0 };
+    var rows: std.ArrayList(Row) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const r = std.json.parseFromSliceLeaky(Row, arena, line, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        try rows.append(arena, r);
+    }
+    if (rows.items.len == 0) return .{ .cpu = &.{}, .mem = null };
+
+    var peak: u64 = 0;
+    for (rows.items) |r| peak = @max(peak, r.mem_ws);
+
+    // A counter needs two points to become a rate, so the first sample only
+    // establishes a baseline.
+    var cpu: std.ArrayList(Point) = .empty;
+    if (rows.items.len >= 2) {
+        const start: f64 = @floatFromInt(ramp.start_rate orelse 0);
+        const end: f64 = @floatFromInt(ramp.max_rate orelse 0);
+        const total: f64 = @floatFromInt(ramp.ramp_seconds orelse 0);
+
+        for (rows.items[1..], 0..) |r, i| {
+            const prev = rows.items[i];
+            const dt = r.t - prev.t;
+            if (dt <= 0) continue;
+            const cores = (r.cpu_seconds_total - prev.cpu_seconds_total) / dt;
+            const frac = if (total > 0) std.math.clamp(r.t / total, 0, 1) else 0;
+            try cpu.append(arena, .{ .x = start + (end - start) * frac, .y = cores });
+        }
+    }
+
+    return .{ .cpu = try cpu.toOwnedSlice(arena), .mem = if (peak > 0) @floatFromInt(peak) else null };
+}
+
+/// `<dir>/<proxy>.<tag>.<ext>`, or `<dir>/<proxy>.<ext>` when the tag is empty.
+///
+/// `bench suite` writes untagged names; the loadgen tag only ever existed to
+/// disambiguate multiple generators, and there has only ever been one. Archived
+/// run dirs from the bash harness carry the `lg1` tag, so both spellings have to
+/// resolve.
+fn artifactPath(
+    arena: Allocator,
+    dir: []const u8,
+    proxy: []const u8,
+    tag: []const u8,
+    ext: []const u8,
+) ![]const u8 {
+    return if (tag.len == 0)
+        std.fmt.allocPrint(arena, "{s}/{s}.{s}", .{ dir, proxy, ext })
+    else
+        std.fmt.allocPrint(arena, "{s}/{s}.{s}.{s}", .{ dir, proxy, tag, ext });
+}
+
 pub const ProxyInput = struct {
     name: []const u8,
     tags: []const []const u8,
@@ -239,7 +315,10 @@ fn hgrmFilename(
     tags: []const []const u8,
 ) ![]const u8 {
     for (tags) |tag| {
-        const name = try std.fmt.allocPrint(arena, "{s}.{s}.hgrm", .{ proxy, tag });
+        const name = if (tag.len == 0)
+            try std.fmt.allocPrint(arena, "{s}.hgrm", .{proxy})
+        else
+            try std.fmt.allocPrint(arena, "{s}.{s}.hgrm", .{ proxy, tag });
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
         if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
             return name;
@@ -490,4 +569,21 @@ test "orderPresent puts known proxies in display order and keeps the rest" {
 test "colorOf knows the shipped proxies and nothing else" {
     try std.testing.expectEqualStrings("#fb9e0e", colorOf("zoxy").?);
     try std.testing.expect(colorOf("mystery") == null);
+}
+
+test "artifactPath resolves both the tagged and untagged spellings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // What `bench suite` writes.
+    try std.testing.expectEqualStrings(
+        "run/c1k/zoxy.ndjson",
+        try artifactPath(arena, "run/c1k", "zoxy", "", "ndjson"),
+    );
+    // What the archived run dirs from the bash harness carry.
+    try std.testing.expectEqualStrings(
+        "run/zoxy.lg1.ndjson",
+        try artifactPath(arena, "run", "zoxy", "lg1", "ndjson"),
+    );
 }
