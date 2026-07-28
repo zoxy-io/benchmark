@@ -99,10 +99,14 @@ poking at the stack; the load driver itself is cloud-only.
 - **zoxy caps admitted connections per process**: on the phase-1 L7 path the
   bound is a configurable `limits.conn_slots` (default 1386, tuned to a ~32 MiB
   footprint — zoxy prints the exact figure at startup; we don't set this, so it
-  runs on the default) up to a comptime ceiling of 14074 (the io_uring
+  runs on the default) up to a comptime ceiling of 11464 (the io_uring
   completion-queue c10k budget), plus a shared upstream keep-alive pool of
-  `upstream_slots_max`=1024; connections beyond the admission ceiling get a
-  static shed response. `CONNECTIONS` (zrk's in-flight cap) defaults to 500,
+  `upstream_slots_max`=11464 — pinned equal to the conn-slot ceiling as of
+  zoxy #108, since an upstream is leased for a whole client exchange (one
+  slot per admitted connection at saturation, not per in-flight request), so
+  a higher conn ceiling than upstream ceiling was admission capacity that
+  couldn't be served. Connections beyond the admission ceiling get a static
+  shed response. `CONNECTIONS` (zrk's in-flight cap) defaults to 500,
   comfortably under the 1386 default. That's not chased up against zoxy's
   ceiling — past a proxy's sweet-spot concurrency *every* proxy
   congestion-collapses (throughput falls as latency climbs), so `CONNECTIONS`
