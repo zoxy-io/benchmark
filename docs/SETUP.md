@@ -287,6 +287,32 @@ leak. If your organisation can enforce this centrally
 (organization-manager → security policy → forbid static access keys), do
 — **[verify]**, I could not confirm the exact policy name.
 
+### Allow public objects, so the Discord post can link the report
+
+`bench notify` uploads each profile's `report.html` to
+`runs/<runid>/<profile>/report.html` with `x-amz-acl: public-read`, and puts the
+resulting URL in the Discord embed. The report is linked rather than attached
+because a Discord HTML attachment cannot be previewed — it has to be downloaded
+and opened from disk, which means the artifact that took the whole night to
+produce goes unread.
+
+Only that one object per profile is made public. The raw run data, the payload
+and the log stay private, and everything ages out together under the same
+lifecycle rule.
+
+For the ACL to take effect the bucket must permit public objects. Yandex
+buckets default to private, and a bucket with public access blocked will make
+the `PUT` fail — `bench notify` then falls back to the GitHub Pages link and
+carries on, so this is a nice-to-have, not a prerequisite.
+
+**[verify]** In the console: Object Storage → the bucket → Access → allow public
+read for objects. There is no per-object toggle to set in advance; the ACL
+travels with the upload.
+
+If you would rather the bucket stay entirely private, do nothing — the Pages
+link covers the latest run, and only the ability to link an *older* run's report
+is lost.
+
 ### 30-day lifecycle rule on `runs/`
 
 The bucket is transport, not an archive. The durable copy of a night's data is

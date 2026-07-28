@@ -467,8 +467,18 @@ pub fn notify(
     };
 
     var embeds: std.ArrayList(discord.Embed) = .empty;
-    var files: std.ArrayList(discord.Attachment) = .empty;
     var any_failed = false;
+
+    // The report is UPLOADED and LINKED rather than attached. A Discord HTML
+    // attachment cannot be previewed — it has to be downloaded and opened from
+    // disk, which nobody does — so the artifact that took the whole night to
+    // produce goes unread. A link opens in a browser. The object is uploaded
+    // public-read under the run prefix, so it ages out with the run instead of
+    // accumulating, and only the rendered report is exposed; the raw data stays
+    // private.
+    var client = ycs.Client.init(gpa, io, env.token);
+    defer client.deinit();
+    const keys: ycs.Keys = .{ .runid = runid };
 
     for (profile.all) |p| {
         const view = (try readProfile(arena, io, dir, p.name)) orelse continue;
@@ -478,13 +488,29 @@ pub fn notify(
             r.delta = index.delta(r.sustained, index.previousSustained(history, p.name, r.name, runid));
         }
 
+        // Upload the report and link it. A failure here costs the link, not the
+        // post — the table is the part that has to arrive.
+        var link: []const u8 = "";
+        if (view.html.len > 0 and env.token.len > 0 and env.bucket.len > 0) {
+            const key = try keys.report(arena, p.name);
+            if (client.putObject(env.bucket, key, view.html, .{
+                .content_type = "text/html; charset=utf-8",
+                .public = true,
+            })) |_| {
+                link = try ycs.Client.publicUrl(arena, env.bucket, key);
+            } else |e| {
+                std.debug.print("bench notify: could not upload {s}'s report ({s})\n", .{ p.name, @errorName(e) });
+            }
+        }
+        if (link.len == 0 and base_url.len > 0) {
+            // Fall back to the Pages copy, which only ever holds the latest run.
+            link = try std.fmt.allocPrint(arena, "{s}{s}/", .{ base_url, p.name });
+        }
+
         try embeds.append(arena, .{
             .title = try std.fmt.allocPrint(arena, "{s} · {d} connections", .{ p.name, p.connections }),
             .ref_rate = p.ref_rate,
-            .url = if (base_url.len > 0)
-                try std.fmt.allocPrint(arena, "{s}{s}/", .{ base_url, p.name })
-            else
-                "",
+            .url = link,
             .footer = try std.fmt.allocPrint(
                 arena,
                 "{s} · p50/p99 read at {d:.0} req/s · zrk 1.3.1",
@@ -493,13 +519,6 @@ pub fn notify(
             .rows = view.rows,
         });
 
-        if (view.html.len > 0) {
-            try files.append(arena, .{
-                .filename = try std.fmt.allocPrint(arena, "report-{s}.html", .{p.name}),
-                .content_type = "text/html",
-                .bytes = view.html,
-            });
-        }
     }
 
     if (embeds.items.len == 0) {
@@ -513,11 +532,8 @@ pub fn notify(
         .{ if (any_failed) "⚠" else "✅", runid },
     );
 
-    try discord.post(gpa, arena, io, env.webhook, content, embeds.items, files.items, dry_run);
-    std.debug.print("bench notify: posted {d} embed(s), {d} attachment(s)\n", .{
-        embeds.items.len,
-        files.items.len,
-    });
+    try discord.post(gpa, arena, io, env.webhook, content, embeds.items, &.{}, dry_run);
+    std.debug.print("bench notify: posted {d} embed(s)\n", .{embeds.items.len});
     return 0;
 }
 

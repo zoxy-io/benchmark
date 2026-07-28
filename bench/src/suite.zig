@@ -146,6 +146,31 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         return .{ .records = try records.toOwnedSlice(arena), .aborted = true };
     };
 
+    // --- cAdvisor: the measurement's CPU/memory source and its identity witness.
+    //
+    // It must be started EXPLICITLY. `compose --profile <p> up -d --wait <p>`
+    // names the service, so compose starts that service alone — cAdvisor sits in
+    // every proxy's profile but is never brought up by it. The bash driver had a
+    // separate step for this; dropping it cost a whole cloud run its CPU and
+    // memory data, and every proxy came back `degraded` for want of samples.
+    //
+    // Not fatal: throughput and latency are still sound without it, and the
+    // per-proxy `degraded` status already says the metrics are absent rather
+    // than zero.
+    _ = remote.check(
+        gpa,
+        arena,
+        io,
+        opts.fleet.proxyHost(),
+        "cadvisor up",
+        try std.fmt.allocPrint(arena, "cd {s} && {s} --profile monitoring up -d --wait cadvisor", .{
+            opts.fleet.remote_dir, opts.fleet.composeCmd(),
+        }),
+        deadline.start,
+    ) catch |e| {
+        redact.log("bench: cAdvisor did not start ({s}); CPU and memory will be absent", .{@errorName(e)});
+    };
+
     // --- backend: the origin every proxy forwards to.
     //
     // The bash driver tolerated a backend failure with `|| true` and then died

@@ -104,8 +104,16 @@ pub const Profile = struct {
 /// Shared ramp shape. Identical across profiles by design — the offered axis
 /// every chart shares depends on it, so only `connections` (and what that
 /// forces) differs between c1k and c10k.
+///
+/// At 100k req/s of 1 KiB bodies the offered load is ~820 Mbps, which is at or
+/// past what a 2-vCPU standard-v3 NIC sustains. That is deliberate: the ramp has
+/// to extend past every proxy's knee for the knee to be visible at all. But it
+/// does mean the `direct` baseline is expected to top out on the NETWORK rather
+/// than on the origin, so `direct` marks where the measurement rig itself
+/// saturates, not where nginx does — read a proxy against it, never as a
+/// fraction of line rate.
 const start_rate: u64 = 200;
-const max_rate: u64 = 50_000;
+const max_rate: u64 = 100_000;
 const ramp_seconds: u64 = 300;
 
 pub const c1k: Profile = .{

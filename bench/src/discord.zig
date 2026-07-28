@@ -131,6 +131,10 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
     }
     try w.writer.writeAll("```");
 
+    // The embed title is a link, but a bare URL under the table is what people
+    // actually click, and it survives being quoted or copied elsewhere.
+    if (e.url.len > 0) try w.writer.print("\n[full report]({s})", .{e.url});
+
     var out = w.toArrayList();
     return out.toOwnedSlice(arena);
 }
