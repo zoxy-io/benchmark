@@ -20,8 +20,15 @@ devenv.local.nix
 __pycache__/
 *.pyc
 
-# zrk-runner build artifacts (loadgen/zrk-runner/build.sh) — build.zig.zon
-# pins the zrk/zio deps, no committed lockfile-equivalent needed beyond that
+# zig build artifacts — build.zig.zon pins the zrk/zio deps, so no committed
+# lockfile-equivalent is needed beyond that. zig-pkg/ is a local `--system`
+# package dir (vendored copies of the pinned deps), not source.
+bench/.zig-cache/
+bench/zig-out/
+bench/zig-pkg/
+
+# zrk-runner build artifacts (loadgen/zrk-runner/build.sh) — being replaced by
+# bench/; removed in the Phase 7 cleanup
 loadgen/zrk-runner/.zig-cache/
 loadgen/zrk-runner/zig-out/
 loadgen/zrk-runner/zig-pkg/

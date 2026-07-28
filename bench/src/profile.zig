@@ -1,0 +1,216 @@
+//! Ramp profiles, compiled in.
+//!
+//! The old loadgen/zrk-runner read eleven parameters from the environment, each
+//! with a silent `catch default` fallback (its main.zig:45). That is how a real
+//! run ended up with `TIMEOUT_S=0` while .env.example documented 1, and nothing
+//! anywhere noticed. Ramp parameters are the fairness contract of this
+//! benchmark — "never compare runs with different MAX_RATE, RAMP_SECONDS or
+//! CONNECTIONS" — so they are constants here, and `validate()` runs before any
+//! measurement. An unknown profile name is a hard error, not a default.
+
+const std = @import("std");
+
+pub const Pair = struct { key: []const u8, value: []const u8 };
+
+pub const Profile = struct {
+    name: []const u8,
+
+    /// Open connections = in-flight concurrency cap (the open-loop guard; zrk
+    /// keeps one request in flight per connection).
+    connections: u32,
+    /// OS threads driving zrk's zio coroutine engine. Match the loadgen VM's
+    /// core count (cloud/variables.tf loadgen_cores), NOT `connections`.
+    threads: u8,
+
+    start_rate: u64,
+    max_rate: u64,
+    ramp_seconds: u64,
+
+    /// Per-request WIRE timeout (bytes-out -> bytes-in). A hung-connection
+    /// guard, NOT a bound on coordinated-omission latency: past saturation a
+    /// request waits for a free connection but completes fast once it has one,
+    /// so it never trips this while its scheduled->response latency balloons.
+    timeout_s: u64,
+
+    /// Coordinated-omission deadline (0 = off). A request already staler than
+    /// this is SHED BEFORE SENDING — never touches the wire, counted as
+    /// `deadline_errors`, never recorded in the histogram — so overload surfaces
+    /// as a bounded, directly comparable error rate instead of an unbounded tail.
+    ///
+    /// This is what keeps c10k's histogram off zrk's 60s ceiling
+    /// (zrk/src/stats.zig:35), where every tail percentile degenerates to
+    /// ">=60s". It also makes the proxies comparable at all: without it each
+    /// proxy's own timeout config decides the outcome (haproxy bounds an
+    /// exchange at 60s and returns 504s, zoxy has no request_ms configured,
+    /// pingora has no request timeout whatsoever).
+    ///
+    /// NEVER pair this with zrk's `deadline_abort`. That aborts requests already
+    /// on the wire by resetting the connection, which under saturation storms
+    /// the target with reconnects — we measured pingora/envoy/traefik blowing
+    /// from tens of MiB to 380-440 MiB and collapsing (2026-07-20). zrk made
+    /// shed-before-send the default precisely because of that report.
+    deadline_ms: u64,
+
+    req_path: []const u8,
+
+    /// SUMMARY-latency reference offered rate: a shared, light, sub-knee load
+    /// where a single per-proxy latency number is actually fair, because it
+    /// reflects per-request COST rather than standing-queue wait.
+    ///
+    /// Per-profile because the connect storm moves. On a 200->50000/300s ramp,
+    /// offered 2000 rps is t~=[8.4, 13.2]s — and at 10000 connections zrk is
+    /// still ESTABLISHING connections then (zrk/src/runner.zig:153-156 launches
+    /// them all at once), so a 2000 rps reading at c10k measures connection
+    /// setup, not proxying.
+    ref_rate: f64,
+    /// Merge windows with offered within +/-ref_band of ref_rate.
+    ref_band: f64,
+
+    cooldown_s: u64,
+
+    /// Per-profile proxy tuning, applied as environment to `docker compose`.
+    proxy_env: []const Pair,
+
+    pub fn validate(self: Profile) !void {
+        if (self.start_rate >= self.max_rate) return error.InvalidRampBounds;
+        if (self.ramp_seconds == 0) return error.InvalidRampSeconds;
+        if (self.connections == 0) return error.InvalidConnections;
+        if (self.threads == 0) return error.InvalidThreads;
+        // A zero wire timeout means "no hung-connection guard at all", which is
+        // exactly the misconfiguration the env-var plumbing used to produce.
+        if (self.timeout_s == 0) return error.InvalidTimeout;
+
+        // The reference rate must be reachable on this ramp and land after the
+        // t>=3 warmup exclusion, or every proxy reports a null latency.
+        const span: f64 = @floatFromInt(self.max_rate - self.start_rate);
+        const t_at_ref = (self.ref_rate - @as(f64, @floatFromInt(self.start_rate))) /
+            (span / @as(f64, @floatFromInt(self.ramp_seconds)));
+        if (t_at_ref < 3) return error.RefRateInsideWarmup;
+        if (self.ref_rate >= @as(f64, @floatFromInt(self.max_rate))) return error.RefRateAboveRamp;
+        if (self.ref_band <= 0 or self.ref_band >= 1) return error.InvalidRefBand;
+    }
+
+    pub fn timeoutNs(self: Profile) u64 {
+        return self.timeout_s * std.time.ns_per_s;
+    }
+    pub fn deadlineNs(self: Profile) u64 {
+        return self.deadline_ms * std.time.ns_per_ms;
+    }
+    pub fn durationNs(self: Profile) u64 {
+        return self.ramp_seconds * std.time.ns_per_s;
+    }
+};
+
+/// Shared ramp shape. Identical across profiles by design — the offered axis
+/// every chart shares depends on it, so only `connections` (and what that
+/// forces) differs between c1k and c10k.
+const start_rate: u64 = 200;
+const max_rate: u64 = 50_000;
+const ramp_seconds: u64 = 300;
+
+pub const c1k: Profile = .{
+    .name = "c1k",
+    .connections = 1000,
+    .threads = 4,
+    .start_rate = start_rate,
+    .max_rate = max_rate,
+    .ramp_seconds = ramp_seconds,
+    .timeout_s = 1,
+    .deadline_ms = 0,
+    .req_path = "/1k",
+    .ref_rate = 2000,
+    .ref_band = 0.20,
+    .cooldown_s = 8,
+    .proxy_env = &.{
+        // zoxy leases an upstream slot per admitted connection at saturation, so
+        // the stock 1024 upstream slots against 1000 offered connections leaves
+        // 2.4% headroom — close enough that zoxy could shed for a reason that
+        // has nothing to do with its proxying. Pin upstream to the conn_slots
+        // default so the two agree. (zoxy is fixing this default upstream.)
+        .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
+        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "1386" },
+    },
+};
+
+pub const c10k: Profile = .{
+    .name = "c10k",
+    .connections = 10_000,
+    .threads = 4,
+    .start_rate = start_rate,
+    .max_rate = max_rate,
+    .ramp_seconds = ramp_seconds,
+    .timeout_s = 1,
+    // One SLO, enforced by the loadgen, identical for every proxy. See the
+    // field docs above for why this is not optional at c10k.
+    .deadline_ms = 1000,
+    .req_path = "/1k",
+    // Past the connect storm: ~8000 rps is t~=47s on this ramp, by which point
+    // all 10k connections are long established.
+    .ref_rate = 8000,
+    .ref_band = 0.15,
+    .cooldown_s = 8,
+    .proxy_env = &.{
+        // The comptime ceiling for both, pinned equal as of zoxy #108. Without
+        // this zoxy sheds ~1/3 of responses by admission policy at 10k
+        // connections and the number measures the cap, not the proxy.
+        .{ .key = "ZOXY_CONN_SLOTS", .value = "11464" },
+        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "11464" },
+    },
+};
+
+pub const all = [_]Profile{ c1k, c10k };
+
+pub fn byName(name: []const u8) ?Profile {
+    for (all) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    return null;
+}
+
+test "every shipped profile validates" {
+    for (all) |p| try p.validate();
+}
+
+test "byName is exhaustive and rejects unknown names" {
+    try std.testing.expect(byName("c1k") != null);
+    try std.testing.expect(byName("c10k") != null);
+    try std.testing.expect(byName("") == null);
+    try std.testing.expect(byName("c100k") == null);
+}
+
+test "validate rejects the misconfigurations the env plumbing used to allow" {
+    var p = c1k;
+
+    // The real one: TIMEOUT_S parsed as 0 and nothing noticed.
+    p.timeout_s = 0;
+    try std.testing.expectError(error.InvalidTimeout, p.validate());
+
+    p = c1k;
+    p.max_rate = p.start_rate;
+    try std.testing.expectError(error.InvalidRampBounds, p.validate());
+
+    // A reference rate down in the warmup would silently null out every
+    // proxy's summary latency, since refHist excludes t<3.
+    p = c1k;
+    p.ref_rate = 250;
+    try std.testing.expectError(error.RefRateInsideWarmup, p.validate());
+
+    p = c1k;
+    p.ref_rate = @floatFromInt(p.max_rate);
+    try std.testing.expectError(error.RefRateAboveRamp, p.validate());
+}
+
+test "c10k carries a deadline and c1k does not" {
+    // c10k without a deadline is the configuration that produced
+    // p90=p99=p99_9=max=60014592us — a saturated histogram, not a measurement.
+    try std.testing.expect(c10k.deadline_ms > 0);
+    try std.testing.expectEqual(@as(u64, 0), c1k.deadline_ms);
+}
+
+test "profiles share one ramp shape so the offered axis is comparable" {
+    for (all) |p| {
+        try std.testing.expectEqual(start_rate, p.start_rate);
+        try std.testing.expectEqual(max_rate, p.max_rate);
+        try std.testing.expectEqual(ramp_seconds, p.ramp_seconds);
+    }
+}
