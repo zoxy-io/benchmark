@@ -151,7 +151,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
             opts.fleet.proxy_ip,
             try std.fmt.allocPrint(arena, "build {s}", .{name}),
             try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
-                opts.fleet.remote_dir, envPrefix(arena, p) catch "", compose_cmd, name, name,
+                opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", compose_cmd, name, name,
             }),
             deadline.build,
         ) catch {
@@ -233,7 +233,7 @@ fn runOne(
             opts.fleet.proxy_ip,
             try std.fmt.allocPrint(arena, "start {s}", .{name}),
             try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
-                opts.fleet.remote_dir, try envPrefix(arena, p), compose_cmd, name, name,
+                opts.fleet.remote_dir, try envPrefix(arena, p, opts.fleet), compose_cmd, name, name,
             }),
             deadline.start,
         );
@@ -490,9 +490,17 @@ fn teardownProxy(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: [
 
 const compose_cmd = "docker compose -f compose.yaml -f compose.cloud.yaml";
 
-/// Per-profile proxy tuning, as an environment prefix for `docker compose`.
-fn envPrefix(arena: Allocator, p: profile.Profile) ![]const u8 {
+/// Environment prefix for a remote `docker compose` invocation.
+///
+/// Carries BACKEND_IP as well as the profile's proxy tuning. compose.cloud.yaml
+/// interpolates it into every proxy's `extra_hosts` (zoxy does no DNS, so the
+/// origin must be an address literal) and into pingora's BACKEND_ADDR. Omitting
+/// it does not fail loudly — compose substitutes an empty string and each proxy
+/// starts with `extra_hosts: "backend:"`, so the failure surfaces much later as
+/// a warm probe that never gets a 200.
+fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "BACKEND_IP={s} ", .{fleet.backend_ip});
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
     }
@@ -547,12 +555,21 @@ test "isKnownProxy excludes direct, which has no container" {
     try std.testing.expect(!isKnownProxy("direct"));
 }
 
-test "envPrefix renders the profile's proxy tuning" {
+test "envPrefix carries BACKEND_IP as well as the profile's tuning" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const s = try envPrefix(arena, profile.c10k);
+    const fleet: Fleet = .{
+        .proxy_ip = "10.10.0.12",
+        .backend_ip = "10.10.0.13",
+        .ssh = .{ .key_path = "k", .known_hosts = "kh" },
+    };
+    const s = try envPrefix(arena, profile.c10k, fleet);
+
+    // Without this every proxy starts with extra_hosts "backend:" and fails its
+    // warm probe much later, with a symptom that does not name the cause.
+    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND_IP=10.10.0.13") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11464") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11464") != null);
 }

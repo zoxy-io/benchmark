@@ -8,7 +8,6 @@
 //!
 //! Subcommands and where each runs:
 //!   bench suite   --profile <name>   loadgen VM   drive every proxy, one ramp each
-//!   bench ramp    ...                loadgen VM   one proxy's ramp (re-exec'd by suite)
 //!   bench report  <rundir>           CI runner    rundir -> report.json + report.html
 //!   bench index   <rundir>           CI runner    -> _site/ (both profiles + trend)
 //!   bench notify  <rundir>           CI runner    -> Discord embed + attachment
@@ -38,7 +37,6 @@ const usage =
     \\usage: bench <command> [options]
     \\
     \\  suite   --profile <c1k|c10k> [--proxies a,b,c]   run the suite (loadgen VM)
-    \\  ramp    --profile <name> --proxy <name> ...      one ramp (loadgen VM)
     \\  report  <rundir>                                 render report.json + report.html
     \\  index   <rundir>                                 build the Pages site
     \\  notify  <rundir> [--dry-run]                     post to Discord

@@ -12,8 +12,7 @@ independently.
 | `bench sweep` | runner | Delete any instance labelled `bench=nightly` left over from a previous run |
 | `bench wait --runid <id>` | runner | Poll Object Storage for `DONE`/`FAILED`, streaming the uploaded log to stdout |
 | `bench fetch --runid <id> --out <dir>` | runner | Download the run's artifacts |
-| `bench suite --profile <name> [--proxies a,b,c]` | loadgen | Run every proxy's ramp for one profile |
-| `bench ramp --profile <name> --proxy <name> --target <url> ...` | loadgen | One proxy's ramp (re-exec'd by `suite`) |
+| `bench suite --profile <name> [--proxies a,b,c]` | loadgen | Run every proxy's ramp for one profile (calls the ramp in-process; there is no separate `ramp` subcommand) |
 | `bench report <dir> --profile <name>` | runner | `<dir>` → `report.json` + `report.html` |
 | `bench index <rundir> --out _site` | runner | Both profiles + trend chart → Pages site |
 | `bench notify <rundir> [--dry-run]` | runner | Discord embed + `report.html` attachments |

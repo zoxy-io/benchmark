@@ -1,10 +1,16 @@
 # proxy-bench
 
-Compares **zoxy** against **HAProxy**, **Envoy**, **Traefik**, **nginx** and
-**Pingora**: every proxy gets the *identical* linearly-growing **open-loop** load
-ramp until it stops keeping up, and the output is one HTML report overlaying
-**latency, CPU, memory and achieved req/s against offered load** — plus a live
-Grafana view while a run is in flight.
+Compares **zoxy** against **HAProxy** and **Pingora**: every proxy gets the
+*identical* linearly-growing **open-loop** load ramp until it stops keeping up,
+and the output is one self-contained HTML report overlaying **latency, CPU,
+memory and achieved req/s against offered load**.
+
+It runs **unattended every night** ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)):
+CI creates a throwaway three-VM fleet with no public addresses, the loadgen
+drives the whole suite itself, results come back through Object Storage, the
+fleet is destroyed, and the summary is posted to Discord and published to Pages.
+Envoy, Traefik and nginx keep their configs and can still be named explicitly,
+but are out of the nightly comparison.
 
 zoxy's phase-1 build adds an **HTTP (L7)** listener, so every proxy runs as an
 **HTTP/1.1 reverse proxy** (`mode http`, `http_connection_manager`, HTTP router,
@@ -15,18 +21,22 @@ end-to-end and the origin nginx is the HTTP endpoint, as before — now the
 proxies parse it too instead of tunnelling bytes.
 
 ```
-             0 ──────── linear ramp ────────► MAX_RATE
+             0 ──────── linear ramp ────────► MAX_RATE (50k)
         zrk ───────► proxy-under-test ───────────► nginx origin
- (open loop, CO-     (pinned cores, 512 MiB,       (canned 64B..100k
-  corrected)          ONE at a time)                bodies, 8x cpus)
-      │                       │ cAdvisor: cpu/mem per container
-      ├── /metrics ──► Prometheus ◄── scrape ───────┘
-      │  (bridged)         │
-      └── per-1s NDJSON     └─► Grafana (live)
+ (open loop, CO-     (pinned core, 512 MiB,        (canned 64B..100k
+  corrected)          ONE at a time)                bodies, 2x cpus)
+      │                       │
+      │                       └── cAdvisor :8081 ── sampled at 1Hz
+      │                            (cpu + working-set, into the run's
+      └── per-1s NDJSON             own artifacts — no Prometheus)
         + HdrHistogram
              │
-             └─► report/report.py  ── the artifact (report.html)
+             └─► bench report ── report.json + report.html
 ```
+
+All of that happens **inside the VPC**. The three VMs have no public IPs; the
+only things that cross the boundary are the payload going in and the results
+coming out, both through Object Storage.
 
 ## The design in five sentences
 
@@ -49,25 +59,34 @@ collapses the path), and a `direct` pseudo-proxy calibrates that the origin
 itself saturates above the proxies. **Local = plumbing, cloud = numbers**: quote the 3-VM cloud
 runs.
 
-## Run it in Yandex Cloud
+## Running it
+
+The nightly runs itself. One-time cloud setup — service accounts, the OIDC
+federation, the results bucket — is in [docs/SETUP.md](docs/SETUP.md); after
+that, use `workflow_dispatch` to trigger a run by hand.
+
+Two ramp profiles run in sequence, both across `direct, zoxy, haproxy, pingora`:
+
+| profile | connections | deadline | what it answers |
+|---|---|---|---|
+| `c1k` | 1 000 | — | how fast is each proxy at a healthy concurrency |
+| `c10k` | 10 000 | 1 s | how much of a 10k-connection schedule can each serve *within an SLO* |
+
+Locally you can work on everything except the load generation itself:
 
 ```sh
-cd cloud && cp terraform.tfvars.example terraform.tfvars   # fill in creds
-make cloud-up              # 3 VMs: loadgen 4c / proxy 2c / backend 4c, core_fraction=100
-make cloud-bench           # build zrk, ramp every proxy, write NDJSON + meta.json
-make report                # -> results/latest/report.html
-make cloud-down
+make build     # the bench binary (static musl)
+make test      # unit tests
+make gate      # prove bench's report matches report/report.py on archived runs
+make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
+make up/down   # the backend origin, for poking at a proxy by hand
 ```
 
-`cloud-bench` (`scripts/zrk-bench.sh`) reads the terraform inventory, ships
-the repo, brings up backend + monitoring, and for each proxy: brings it up,
-ramps it with `zrk` on the loadgen, pulls the per-1s NDJSON (+ whole-run
-HdrHistogram), tears it down. Live Grafana: **http://\<loadgen-ip\>:3000** →
-"Proxy bench — live run (zrk open-loop)". Run a subset with
-`make cloud-bench PROXIES="direct zoxy haproxy"`.
-
-Local `make up` / `make down` start/stop backend + prometheus + grafana for
-poking at the stack; the load driver itself is cloud-only.
+**Ramp parameters are not knobs.** They are compiled into
+[`bench/src/profile.zig`](bench/src/profile.zig), because the previous
+environment-variable plumbing had eleven values with silent fallbacks — which is
+how a real run executed with `TIMEOUT_S=0` against a documented `1` and nothing
+noticed.
 
 ## Fairness rules (what makes the numbers comparable)
 

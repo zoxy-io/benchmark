@@ -1,0 +1,521 @@
+# Nightly benchmark — an ephemeral, self-driving fleet.
+#
+# Build the harness, mint a short-lived cloud token from GitHub's OIDC
+# identity, drop the payload in Object Storage, create three VMs with no public
+# address, watch the run through the bucket, publish the report, and destroy the
+# fleet. Nothing long-lived is stored anywhere: no cloud key in the repo, no
+# remote terraform state, no VM that outlives the job.
+#
+# Three invariants this file exists to hold:
+#
+#  1. THE FLEET NEVER SURVIVES THE RUN. `tofu destroy` is `if: always()`, so it
+#     runs on success, on failure and on cancellation; `bench sweep` is the
+#     backstop for when destroy itself cannot (state lost, apply died before it
+#     could write state, token expired). The IAM token is re-minted immediately
+#     before teardown, because a 150-minute job outlives a one-hour token and a
+#     teardown that 401s is exactly the failure this design cannot tolerate.
+#
+#  2. NO ADDRESS REACHES THE LOG. This log is public. `tofu output` is
+#     sensitive, and nothing here reads one — but `apply`/`destroy` print the
+#     resource diff, which carries `ip_address` and the subnet CIDR in clear, so
+#     both are piped through an address scrubber. Never `cat` the state, never
+#     echo an output.
+#
+#  3. NO SECRET REACHES THE LOG. The IAM token and the Discord webhook are only
+#     ever passed through `env:`, never interpolated into a command line.
+#
+# See bench/CONTRACT.md for the `bench` CLI and the Object Storage layout, and
+# docs/SETUP.md for the one-time cloud setup this assumes already exists.
+
+name: nightly
+
+on:
+  # Nightly at 00:00 UTC. DELIBERATELY COMMENTED OUT until the first few manual
+  # `workflow_dispatch` runs come back clean end-to-end — fleet created, DONE
+  # written, report published, fleet destroyed, no orphans in the console. An
+  # unattended cron that can strand a three-VM fleet costs more than a missing
+  # night of data. Uncomment both lines to enable.
+  #
+  # schedule:
+  #   - cron: '0 0 * * *'
+
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
+        required: false
+        type: string
+        default: c1k,c10k
+      proxies:
+        description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
+        required: false
+        type: string
+        default: direct,zoxy,haproxy,pingora
+
+# `id-token: write` is needed TWICE over: once by the Yandex OIDC exchange in the
+# bench job, and once by actions/deploy-pages, which authenticates the deployment
+# with an OIDC token of its own. Job-level `permissions:` REPLACES this block
+# rather than merging with it, so every job below restates exactly what it needs.
+permissions:
+  contents: read
+  id-token: write
+  pages: write
+
+# One nightly at a time, and never cancel one that is in flight: cancelling
+# between `apply` and `destroy` is precisely how a fleet is left running. A
+# queued run waits instead.
+concurrency:
+  group: nightly-bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+
+    # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
+    # pingora a cargo build), then 2 profiles x 4 proxies x ~350 s ~= 47 min,
+    # plus fetch/report/publish. 150 leaves real headroom without letting a
+    # wedged run bill for hours. `bench wait` carries its own, tighter step
+    # timeout so that a loadgen which never writes DONE fails the STEP, leaving
+    # the teardown steps to run normally instead of being raced by a job-level
+    # cancellation.
+    timeout-minutes: 150
+
+    # No `pages:` here — this job never touches Pages, it only uploads an
+    # artifact for the deploy job to publish.
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      # Absolute, and NOT `./bench` — that path is the source directory.
+      BENCH: ${{ github.workspace }}/bin/bench
+
+      # `inputs` is null on a scheduled run, so every consumer needs the same
+      # fallback the dispatch form defaults to.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c10k' }}
+      BENCH_PROXIES: ${{ inputs.proxies || 'direct,zoxy,haproxy,pingora' }}
+
+      BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
+      YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID }}
+      YC_FOLDER_ID: ${{ vars.YC_FOLDER_ID }}
+      # The service account the CI job federates INTO (source of YC_TOKEN).
+      YC_CI_SA_ID: ${{ vars.YC_CI_SA_ID }}
+      # The service account ATTACHED to the instances — bucket access only, so
+      # a saturated benchmark host holds nothing worth stealing.
+      YC_VM_SA_ID: ${{ vars.YC_VM_SA_ID }}
+
+      # Read by `bench notify`. Never passed to a VM, never echoed.
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+    outputs:
+      runid: ${{ steps.meta.outputs.runid }}
+      # 'success' only when a Pages artifact was actually uploaded. The deploy
+      # job keys off this so it cannot fail on a night that produced no site.
+      site: ${{ steps.pages.outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          # Matches the devenv pin, which is what cloud/.terraform.lock.hcl was
+          # generated with. cloud/versions.tf only requires >= 1.6, but a
+          # floating version is one more thing that can plan differently between
+          # two runs of the same config.
+          tofu_version: 1.12.3
+          # The wrapper copies every tofu invocation's stdout and stderr into
+          # step outputs. Those streams carry the resource diff, and therefore
+          # addresses. Off.
+          tofu_wrapper: false
+
+      # ------------------------------------------------------------ identity --
+
+      - name: Pick the run id
+        id: meta
+        run: |
+          set -euo pipefail
+
+          # Fail here, before a single cloud call, rather than three steps later
+          # with a URL that has an empty bucket in it. All five are repo
+          # VARIABLES, not secrets — see docs/SETUP.md.
+          missing=()
+          for v in BENCH_BUCKET YC_CLOUD_ID YC_FOLDER_ID YC_CI_SA_ID YC_VM_SA_ID; do
+            [ -n "${!v:-}" ] || missing+=("$v")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::unset repository variables: ${missing[*]} (see docs/SETUP.md)"
+            exit 1
+          fi
+
+          # UTC, sortable, and inside cloud/variables.tf's runid validation
+          # (^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$) — it is a label, an object
+          # prefix AND a resource-name suffix. Generated ONCE and threaded
+          # through terraform and every bench invocation.
+          runid="$(date -u +%Y%m%d-%H%M%S)"
+          echo "runid=$runid" >> "$GITHUB_OUTPUT"
+          echo "run id: $runid"
+
+      # Exchanges the job's GitHub OIDC identity for a short-lived Yandex IAM
+      # token. There is NO static cloud key anywhere in this repo or in the
+      # repo's secrets — the trust is the federated credential bound to
+      # `repo:zoxy-io/benchmark:ref:refs/heads/main` (docs/SETUP.md).
+      - name: Exchange the GitHub OIDC token for a Yandex IAM token
+        id: iam
+        uses: yc-actions/yc-github-oidc@v1
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the IAM token
+        env:
+          TOKEN: ${{ steps.iam.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The action masks its own output; do it again rather than depend on
+          # that. `::add-mask::` does not print the value it is given.
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------------------- build --
+
+      - name: Build bench (static x86_64-linux-musl)
+        working-directory: bench
+        run: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+
+      - name: Stage the binary
+        run: |
+          set -euo pipefail
+          install -D -m 0755 bench/zig-out/bin/bench "$BENCH"
+          file "$BENCH" || true
+
+      # ---------------------------------------------------------- pre-flight --
+
+      # Anything labelled bench=nightly is an orphan from a run that died
+      # between apply and destroy: per-run terraform state lives in the runner
+      # workspace and dies with it, so the label is the only recovery path.
+      - name: Sweep orphaned fleets from previous runs
+        run: |
+          set -euo pipefail
+          "$BENCH" sweep
+
+      # payload.tar has to be in the bucket BEFORE apply: cloud-init's
+      # bench-payload pulls it on first boot and the loadgen unpacks it into
+      # ~/bench, which is the working directory the whole run executes from.
+      - name: Pack and upload payload.tar
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          rm -rf payload && mkdir -p payload
+
+          # The layout cloud-init extracts into ~/bench: the harness at the
+          # root (bench-drive runs `./bench suite`), both compose files beside
+          # it (`docker compose -f compose.yaml -f compose.cloud.yaml`), and the
+          # build contexts and bind-mounted configs those reference.
+          install -m 0755 "$BENCH" payload/bench
+          cp compose.yaml compose.cloud.yaml payload/
+          cp -a proxies backend payload/
+
+          tar -cf payload.tar -C payload .
+          echo "payload.tar: $(stat -c %s payload.tar) bytes"
+
+          # Yandex Object Storage accepts an IAM token directly — no SigV4, no
+          # static access key. Same call the VMs' bench-os makes.
+          curl -fsS --retry 3 --retry-connrefused \
+            -X PUT \
+            -H "Authorization: Bearer $YC_TOKEN" \
+            --data-binary @payload.tar \
+            "https://storage.yandexcloud.net/$BENCH_BUCKET/runs/$RUNID/payload.tar" \
+            -o /dev/null
+
+      # ---------------------------------------------------------- the fleet --
+
+      - name: tofu init
+        run: tofu -chdir=cloud init -input=false
+
+      # State is EPHEMERAL — it lives in this workspace and there is no remote
+      # backend on purpose (a nightly fleet has nothing to hand to the next run,
+      # and a shared backend is one more thing that can lock or leak).
+      #
+      # The diff prints `ip_address` and `v4_cidr_blocks` in clear, so the whole
+      # stream goes through a scrubber. `pipefail` keeps tofu's exit status;
+      # `sed -u` keeps it streaming so the console shows progress.
+      #
+      # The second expression is belt-and-braces. `metadata` should render as
+      # `(sensitive value)` — terraform propagates the tls provider's sensitive
+      # mark through templatefile(), and the rendered cloud-init carries the
+      # fleet's ssh host key (and, for the loadgen, its private identity). If
+      # that propagation ever stops holding, this catches it rather than
+      # publishing a private key to a public log.
+      - name: tofu apply
+        id: apply
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          tofu -chdir=cloud apply -auto-approve -input=false -no-color \
+            -var "runid=$RUNID" \
+            -var "cloud_id=$YC_CLOUD_ID" \
+            -var "folder_id=$YC_FOLDER_ID" \
+            -var "service_account_id=$YC_VM_SA_ID" \
+            -var "bench_bucket=$BENCH_BUCKET" \
+            -var "bench_profiles=$BENCH_PROFILES" \
+            -var "bench_proxies=$BENCH_PROXIES" \
+            2>&1 | sed -u -E \
+              -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
+              -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
+
+      # The VMs have no public address and nothing can dial in, so the bucket is
+      # the only window onto the run: `bench wait` polls for DONE/FAILED and
+      # streams the log object, which the loadgen re-uploads every ~30 s. The
+      # console therefore lags reality by about half a minute.
+      #
+      # "What if DONE is never written" is answered TWICE, and the inner answer
+      # is the one that should fire. `bench wait` carries its own deadlines
+      # (commands.WaitOptions: 110 min overall, 15 min for the first boot
+      # marker) and exits cleanly with a diagnosis. `timeout-minutes` here is a
+      # few minutes wider, so it only fires if `wait` ITSELF wedges — and it
+      # bounds the STEP rather than the job, because a job-level timeout cancels
+      # the job and races the teardown, whereas a step timeout leaves the
+      # `if: always()` steps below to run normally.
+      #
+      # Exit codes (bench/CONTRACT.md): 0 done, 3 the suite ran and reported
+      # failures, 1 it never booted or never finished.
+      - name: Wait for the run (streams the fleet's log)
+        id: wait
+        continue-on-error: true
+        timeout-minutes: 115
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          "$BENCH" wait --runid "$RUNID"
+
+      - name: Fetch the results
+        id: fetch
+        continue-on-error: true
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          "$BENCH" fetch --runid "$RUNID" --out results
+
+      # ------------------------------------------------------------ teardown --
+
+      # As early as it can possibly be: everything after this point is rendering
+      # and publishing, which needs no fleet. Placed BEFORE the report steps so a
+      # slow render is not billed as three guaranteed-vCPU VMs.
+
+      # A federated IAM token is short-lived and this job may have been running
+      # for well over an hour by now. Re-mint before teardown — a destroy that
+      # fails on an expired token leaves the fleet up, which is the one outcome
+      # that is not allowed. Failure here is tolerated: the old token may still
+      # be good, and destroy should get its chance either way.
+      - name: Re-mint the IAM token for teardown
+        id: iam_teardown
+        if: always()
+        continue-on-error: true
+        uses: yc-actions/yc-github-oidc@v1
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the teardown token
+        if: always() && steps.iam_teardown.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.iam_teardown.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # `if: always()` covers success, failure AND cancellation. Same scrubber as
+      # apply. `continue-on-error` so that a teardown failure still reaches the
+      # sweep backstop below instead of ending the job here.
+      - name: tofu destroy
+        id: destroy
+        if: always()
+        continue-on-error: true
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          if [ ! -f cloud/terraform.tfstate ]; then
+            echo "no terraform state in the workspace — nothing was created"
+            exit 0
+          fi
+          tofu -chdir=cloud destroy -auto-approve -input=false -no-color \
+            -var "runid=$RUNID" \
+            -var "cloud_id=$YC_CLOUD_ID" \
+            -var "folder_id=$YC_FOLDER_ID" \
+            -var "service_account_id=$YC_VM_SA_ID" \
+            -var "bench_bucket=$BENCH_BUCKET" \
+            -var "bench_profiles=$BENCH_PROFILES" \
+            -var "bench_proxies=$BENCH_PROXIES" \
+            2>&1 | sed -u -E \
+              -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
+              -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
+
+      # Last line of defence. Deletes by the bench=nightly label, which is what
+      # the label is for. NOTE: it deletes every fleet carrying that label, so a
+      # laptop-driven run in the same folder would go with it — see docs/SETUP.md.
+      - name: Sweep the fleet (backstop for a failed destroy)
+        if: always() && steps.destroy.outcome != 'success'
+        run: |
+          set -euo pipefail
+          echo "destroy did not succeed — sweeping by label so nothing survives"
+          "$BENCH" sweep
+
+      # ------------------------------------------------------------- publish --
+
+      - name: Render the per-profile reports
+        id: report
+        if: always() && steps.fetch.outcome == 'success'
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
+          for p in "${profiles[@]}"; do
+            "$BENCH" report "results/$RUNID/$p" --profile "$p"
+          done
+
+      # deploy-pages replaces the site wholesale, so the trend chart's history
+      # lives IN the published site and has to be carried forward by hand:
+      # download the currently-published history.ndjson, hand it to `bench
+      # index`, which re-emits it with tonight's rows appended. Skip this and
+      # every night's trend chart shows exactly one night.
+      #
+      # Best-effort by design — the first ever run has no site to read, and a
+      # 404 must not be a failure.
+      - name: Fetch the published history
+        id: history
+        if: always() && steps.report.outcome == 'success'
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          repo="${GITHUB_REPOSITORY#*/}"
+          base="https://${owner}.github.io/${repo}/"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+          # A custom Pages domain would make this the wrong URL; the trend just
+          # restarts, nothing else breaks. --max-time so a hanging CDN cannot
+          # eat the budget.
+          if curl -fsS --max-time 60 -o history.ndjson "${base}history.ndjson"; then
+            echo "carried forward $(wc -l < history.ndjson) history row(s)"
+          else
+            echo "no published history yet (first run, or Pages not live) — starting fresh"
+            : > history.ndjson
+          fi
+
+      - name: Build the Pages site
+        id: index
+        if: always() && steps.report.outcome == 'success'
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -euo pipefail
+          "$BENCH" index "results/$RUNID" --out _site --history history.ndjson
+
+      # results/ is gitignored, so THIS is the durable store for a night's raw
+      # data — 90 days of NDJSON, histograms and cAdvisor samples. Everything
+      # else (Pages, Discord) is a rendering of it.
+      - name: Upload the run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ steps.meta.outputs.runid }}
+          path: results/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload the Pages artifact
+        id: pages
+        if: always() && steps.index.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      # --history gives each row its change against the previous night;
+      # --base-url makes each embed link at the published profile page.
+      - name: Notify Discord
+        if: always() && steps.report.outcome == 'success'
+        continue-on-error: true
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+          BASE_URL: ${{ steps.history.outputs.base }}
+        run: |
+          set -euo pipefail
+          # No webhook configured (a fork, or a first run) — render and validate
+          # the post without sending it, rather than failing the night.
+          dry=()
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK is unset — dry run"
+            dry=(--dry-run)
+          fi
+          "$BENCH" notify "results/$RUNID" \
+            --history history.ndjson \
+            --base-url "$BASE_URL" \
+            "${dry[@]}"
+
+      # ---------------------------------------------------------- the verdict --
+
+      # Everything above is `continue-on-error` so that teardown and publishing
+      # always get their turn. The job's success or failure is decided here,
+      # once, from what actually happened.
+      - name: Verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          bad=0
+          for pair in \
+            "wait:${{ steps.wait.outcome }}" \
+            "fetch:${{ steps.fetch.outcome }}" \
+            "report:${{ steps.report.outcome }}" \
+            "index:${{ steps.index.outcome }}" \
+            "destroy:${{ steps.destroy.outcome }}"
+          do
+            name="${pair%%:*}"; outcome="${pair#*:}"
+            echo "$name: $outcome"
+            case "$outcome" in
+              success|skipped) ;;
+              *) bad=1 ;;
+            esac
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::the nightly run did not complete cleanly"
+            exit 1
+          fi
+
+  # A separate job because actions/deploy-pages needs `pages: write` plus its own
+  # `id-token: write`, and because Pages must not be able to fail the benchmark:
+  # `continue-on-error` at the JOB level keeps a Pages outage off the workflow's
+  # result, and the `needs.bench.outputs.site` gate keeps it from even trying on
+  # a night that produced no site.
+  deploy:
+    needs: bench
+    if: always() && needs.bench.outputs.site == 'success'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 10
+
+    # Restated in full: job-level permissions REPLACE the workflow block, they do
+    # not merge with it. `id-token: write` is deploy-pages' own requirement.
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
