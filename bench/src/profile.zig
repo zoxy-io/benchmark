@@ -112,6 +112,21 @@ pub const Profile = struct {
 /// than on the origin, so `direct` marks where the measurement rig itself
 /// saturates, not where nginx does — read a proxy against it, never as a
 /// fraction of line rate.
+/// The zoxy ref every profile builds. `main` ON PURPOSE: the nightly exists to
+/// catch a regression the morning after it lands, so each night must build
+/// whatever main is at the time. Points on the trend chart are deliberately
+/// different commits, and `zoxy_commit` in profile.json records which one
+/// produced each — that is what makes a regression bisectable.
+///
+/// Passed explicitly rather than left to compose's `${ZOXY_REF:-main}` default,
+/// so a floating build is a stated intent rather than something that happens
+/// because nobody set the variable.
+///
+/// A floating ref only means anything if the clone is actually fresh — see the
+/// cache-bust in proxies/zoxy/Dockerfile, without which "main" silently means
+/// "whatever main was when the layer was first built".
+pub const zoxy_ref = "main";
+
 const start_rate: u64 = 200;
 const max_rate: u64 = 100_000;
 const ramp_seconds: u64 = 300;

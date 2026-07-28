@@ -328,15 +328,29 @@ fn runOne(
             const info = std.mem.trim(u8, res.stdout, " \n\r\t");
             if (info.len > 0) {
                 build_info = info;
-                if (std.mem.indexOf(u8, info, "BASELINE") != null) {
+                // Every proxy targets a generic baseline, matching the stock
+                // upstream images in the comparison. A NATIVE build is the
+                // anomaly: it would hand that proxy the host's AVX2/AVX-512
+                // against others running SSE2.
+                if (std.mem.indexOf(u8, info, "NATIVE") != null) {
                     try notes.append(arena, try std.fmt.allocPrint(
                         arena,
-                        "built for a BASELINE cpu ({s}) — not comparable to a natively-built proxy",
+                        "built for the host CPU ({s}) — an unfair advantage over the baseline-built proxies",
                         .{info},
                     ));
                 }
             }
-        } else |_| {}
+        } else |_| {
+            // No descriptor means a stock upstream image rather than one built
+            // here. Those are compiled for a generic x86-64 baseline so they run
+            // anywhere, which is a real disadvantage against a proxy built with
+            // the host's CPU features — haproxy:3.0-alpine carries zero AVX
+            // instructions where zoxy and pingora both get AVX2/AVX-512. Say so
+            // rather than leaving the field null and the asymmetry invisible.
+            // Matches what the proxies built here target, so this is expected
+            // rather than a problem — recorded so the parity is checkable.
+            build_info = "stock upstream image (generic x86-64 baseline)";
+        }
 
         if (std.mem.eql(u8, name, "zoxy")) {
             // Record which commit actually ran. The Dockerfile caches its git
@@ -351,6 +365,11 @@ fn runOne(
                 "docker exec zoxy cat /etc/zoxy/zoxy-commit",
                 deadline.inspect,
             )) |res| {
+                // The resolved HEAD of the image that actually ran, not the ref
+                // that was requested. With a floating `main` these differ every
+                // night by design, and this is the only record of which commit
+                // produced tonight's numbers — so a regression on the trend
+                // chart can be bisected to a range of zoxy commits.
                 zoxy_commit = std.mem.trim(u8, res.stdout, " \n\r\t");
             } else |_| {
                 try notes.append(arena, "could not read the running zoxy image's commit");
@@ -598,6 +617,9 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet) ![]const u8 {
     // Only the cloud overlay interpolates BACKEND_IP; locally the proxies reach
     // the origin by its compose service name over docker DNS.
     if (!fleet.isLocal()) try buf.print(arena, "BACKEND_IP={s} ", .{fleet.backend_ip});
+    // Without this, compose falls back to `${ZOXY_REF:-main}` and builds a
+    // floating main rather than the pinned commit — see profile.zig's note.
+    try buf.print(arena, "ZOXY_REF={s} ", .{profile.zoxy_ref});
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
     }

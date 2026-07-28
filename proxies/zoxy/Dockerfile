@@ -53,9 +53,24 @@ RUN case "$BUILDARCH" in \
        | tar -xJ -C /opt \
     && ln -s /opt/zig-*/zig /usr/local/bin/zig
 
+# Cache-bust keyed on what $ZOXY_REF currently POINTS AT, not on its name.
+#
+# The nightly builds `main` on purpose — the whole point is to catch a zoxy
+# regression the morning after it lands. But a bare `git clone` layer caches on
+# the command string, and "main" never changes as a string, so every subsequent
+# build would reuse the first checkout and the benchmark would quietly measure a
+# frozen commit forever while reporting it as main.
+#
+# `ADD` of a URL re-fetches on every build and busts the cache exactly when its
+# CONTENT changes — so the clone is reused while main is unchanged and redone
+# the moment it moves. Cheap and precise, where --no-cache would also throw away
+# the zig toolchain download.
+ADD https://api.github.com/repos/zoxy-io/zoxy/commits/$ZOXY_REF /tmp/zoxy-head.json
+
 RUN git clone https://github.com/zoxy-io/zoxy /src \
     && git -C /src checkout "$ZOXY_REF" \
-    && git -C /src rev-parse HEAD > /zoxy-commit
+    && git -C /src rev-parse HEAD > /zoxy-commit \
+    && echo "built zoxy $ZOXY_REF -> $(cat /zoxy-commit)"
 
 WORKDIR /src
 # Benchmark override: bump the relay-buffer pool (only the declaration line,
@@ -102,23 +117,40 @@ ARG ZOXY_OPTIMIZE=ReleaseFast
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for
 # quotable numbers.
-# The branch taken is RECORDED, not just chosen. A baseline fallback handicaps
-# zoxy against proxies that build native (pingora uses -C target-cpu=native), and
-# without this the difference is invisible: the run completes, the report renders,
-# and the number is simply wrong. `bench suite` reads this into profile.json so a
-# fairness violation shows up in the artifact rather than nowhere.
-RUN if [ "$BUILDARCH" = "$TARGETARCH" ]; then \
-        zig build -Doptimize=$ZOXY_OPTIMIZE; \
-        echo "native $ZOXY_OPTIMIZE (host cpu features)" > /zoxy-build; \
-    else \
-        case "$TARGETARCH" in \
-            amd64) ztarget=x86_64-linux-gnu ;; \
-            arm64) ztarget=aarch64-linux-gnu ;; \
-            *) echo "unsupported target arch: $TARGETARCH" >&2; exit 1 ;; \
-        esac \
-        && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget" \
-        && echo "cross $ZOXY_OPTIMIZE $ztarget (BASELINE cpu — not comparable to a native build)" > /zoxy-build; \
-    fi
+# BASELINE cpu target, always — never `-mcpu=native`.
+#
+# The comparison includes haproxy, which ships as the stock upstream image and is
+# therefore compiled for a generic x86-64 baseline with no AVX at all. Building
+# zoxy with the host's AVX2/AVX-512 while haproxy runs SSE2 would hand zoxy a
+# large advantage that has nothing to do with its proxying, so every proxy here
+# targets the same generic baseline — which is also what a package or registry
+# image gives you in practice.
+#
+# The effective target is RECORDED either way. `bench suite` reads it into
+# profile.json, so if this ever drifts back to native the artifact says so rather
+# than the run completing and the number simply being wrong.
+# Built exactly as zoxy's own release workflow builds it:
+#
+#   zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+#
+# That means the benchmark measures the artifact users actually download, and it
+# settles the CPU-parity question for free: a named target implies a BASELINE cpu
+# model, matching haproxy's stock upstream image (a generic x86-64 build with no
+# AVX at all). Building zoxy with the host's AVX2/AVX-512 while haproxy runs SSE2
+# would be a large advantage that has nothing to do with proxying.
+#
+# Static musl also removes the system-OpenSSL link that made a native build
+# awkward to pin to a baseline cpu.
+#
+# The effective target is RECORDED, so if this ever drifts the artifact says so
+# rather than the run completing with a quietly incomparable number.
+RUN case "$TARGETARCH" in \
+        amd64) ztarget=x86_64-linux-musl ;; \
+        arm64) ztarget=aarch64-linux-musl ;; \
+        *) echo "unsupported target arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget" \
+    && echo "release-parity $ZOXY_OPTIMIZE $ztarget (baseline cpu)" > /zoxy-build
 
 FROM debian:bookworm-slim
 COPY --from=build /src/zig-out/bin/zoxy /usr/local/bin/zoxy

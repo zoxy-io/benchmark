@@ -125,6 +125,10 @@ services:
         UPSTREAM_SLOTS_MAX: ${UPSTREAM_SLOTS_MAX:-}
         CONN_SLOTS_MAX: ${CONN_SLOTS_MAX:-}
         HEAD_BYTES_MAX_KIB: ${HEAD_BYTES_MAX_KIB:-}
+        # Generic baseline for every proxy, so the comparison is not decided by
+        # which of them happened to be compiled for this exact CPU. Override to
+        # `native` only if you also build haproxy from source.
+        ZOXY_TARGET_CPU: ${ZOXY_TARGET_CPU:-baseline}
     # tag carries every override so each variant is a distinct image (forces
     # rebuild; recorded in runs.json versions)
     image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}${RELAY_BUFFERS_MAX:+-rb${RELAY_BUFFERS_MAX}}${UPSTREAM_SLOTS_MAX:+-us${UPSTREAM_SLOTS_MAX}-cs${CONN_SLOTS_MAX}}${HEAD_BYTES_MAX_KIB:+-hb${HEAD_BYTES_MAX_KIB}}
@@ -192,6 +196,8 @@ services:
     # worker thread; UPSTREAM is resolved once at startup and pooled/kept alive.
     build:
       context: ./proxies/pingora
+      args:
+        PINGORA_TARGET_CPU: ${PINGORA_TARGET_CPU:-x86-64}
     image: zoxy-bench/pingora-http:0.8
     container_name: pingora
     profiles: [pingora]

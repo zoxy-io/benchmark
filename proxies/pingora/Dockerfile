@@ -12,11 +12,16 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
-# Compile for the BUILD host's exact CPU — native SIMD (AVX2 + AVX-512 on the
-# Icelake proxy VM), parity with zoxy, which zig builds `-mcpu=native` in this
-# same spot. The image is built on the very VM it runs on, so native is both
-# safe and fair. Set PINGORA_TARGET_CPU=x86-64 for a generic/baseline build.
-ARG PINGORA_TARGET_CPU=native
+# Generic x86-64 baseline, NOT native. The comparison includes haproxy, which is
+# the stock upstream image and therefore a baseline build with no AVX at all —
+# giving pingora and zoxy the host's AVX2/AVX-512 while haproxy runs SSE2 would
+# be a large, one-sided advantage that has nothing to do with proxying.
+#
+# Baseline is also the honest default for this comparison: it is what a package
+# or a registry image actually gives you. Set PINGORA_TARGET_CPU=native to
+# measure peak achievable performance instead — but then build haproxy from
+# source too, or the numbers are not comparable.
+ARG PINGORA_TARGET_CPU=x86-64
 # Recorded for the same reason zoxy records its target: the comparison is only
 # fair if both were built for the same CPU, and that has to be checkable from the
 # run's artifacts rather than inferred from a Dockerfile.
