@@ -102,20 +102,28 @@ ARG ZOXY_OPTIMIZE=ReleaseFast
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for
 # quotable numbers.
+# The branch taken is RECORDED, not just chosen. A baseline fallback handicaps
+# zoxy against proxies that build native (pingora uses -C target-cpu=native), and
+# without this the difference is invisible: the run completes, the report renders,
+# and the number is simply wrong. `bench suite` reads this into profile.json so a
+# fairness violation shows up in the artifact rather than nowhere.
 RUN if [ "$BUILDARCH" = "$TARGETARCH" ]; then \
         zig build -Doptimize=$ZOXY_OPTIMIZE; \
+        echo "native $ZOXY_OPTIMIZE (host cpu features)" > /zoxy-build; \
     else \
         case "$TARGETARCH" in \
             amd64) ztarget=x86_64-linux-gnu ;; \
             arm64) ztarget=aarch64-linux-gnu ;; \
             *) echo "unsupported target arch: $TARGETARCH" >&2; exit 1 ;; \
         esac \
-        && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget"; \
+        && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget" \
+        && echo "cross $ZOXY_OPTIMIZE $ztarget (BASELINE cpu — not comparable to a native build)" > /zoxy-build; \
     fi
 
 FROM debian:bookworm-slim
 COPY --from=build /src/zig-out/bin/zoxy /usr/local/bin/zoxy
 COPY --from=build /zoxy-commit /etc/zoxy/zoxy-commit
+COPY --from=build /zoxy-build /etc/zoxy/build-info
 # zoxy (libxev) rejects hostname endpoints — the entrypoint resolves the
 # `backend` upstream once at container start and renders the IP literal into
 # /etc/zoxy/config.json from the mounted template (see entrypoint.sh).

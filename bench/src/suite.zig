@@ -285,6 +285,7 @@ fn runOne(
 
     var notes: std.ArrayList([]const u8) = .empty;
     var zoxy_commit: ?[]const u8 = null;
+    var build_info: ?[]const u8 = null;
 
     const target = if (direct)
         try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ip, p.req_path })
@@ -311,6 +312,31 @@ fn runOne(
         // up, and with a healthcheck it gates on that container being healthy —
         // neither rules out a second, leftover container also bound to the port.
         try assertOnlyProxy(gpa, arena, io, opts.fleet, name);
+
+        // How this image was compiled. Every proxy that records it gets read;
+        // a mismatch in target CPU across proxies is a fairness violation that
+        // is otherwise invisible in the numbers.
+        if (remote.check(
+            gpa,
+            arena,
+            io,
+            opts.fleet.proxyHost(),
+            "build info",
+            try std.fmt.allocPrint(arena, "docker exec {s} cat /etc/{s}/build-info", .{ name, name }),
+            deadline.inspect,
+        )) |res| {
+            const info = std.mem.trim(u8, res.stdout, " \n\r\t");
+            if (info.len > 0) {
+                build_info = info;
+                if (std.mem.indexOf(u8, info, "BASELINE") != null) {
+                    try notes.append(arena, try std.fmt.allocPrint(
+                        arena,
+                        "built for a BASELINE cpu ({s}) — not comparable to a natively-built proxy",
+                        .{info},
+                    ));
+                }
+            }
+        } else |_| {}
 
         if (std.mem.eql(u8, name, "zoxy")) {
             // Record which commit actually ran. The Dockerfile caches its git
@@ -418,6 +444,7 @@ fn runOne(
         .saturated = outcome.saturated,
         .cadvisor_samples = outcome.cadvisor_samples,
         .zoxy_commit = zoxy_commit,
+        .build_info = build_info,
         .notes = try notes.toOwnedSlice(arena),
     };
 }

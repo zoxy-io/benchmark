@@ -17,13 +17,18 @@ COPY src ./src
 # same spot. The image is built on the very VM it runs on, so native is both
 # safe and fair. Set PINGORA_TARGET_CPU=x86-64 for a generic/baseline build.
 ARG PINGORA_TARGET_CPU=native
+# Recorded for the same reason zoxy records its target: the comparison is only
+# fair if both were built for the same CPU, and that has to be checkable from the
+# run's artifacts rather than inferred from a Dockerfile.
 RUN RUSTFLAGS="-C target-cpu=${PINGORA_TARGET_CPU}" cargo build --release \
-    && strip target/release/pingora-http
+    && strip target/release/pingora-http \
+    && echo "release target-cpu=${PINGORA_TARGET_CPU}" > /pingora-build
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/pingora-http /usr/local/bin/pingora-http
+COPY --from=build /pingora-build /etc/pingora/build-info
 # LISTEN / UPSTREAM come from compose env; worker threads are hardcoded to 1.
 ENTRYPOINT ["/usr/local/bin/pingora-http"]

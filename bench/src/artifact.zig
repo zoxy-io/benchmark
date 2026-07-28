@@ -88,6 +88,15 @@ pub const ProxyRecord = struct {
     /// because the Dockerfile caches its git clone, so a floating ref can
     /// silently be an older commit than requested.
     zoxy_commit: ?[]const u8 = null,
+    /// How the image was compiled — optimisation mode and target CPU, read from
+    /// the image's own /etc/<proxy>/build-info.
+    ///
+    /// The comparison is only fair if every proxy was built for the same CPU.
+    /// zoxy falls back to a BASELINE target when the build and target
+    /// architectures differ, while pingora always builds `target-cpu=native`;
+    /// that mismatch would handicap zoxy by a wide margin and leave no trace
+    /// anywhere, since the run completes and the report renders normally.
+    build_info: ?[]const u8 = null,
     notes: []const []const u8 = &.{},
 };
 
@@ -242,6 +251,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
 
         try j.key("zoxy_commit");
         if (r.zoxy_commit) |c| try j.string(c) else try j.nullValue();
+        try j.key("build_info");
+        if (r.build_info) |b| try j.string(b) else try j.nullValue();
 
         try j.key("notes");
         try j.beginArray();
