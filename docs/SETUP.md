@@ -381,26 +381,35 @@ see the site until you are running from `main`.
 The `schedule:` trigger in `.github/workflows/nightly.yml` is commented out.
 Leave it that way until the sequence below is clean.
 
-### The branch caveat, first, because it will stop you
+### Merge to `main` first — you have no choice, and it is also the easy path
 
-The federated credential is bound to
-`repo:zoxy-io/benchmark:ref:refs/heads/main`. **A `workflow_dispatch` run from
-any other branch will not get a token.** The `aud`/`sub` check fails at the
-exchange step, which is the *first* cloud interaction — so it fails cheaply,
-before anything is created, but it does fail. Two options:
+Two constraints point the same way:
 
-* Merge the workflow to `main` and test from there (preferred: it is the path
-  the cron will actually take), or
-* temporarily add a second federated credential for the test branch, and
-  **delete it when you are done**:
+* **GitHub only offers "Run workflow" for a `workflow_dispatch` workflow that
+  exists on the DEFAULT branch.** While `nightly.yml` lives only on a feature
+  branch, the button does not appear at all and there is nothing to click.
+* **The federated credential is bound to
+  `repo:zoxy-io/benchmark:ref:refs/heads/main`**, so a dispatch from any other
+  branch fails the `sub` check at the token exchange — the *first* cloud
+  interaction, so it fails cheaply, before anything is created, but it fails.
 
-  ```sh
-  yc iam workload-identity federated-credential create \
-    --service-account-id "$CI_SA_ID" --federation-id "$FED_ID" \
-    --external-subject-id "repo:zoxy-io/benchmark:ref:refs/heads/nightly-bench"
-  # ... test ...
-  yc iam workload-identity federated-credential delete <credential-id>
-  ```
+Merging is safe: the `schedule:` trigger is commented out, so landing the
+workflow on `main` starts nothing. Merge, then dispatch from `main`, and both
+constraints are satisfied at once with no temporary credential.
+
+If you really must run from a branch after the workflow is on `main` (say, to
+iterate on the driver), add a second federated credential for it and **delete it
+when you are done** — it is a standing grant to spend cloud money from an
+unreviewed branch:
+
+```sh
+yc iam workload-identity federated-credential create \
+  --service-account-id "$CI_SA_ID" --federation-id "$FED_ID" \
+  --external-subject-id "repo:zoxy-io/benchmark:ref:refs/heads/nightly-bench"
+# ... test, then: ...
+yc iam workload-identity federated-credential list --service-account-id "$CI_SA_ID"
+yc iam workload-identity federated-credential delete <credential-id>
+```
 
 ### Smoke run — smallest useful shape
 
