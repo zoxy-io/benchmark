@@ -1,45 +1,64 @@
 # proxy-bench — one open-loop linear ramp per proxy on Yandex Cloud.
 #
-#   make cloud-up    terraform apply the fleet (loadgen + proxy + backend)
-#   make cloud-bench build + ramp every proxy (zrk); writes NDJSON + report
-#   make report      render results/latest -> report.html
-#   make cloud-down  terraform destroy
-#   make up / down   local: start/stop backend + prometheus + grafana
+# The benchmark itself runs as an unattended nightly (.github/workflows/
+# nightly.yml): CI creates an ephemeral fleet with no public IPs, the loadgen
+# drives itself, results come back through Object Storage, and the fleet is
+# destroyed. These targets are the local/manual half of that.
 #
-# Knobs live in .env (copy .env.example); PROXIES / MAX_RATE / RAMP_SECONDS /
-# CONNECTIONS override per-invocation: make cloud-bench PROXIES=zoxy
+#   make build       build the bench binary (static musl)
+#   make test        bench unit tests
+#   make gate        prove bench's report matches report/report.py on real runs
+#   make report      render results/latest -> report.json + report.html
+#   make up / down   local: start/stop the backend origin
+#
+# Ramp parameters are NOT knobs any more — they are compiled into
+# bench/src/profile.zig as the c1k and c10k profiles, because eleven env vars
+# with silent fallbacks is how a real run ended up with TIMEOUT_S=0 against a
+# documented 1 and nothing noticed.
 
 SHELL := bash
 .ONESHELL:
 .SHELLFLAGS := -euo pipefail -c
 
-TF ?= tofu
+ZIG ?= zig
+ZIG_TARGET ?= x86_64-linux-musl
+# The vendored copies of the pinned zrk/zio packages, so a build needs no network.
+ZIG_PKG ?= zig-pkg
+PROFILE ?= c1k
+RUN ?= results/latest
 
-.PHONY: help up down report cloud-up cloud-bench cloud-down clean
+.PHONY: help build test gate report up down clean
 
 help:
-	@sed -n '3,7p' $(MAKEFILE_LIST)
+	@sed -n '8,13p' $(MAKEFILE_LIST)
 
+build:
+	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) --system $(ZIG_PKG)
+	@echo "built bench/zig-out/bin/bench ($(ZIG_TARGET))"
+
+test:
+	cd bench && $(ZIG) build test --system $(ZIG_PKG) --summary all
+
+# The Phase 0 gate: diff `bench report` against report/report.py over real run
+# directories. This is the only proof that the Zig port of the measurement math
+# is correct, so report/*.py stays until a live nightly has validated the new
+# path end to end. It stubs Prometheus (report.py crashes without one, and that
+# fleet is gone) and works on copies, so archived runs are never modified.
+gate:
+	python3 bench/tools/gate.py $(wildcard results/zrk-2026*)
+
+report:
+	cd bench && $(ZIG) build --system $(ZIG_PKG)
+	bench/zig-out/bin/bench report $(RUN) --profile $(PROFILE)
+
+# The origin alone — enough to poke at a proxy by hand. There is no monitoring
+# profile any more: Prometheus and Grafana are gone, and the driver samples the
+# proxy's cAdvisor directly into each run's artifacts.
 up:
-	docker compose --profile monitoring --profile backend up -d --wait
-	@echo "grafana: http://localhost:3000  prometheus: http://localhost:9090"
+	docker compose --profile backend up -d --wait
 
 down:
 	docker compose --profile '*' down
 
-cloud-up:
-	$(TF) -chdir=cloud init -input=false
-	$(TF) -chdir=cloud apply -auto-approve
-
-cloud-bench:
-	./scripts/zrk-bench.sh
-
-# uses the prometheus URL recorded in the run's meta.json (override: PROM_URL=...)
-report:
-	python3 report/report.py results/latest
-
-cloud-down:
-	$(TF) -chdir=cloud destroy -auto-approve
-
 clean:
-	rm -rf results/* .env.cloud monitoring/targets/cloud
+	rm -rf results/* .env.cloud bench/zig-out bench/.zig-cache

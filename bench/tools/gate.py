@@ -152,7 +152,18 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     failed = 0
+    checked = 0
     for d in dirs:
+        # Some archived run dirs hold only a meta.json — a run that died before
+        # its first result file landed. There is nothing to compare, and
+        # report.py exits non-zero on them, so skip rather than fail.
+        if not glob.glob(os.path.join(d, "*.ndjson")):
+            print(f"skip {d}  (no ndjson)")
+            continue
+        if not os.path.exists(os.path.join(d, "meta.json")):
+            print(f"skip {d}  (no meta.json)")
+            continue
+        checked += 1
         # Both generators write report.json INTO the run dir, so work on a copy
         # of the inputs. Overwriting the originals would destroy the recorded
         # `mem` and `series.cpu` — the one thing in an archived run that cannot
@@ -190,7 +201,7 @@ def main():
             print(f"ok   {d}  ({n} proxies)")
 
     srv.shutdown()
-    print(f"\n{len(dirs) - failed}/{len(dirs)} run dirs match")
+    print(f"\n{checked - failed}/{checked} run dirs match")
     return 1 if failed else 0
 
 
