@@ -378,8 +378,10 @@ see the site until you are running from `main`.
 
 ## 7. Testing before you enable the cron
 
-The `schedule:` trigger in `.github/workflows/nightly.yml` is commented out.
-Leave it that way until the sequence below is clean.
+The `schedule:` trigger in `.github/workflows/nightly.yml` is **enabled** —
+nightly at 00:00 UTC. If you are setting this up fresh, comment it out until the
+sequence below is clean; an unattended cron is a poor place to discover a broken
+credential.
 
 ### Merge to `main` first — you have no choice, and it is also the easy path
 

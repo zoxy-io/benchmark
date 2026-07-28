@@ -30,14 +30,17 @@
 name: nightly
 
 on:
-  # Nightly at 00:00 UTC. DELIBERATELY COMMENTED OUT until the first few manual
-  # `workflow_dispatch` runs come back clean end-to-end — fleet created, DONE
-  # written, report published, fleet destroyed, no orphans in the console. An
-  # unattended cron that can strand a three-VM fleet costs more than a missing
-  # night of data. Uncomment both lines to enable.
+  # Nightly at 00:00 UTC. GitHub runs scheduled workflows on a best-effort basis
+  # and commonly fires them 5-30 minutes late, which is immaterial here.
   #
-  # schedule:
-  #   - cron: '0 0 * * *'
+  # What makes an unattended cron safe is that teardown does not depend on the
+  # run succeeding: `tofu destroy` is `if: always()` with a freshly re-minted IAM
+  # token, and `bench sweep` runs both as a backstop after a failed destroy and
+  # at the start of the next run — which is the only thing that covers the runner
+  # itself dying. A failed night therefore costs a red run and ~15 minutes of
+  # three VMs, not a stranded fleet.
+  schedule:
+    - cron: '0 0 * * *'
 
   workflow_dispatch:
     inputs:
