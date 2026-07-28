@@ -211,7 +211,7 @@ yc iam workload-identity federated-credential create \
 Two details that decide whether this works at all:
 
 * **`--audiences` must equal the `aud` claim the workflow's ID token carries.**
-  `yc-actions/yc-github-oidc` requests GitHub's default audience, which is the
+  `yc-actions/yc-iam-token-fed` requests GitHub's default audience, which is the
   repository *owner* URL — `https://github.com/zoxy-io`. If the exchange comes
   back with an audience mismatch, read the `aud` claim the action actually
   requested and set `--audiences` to that. Do **not** widen it to a wildcard;
@@ -230,7 +230,7 @@ yc iam workload-identity federated-credential list --service-account-id "$CI_SA_
 ### Fallback if the action does not work
 
 The exchange is a plain OAuth 2.0 token exchange, so it can be done with `curl`
-if `yc-actions/yc-github-oidc@v1` turns out not to fit. Replace the two token
+if the action turns out not to fit. Replace the two token
 steps in the workflow with:
 
 ```sh

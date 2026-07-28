@@ -168,7 +168,7 @@ jobs:
       # `repo:zoxy-io/benchmark:ref:refs/heads/main` (docs/SETUP.md).
       - name: Exchange the GitHub OIDC token for a Yandex IAM token
         id: iam
-        uses: yc-actions/yc-github-oidc@v1
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
         with:
           yc-sa-id: ${{ vars.YC_CI_SA_ID }}
 
@@ -321,7 +321,7 @@ jobs:
         id: iam_teardown
         if: always()
         continue-on-error: true
-        uses: yc-actions/yc-github-oidc@v1
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
         with:
           yc-sa-id: ${{ vars.YC_CI_SA_ID }}
 
