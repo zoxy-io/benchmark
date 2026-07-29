@@ -388,9 +388,29 @@ jobs:
         run: |
           set -euo pipefail
           IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
+          # Render what the run actually produced, not what it was asked to.
+          #
+          # A profile that never finished has no directory, and rendering it
+          # used to abort the whole step under `set -e` — so a run cut short
+          # during c10k threw away the c1k report that had rendered perfectly
+          # well, which is exactly what uploading results per-profile exists to
+          # prevent. Run #9 lost a clean c1k that way.
+          rendered=0
           for p in "${profiles[@]}"; do
+            if [ ! -f "results/$RUNID/$p/profile.json" ]; then
+              echo "no artifacts for $p — skipping (the run did not get that far)"
+              continue
+            fi
             "$BENCH" report "results/$RUNID/$p" --profile "$p"
+            rendered=$((rendered + 1))
           done
+          # Nothing at all is still a failure: there is no report to publish and
+          # the downstream steps would build an empty site.
+          if [ "$rendered" -eq 0 ]; then
+            echo "::error::no profile produced artifacts — nothing to publish"
+            exit 1
+          fi
+          echo "rendered $rendered of ${#profiles[@]} profile(s)"
 
       # deploy-pages replaces the site wholesale, so the trend chart's history
       # lives IN the published site and has to be carried forward by hand:

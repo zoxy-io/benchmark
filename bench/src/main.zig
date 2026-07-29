@@ -257,8 +257,22 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
 
     // profile.json is what `bench suite` writes; meta.json is the bash
     // harness's, kept working so archived run dirs still render.
+    //
+    // Neither present is the ordinary shape of a truncated run — the profile
+    // never got far enough to write one — so say that, with the path. A bare
+    // `error: FileNotFound` sent me looking for a corrupt artifact when the
+    // directory simply was not there, and it names neither the file nor the
+    // fact that `<dir>` must be the PROFILE directory, not the run directory.
     const meta = readProfileMeta(arena, io, run_dir) catch
-        try readMeta(arena, io, run_dir);
+        readMeta(arena, io, run_dir) catch {
+            std.debug.print(
+                "bench report: no profile.json in {s} — this profile produced no artifacts " ++
+                    "(a run that was cut short), or <dir> is the run directory rather than " ++
+                    "<run>/<profile>\n",
+                .{run_dir},
+            );
+            exit(2);
+        };
     const ordered = try report.orderPresent(arena, meta.proxies);
 
     const inputs = try arena.alloc(report.ProxyInput, ordered.len);
