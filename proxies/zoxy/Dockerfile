@@ -23,8 +23,11 @@ RUN case "$BUILDARCH" in \
         arm64) zigarch=aarch64 ;; \
         *) echo "unsupported build arch: $BUILDARCH" >&2; exit 1 ;; \
     esac \
-    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${zigarch}-linux-${ZIG_VERSION}.tar.xz" \
-       | tar -xJ -C /opt \
+    && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 \
+       -o /tmp/zig.tar.xz \
+       "https://ziglang.org/download/${ZIG_VERSION}/zig-${zigarch}-linux-${ZIG_VERSION}.tar.xz" \
+    && tar -xJf /tmp/zig.tar.xz -C /opt \
+    && rm -f /tmp/zig.tar.xz \
     && ln -s /opt/zig-*/zig /usr/local/bin/zig
 
 # Cache-bust keyed on what $ZOXY_REF currently POINTS AT, not on its name.

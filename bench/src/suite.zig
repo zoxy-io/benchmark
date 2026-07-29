@@ -381,6 +381,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
 
         // A cache hit skips the build entirely. Only for proxies whose image is
         // a pure function of the repo — see `cacheableImage`.
+        // `|| true` so a MISS is not logged as a failure: `remote.check` reports
+        // any non-zero exit, and an empty cache is the normal state on the first
+        // run with a given key. The marker file is what says "hit".
         const restored = if (cacheableImage(name)) |tag|
             remote.check(
                 gpa,
@@ -388,13 +391,21 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
                 io,
                 opts.fleet.proxyHost(),
                 try std.fmt.allocPrint(arena, "cache restore {s}", .{name}),
-                try std.fmt.allocPrint(arena, "bench-image-cache restore {s} {s}", .{ name, tag }),
+                try std.fmt.allocPrint(
+                    arena,
+                    "bench-image-cache restore {s} {s} && echo HIT || true",
+                    .{ name, tag },
+                ),
                 deadline.inspect,
             ) catch null
         else
             null;
+        const cache_hit = if (restored) |r|
+            std.mem.indexOf(u8, r.stdout, "HIT") != null
+        else
+            false;
 
-        if (restored == null) {
+        if (!cache_hit) {
             _ = remote.check(
                 gpa,
                 arena,
@@ -428,7 +439,17 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         const secs = @as(f64, @floatFromInt(
             t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds,
         )) / std.time.ns_per_s;
-        redact.log("bench: [{s}] built in {d:.0}s", .{ name, secs });
+        // Say which it was. "built in 167s" after a FAILED build is how run #21
+        // read, which is worse than silence.
+        if (build_failed.contains(name)) {
+            redact.log("bench: [{s}] BUILD FAILED after {d:.0}s", .{ name, secs });
+        } else {
+            redact.log("bench: [{s}] {s} in {d:.0}s", .{
+                name,
+                if (cache_hit) "restored from cache" else "built",
+                secs,
+            });
+        }
     }
 
     // --- the measurement loop.
