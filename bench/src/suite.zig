@@ -323,13 +323,24 @@ fn runOne(
         // How this image was compiled. Every proxy that records it gets read;
         // a mismatch in target CPU across proxies is a fairness violation that
         // is otherwise invisible in the numbers.
+        //
+        // Only proxies built here write the descriptor, so its ABSENCE is the
+        // normal case for a stock image, not an error. The `|| true` matters:
+        // without it a missing file exits 1 and gets logged as
+        // "bench: build info failed (exit 1)", which reads like haproxy broke
+        // when nothing did. An empty read is the signal, and a real error is
+        // then only a transport failure worth hearing about.
         if (remote.check(
             gpa,
             arena,
             io,
             opts.fleet.proxyHost(),
             "build info",
-            try std.fmt.allocPrint(arena, "docker exec {s} cat /etc/{s}/build-info", .{ name, name }),
+            try std.fmt.allocPrint(
+                arena,
+                "docker exec {s} cat /etc/{s}/build-info 2>/dev/null || true",
+                .{ name, name },
+            ),
             deadline.inspect,
         )) |res| {
             const info = std.mem.trim(u8, res.stdout, " \n\r\t");
@@ -346,17 +357,19 @@ fn runOne(
                         .{info},
                     ));
                 }
+            } else {
+                // Stock upstream image rather than one built here. Those are
+                // compiled for a generic x86-64 baseline so they run anywhere —
+                // haproxy:3.0-alpine carries zero AVX where a native build of
+                // zoxy or pingora would get AVX2/AVX-512. That matches what the
+                // proxies built here now target, so it is expected rather than a
+                // problem; recorded so the parity stays checkable.
+                build_info = "stock upstream image (generic x86-64 baseline)";
             }
         } else |_| {
-            // No descriptor means a stock upstream image rather than one built
-            // here. Those are compiled for a generic x86-64 baseline so they run
-            // anywhere, which is a real disadvantage against a proxy built with
-            // the host's CPU features — haproxy:3.0-alpine carries zero AVX
-            // instructions where zoxy and pingora both get AVX2/AVX-512. Say so
-            // rather than leaving the field null and the asymmetry invisible.
-            // Matches what the proxies built here target, so this is expected
-            // rather than a problem — recorded so the parity is checkable.
-            build_info = "stock upstream image (generic x86-64 baseline)";
+            // Could not run the probe at all (ssh/docker failure), which is
+            // different from the file being absent and should stay visible.
+            try notes.append(arena, "could not read the image's build descriptor");
         }
 
         if (std.mem.eql(u8, name, "zoxy")) {
