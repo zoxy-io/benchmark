@@ -110,17 +110,29 @@ variable "image_id" {
   EOT
 }
 
-# Sizing: the proxy container is capped to 1 CPU (one zoxy process), so the
-# proxy VM is 2 cores — core 0 for the proxy, core 1 left free for OS/cAdvisor
-# and hypervisor-steal absorption. backend gets 2x the proxy so the origin is
-# never the bottleneck; loadgen hosts open-loop generation + prometheus + grafana.
+# Sizing: the proxy container is capped to 1 CPU on cpuset 0 (compose.cloud.yaml)
+# whatever the VM has, so core count does NOT change what the proxy under test
+# gets. Spare cores buy two things instead: the OS, dockerd, sshd and cAdvisor are
+# unpinned, so more of them stay off core 0, and `docker build` — which runs HERE,
+# driven over ssh — gets to use them.
+#
+# That build is most of a nightly. The fleet is ephemeral, so there is no layer
+# cache and zoxy is compiled from source every run: measured at ~13 min of a
+# 37-min four-proxy run, against 5-min ramps. haproxy, a stock image, builds in 1s.
+#
+# CAVEAT worth re-checking after any change here: Yandex standard-v3 scales the
+# NETWORK allowance with vCPU count, and that is benchmark-visible. Proxied
+# traffic crosses this NIC twice (loadgen->proxy->backend and back), so at 24.9k
+# rps of 1 KiB zoxy was already pushing ~408 Mbps through it. If proxy numbers
+# RISE after this bump, they were NIC-limited before and the old ones were not
+# measuring the proxy.
 variable "proxy_cores" {
   type    = number
-  default = 2
+  default = 4
 }
 variable "proxy_memory" {
   type    = number
-  default = 4
+  default = 8
 }
 variable "backend_cores" {
   type    = number
