@@ -198,6 +198,21 @@ services:
 
 
 
+  envoy:
+    <<: *proxy-common
+    image: envoyproxy/envoy:v1.33-latest
+    container_name: envoy
+    profiles: [envoy]
+    # --concurrency 1: envoy sizes its worker threads from the visible CPU count,
+    # not the cgroup quota, so on a 4-core VM it would start four workers inside a
+    # 1-CPU box. Every proxy here is pinned to one worker.
+    command: ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "1"]
+    volumes:
+      - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8080:8080"
+    healthcheck: *healthcheck-bash
+
   pingora:
     <<: *proxy-common
     # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a

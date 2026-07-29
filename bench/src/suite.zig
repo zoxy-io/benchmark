@@ -435,6 +435,35 @@ fn runOne(
         try std.fmt.allocPrint(arena, "http://{s}:8080{s}", .{ opts.fleet.proxy_ip, p.req_path });
 
     if (!direct) {
+        // What the PREVIOUS proxy left behind on the proxy host, before this one
+        // takes over. Bounded and best-effort — a diagnostic must never be able
+        // to fail a run.
+        //
+        // haproxy completed a c10k ramp STANDALONE in run #19 and then wedged as
+        // the third proxy in run #20, at c1k, which it had passed comfortably
+        // before. So something accumulates across proxies. The loadgen is ruled
+        // out — its census at the abort was 1004 established, `tw 2`, no port
+        // pressure at all — and the proxy host is where nothing is visible.
+        // `tw` here is the count that matters: this host makes an UPSTREAM
+        // connection per client connection, so it burns ephemeral ports too, and
+        // the cooldown between proxies is 8s against a 60s TIME_WAIT.
+        if (remote.check(
+            gpa,
+            arena,
+            io,
+            opts.fleet.proxyHost(),
+            "sockets before start",
+            "cat /proc/net/sockstat",
+            deadline.inspect,
+        )) |res| {
+            var lines = std.mem.splitScalar(u8, res.stdout, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, line, "TCP:")) {
+                    redact.log("bench: [{s}] proxy host {s}", .{ name, line });
+                }
+            }
+        } else |_| {}
+
         enter(stage, .start, name);
         _ = try remote.check(
             gpa,

@@ -24,7 +24,7 @@ const Point = analysis.Point;
 /// Display order for the summary table and every series list. Proxies present in
 /// the run but not named here follow, in the order the run recorded them.
 pub const proxy_order = [_][]const u8{
-    "zoxy", "haproxy", "pingora", "direct",
+    "zoxy", "haproxy", "pingora", "envoy", "direct",
 };
 
 /// Dark-ground hues (zoxy.io palette): zoxy is the amber signal, the rest are
@@ -33,6 +33,7 @@ pub const palette = [_]struct { name: []const u8, hex: []const u8 }{
     .{ .name = "zoxy", .hex = "#fb9e0e" },
     .{ .name = "haproxy", .hex = "#38bdf8" },
     .{ .name = "pingora", .hex = "#f472b6" },
+    .{ .name = "envoy", .hex = "#a78bfa" },
     .{ .name = "direct", .hex = "#6d7385" },
 };
 

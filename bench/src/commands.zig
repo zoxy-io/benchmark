@@ -293,7 +293,7 @@ pub fn parseProxies(arena: Allocator, spec: []const u8) ![]const []const u8 {
 }
 
 const all_proxies = [_][]const u8{
-    "direct", "zoxy", "haproxy", "pingora",
+    "direct", "zoxy", "haproxy", "pingora", "envoy",
 };
 
 fn knownProxy(name: []const u8) bool {
@@ -326,10 +326,12 @@ test "parseProxies rejects a typo rather than silently dropping it" {
 test "parseProxies rejects proxies whose configs were removed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // envoy/traefik/nginx were deleted rather than parked. Naming one must fail
-    // here — at argument parsing, with the name in the message — rather than
-    // later as a compose service that does not exist.
-    try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "envoy"));
+    // traefik/nginx were deleted rather than parked. Naming one must fail here —
+    // at argument parsing, with the name in the message — rather than later as a
+    // compose service that does not exist. envoy came BACK (its config was
+    // restored from git history and re-verified end to end), which is why it is
+    // no longer in this list.
+    try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "traefik"));
     try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "nginx"));
 }
 

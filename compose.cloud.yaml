@@ -38,6 +38,12 @@ services:
 
 
 
+  envoy:
+    <<: *host-net
+    cpuset: "0"
+    extra_hosts:
+      - "backend:${BACKEND_IP}"
+
   pingora:
     <<: *host-net
     cpuset: "0"
