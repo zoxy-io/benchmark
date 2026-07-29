@@ -169,7 +169,13 @@ write_files:
       LOG=/home/ubuntu/bench.log
       # A terminal marker was written by THIS script. bench-postmortem checks it
       # so it only speaks when the script never got the chance to.
-      TERMINAL=/run/bench-terminal
+      #
+      # Under $HOME, NOT /run: the unit runs as User=ubuntu and /run is
+      # root-owned, so `: > /run/bench-terminal` failed with "Permission denied"
+      # on every run. The sentinel was therefore never written, and the
+      # post-mortem spoke even when the suite had reported for itself — it would
+      # have appended FAILED after a perfectly good DONE.
+      TERMINAL=/home/ubuntu/.bench-terminal
       exec > >(tee -a "$LOG") 2>&1
 
       fail() {
@@ -287,7 +293,7 @@ write_files:
       set -uo pipefail
       set -a; . /etc/bench/env; set +a
 
-      TERMINAL=/run/bench-terminal
+      TERMINAL=/home/ubuntu/.bench-terminal
       LOG=/home/ubuntu/bench.log
       [ -e "$TERMINAL" ] && exit 0
 
