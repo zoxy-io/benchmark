@@ -109,7 +109,26 @@ fn raiseAfter(io: Io, flag: *std.atomic.Value(bool), ns: u64) void {
     flag.store(true, .monotonic);
 }
 
-pub fn run(gpa: Allocator, arena: Allocator, opts: Options) !Outcome {
+/// One proxy's ramp.
+///
+/// Everything here is allocated from a RAMP-SCOPED arena, not the caller's.
+///
+/// The caller's arena is `init.arena` — it lives for the whole process and is
+/// never reset, and this function builds a zio Runtime whose stack pool is one
+/// coroutine per connection. At c10k that is 2.7 GiB, and `rt.deinit()` merely
+/// hands it back to an arena that releases nothing, so every proxy's ramp added
+/// another 2.7 GiB for the rest of the run. Measured: direct 2.73 GiB, then
+/// haproxy 5.34 GiB, and on the fleet the third allocation OOM-killed an 8 GB
+/// loadgen mid-ramp — which looked for days like a hang in zoxy or zio, because
+/// a SIGKILLed process writes no marker and no watchdog output.
+///
+/// `Outcome` is scalars only, so nothing here outlives the call.
+pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
+    _ = caller_arena;
+    var ramp_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer ramp_arena_state.deinit();
+    const arena = ramp_arena_state.allocator();
+
     const p = opts.prof;
     try p.validate();
 
