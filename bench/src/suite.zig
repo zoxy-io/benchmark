@@ -302,9 +302,17 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     // cache during the previous proxy's cooldown. Building everything up front
     // costs the same wall clock and removes that coupling. A build failure marks
     // just that proxy and the others proceed.
+    // Timed and announced, because this is where the wall clock actually goes.
+    // Measured on run #16: 18 of its 37 minutes elapsed before the first request
+    // was sent, and NOTHING was logged in that window — the ramps themselves
+    // were exactly the 5 minutes they are configured to be. The fleet is
+    // ephemeral, so there is no docker layer cache and zoxy is rebuilt from
+    // source (git clone + zig ReleaseFast) on a 2-core VM every single run.
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
         if (isDirect(name)) continue;
+        redact.log("bench: [{s}] building", .{name});
+        const t0 = Io.Timestamp.now(io, .awake);
         _ = remote.check(
             gpa,
             arena,
@@ -318,6 +326,10 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         ) catch {
             try build_failed.put(arena, name, {});
         };
+        const secs = @as(f64, @floatFromInt(
+            t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds,
+        )) / std.time.ns_per_s;
+        redact.log("bench: [{s}] built in {d:.0}s", .{ name, secs });
     }
 
     // --- the measurement loop.
