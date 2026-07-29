@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const zrk = @import("zrk");
 
 const artifact = @import("artifact.zig");
 const profile = @import("profile.zig");
@@ -513,8 +514,12 @@ pub fn notify(
             .url = link,
             .footer = try std.fmt.allocPrint(
                 arena,
-                "{s} · p50/p99 read at {d:.0} req/s · zrk 1.3.1",
-                .{ runid, p.ref_rate },
+                // The load generator that produced these numbers, read from the
+                // package actually linked in. It was a hardcoded "zrk 1.3.1"
+                // literal, so the footer kept asserting a version whatever was
+                // built — provenance that quietly goes stale is worse than none.
+                "{s} · p50/p99 read at {d:.0} req/s · zrk {s}",
+                .{ runid, p.ref_rate, zrk.cli.version },
             ),
             .rows = view.rows,
         });
