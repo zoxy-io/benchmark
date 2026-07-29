@@ -154,12 +154,16 @@ write_files:
       set -a; . /etc/bench/env; set +a
 
       LOG=/home/ubuntu/bench.log
+      # A terminal marker was written by THIS script. bench-postmortem checks it
+      # so it only speaks when the script never got the chance to.
+      TERMINAL=/run/bench-terminal
       exec > >(tee -a "$LOG") 2>&1
 
       fail() {
         echo "FAILED: $*"
         bench-os put log "$LOG" || true
         bench-os say FAILED "$*" || true
+        : > "$TERMINAL" || true
         exit 1
       }
 
@@ -240,13 +244,56 @@ write_files:
       # profile.json. Anything else means the suite itself broke.
       if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
         bench-os say DONE "rc=$rc"
+        : > "$TERMINAL" || true
       else
         bench-os say FAILED "suite exited $rc"
+        : > "$TERMINAL" || true
       fi
       exit $rc
 
   # A unit rather than a backgrounded runcmd, so the whole run lands in the
   # journal and can be pulled off a host that never reached DONE.
+  # Speaks only when bench-drive did NOT — i.e. when it was killed rather than
+  # finishing. Every terminal path in that script writes $TERMINAL after saying
+  # DONE/FAILED, so an absent sentinel means it never reached its own reporting.
+  #
+  # This is the gap that hid the c10k memory leak for a whole day: the kernel
+  # OOM-killed `bench` mid-ramp, and a SIGKILLed process writes no marker, no
+  # watchdog line and no log. From the runner that is indistinguishable from a
+  # hang, so `bench wait` polled a corpse until the step timed out, five runs
+  # running. The evidence was on the serial console the entire time:
+  #
+  #     Out of memory: Killed process 5452 (bench) anon-rss:7664524kB
+  #
+  # Runs with `+`, i.e. as root regardless of User=ubuntu, because dmesg is
+  # restricted and the whole point is to capture why the kernel intervened.
+  - path: /usr/local/bin/bench-postmortem
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+      set -a; . /etc/bench/env; set +a
+
+      TERMINAL=/run/bench-terminal
+      LOG=/home/ubuntu/bench.log
+      [ -e "$TERMINAL" ] && exit 0
+
+      {
+        echo
+        echo "=== bench-drive died without writing a terminal marker ==="
+        echo "SERVICE_RESULT=$${SERVICE_RESULT:-?} EXIT_CODE=$${EXIT_CODE:-?} EXIT_STATUS=$${EXIT_STATUS:-?}"
+        echo "--- memory at death ---"
+        free -m 2>/dev/null
+        echo "--- kernel OOM verdicts ---"
+        dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -5
+        echo "--- unit journal, last 40 ---"
+        journalctl -u bench-suite.service --no-pager -n 40 2>/dev/null
+      } >> "$LOG" 2>&1
+
+      bench-os put log "$LOG" || true
+      bench-os say FAILED "bench-drive died: $${SERVICE_RESULT:-unknown} $${EXIT_STATUS:-}" || true
+      : > "$TERMINAL" || true
+
   - path: /etc/systemd/system/bench-suite.service
     content: |
       [Unit]
@@ -262,6 +309,10 @@ write_files:
       WorkingDirectory=/home/ubuntu/bench
       EnvironmentFile=/etc/bench/env
       ExecStart=/usr/local/bin/bench-drive
+      # `+` runs it as root despite User=ubuntu: dmesg is restricted, and a
+      # kernel OOM verdict is exactly what this needs to capture. Runs on EVERY
+      # exit, and is a no-op unless bench-drive died without reporting.
+      ExecStopPost=+/usr/local/bin/bench-postmortem
       # limits.d is pam_limits, which a unit never goes through: without these
       # two lines the c10k profile hits systemd's 1024 default and the run looks
       # like a proxy failure instead of a harness failure.
