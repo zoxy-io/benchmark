@@ -180,6 +180,54 @@ const ProxyWatchdog = struct {
                 redact.log("bench: sockets: {s}", .{line});
             }
         }
+        logEstablished();
+    }
+
+    /// How many of those sockets are actually ESTABLISHED.
+    ///
+    /// `inuse` above counts TCP sockets in ANY state, which is not the same
+    /// thing and is the distinction that decides what the c10k stall IS:
+    ///
+    ///   CurrEstab ~= the offered connections -> both ends alive, stuck
+    ///                mid-exchange, and the generator is not unwinding.
+    ///   CurrEstab low, `inuse` high        -> the peer already closed and
+    ///                these are CLOSE_WAIT sockets the generator never reaped.
+    ///
+    /// The second is not a remote possibility: haproxy is configured with
+    /// `timeout client 60s` and `timeout http-keep-alive 60s`, so a healthy
+    /// haproxy closes an idle connection a minute after the ramp ends — roughly
+    /// 500 seconds before this watchdog fires.
+    fn logEstablished() void {
+        var buf: [4096]u8 = undefined;
+        const fd = std.os.linux.open("/proc/net/snmp", .{ .ACCMODE = .RDONLY }, 0);
+        const signed: isize = @bitCast(fd);
+        if (signed < 0) return;
+        const handle: i32 = @intCast(fd);
+        defer _ = std.os.linux.close(handle);
+
+        const n = std.os.linux.read(handle, &buf, buf.len);
+        const got: isize = @bitCast(n);
+        if (got <= 0) return;
+
+        // Two "Tcp:" lines — the header names the columns, the next holds the
+        // values. Find CurrEstab's index in the first, read it from the second.
+        var col: ?usize = null;
+        var lines = std.mem.splitScalar(u8, buf[0..@intCast(got)], '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "Tcp:")) continue;
+            var fields = std.mem.tokenizeAny(u8, line, " \t");
+            var i: usize = 0;
+            while (fields.next()) |f| : (i += 1) {
+                if (col) |want| {
+                    if (i == want) {
+                        redact.log("bench: sockets: TCP CurrEstab {s}", .{f});
+                        return;
+                    }
+                } else if (std.mem.eql(u8, f, "CurrEstab")) {
+                    col = i;
+                }
+            }
+        }
     }
 };
 
