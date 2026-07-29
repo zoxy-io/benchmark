@@ -45,8 +45,23 @@ pub const Client = struct {
         return std.fmt.bufPrint(buf, "Bearer {s}", .{self.token});
     }
 
-    /// Every `fetch` MUST be given a `response_writer`, even when the body is
-    /// of no interest.
+    /// Every `fetch` MUST be given a `response_writer` AND `keep_alive = false`,
+    /// even when the body is of no interest.
+    ///
+    /// `keep_alive = false` is what keeps a reply whose body has no discoverable
+    /// end from hanging the client forever. `exists` uses HEAD, which answers
+    /// with a `content-length` and no body at all, and the client will sit
+    /// waiting for bytes that are never sent unless the connection closes. The
+    /// same defect showed up against Discord's 204 (see discord.zig) and is
+    /// reproducible against httpbingo.org/status/204.
+    ///
+    /// This is not theoretical here: `bench wait` polls `exists` for the
+    /// DONE/FAILED markers every 30s, so one hung HEAD freezes the whole poll
+    /// loop — no marker check, no stall detection, no deadline, nothing until
+    /// the workflow's own step timeout. Nightly run #9 burned 71 minutes that
+    /// way, silently.
+    ///
+    /// Requests here are one-per-poll, so pooling was never worth anything.
     ///
     /// Without one, std.http.Client takes an internal discard path that
     /// segfaults in `Reader.discardRemaining`. It does not reproduce in a Debug
@@ -106,6 +121,7 @@ pub const Client = struct {
             .headers = .{ .authorization = .{ .override = auth } },
             .extra_headers = extra.items,
             .response_writer = &discard.writer,
+            .keep_alive = false,
         });
         if (res.status != .ok and res.status != .created) {
             std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
@@ -139,6 +155,7 @@ pub const Client = struct {
             .payload = body,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &discard.writer,
+            .keep_alive = false,
         });
         if (res.status != .ok and res.status != .created) {
             // The status alone — a storage error body can echo request content.
@@ -166,6 +183,7 @@ pub const Client = struct {
             .method = .GET,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &body.writer,
+            .keep_alive = false,
         });
         if (res.status == .not_found) return null;
         if (res.status != .ok) {
@@ -193,6 +211,7 @@ pub const Client = struct {
             .method = .HEAD,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &discard.writer,
+            .keep_alive = false,
         });
         return res.status == .ok;
     }
@@ -215,6 +234,7 @@ pub const Client = struct {
             .method = .GET,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &body.writer,
+            .keep_alive = false,
         });
         if (res.status != .ok) return error.ListInstancesFailed;
 
@@ -239,6 +259,7 @@ pub const Client = struct {
             .method = .DELETE,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &discard.writer,
+            .keep_alive = false,
         });
         if (res.status != .ok) return error.DeleteInstanceFailed;
     }
@@ -301,6 +322,7 @@ pub fn metadataToken(gpa: Allocator, io: Io, arena: Allocator) ![]const u8 {
         .method = .GET,
         .extra_headers = &.{.{ .name = "Metadata-Flavor", .value = "Google" }},
         .response_writer = &body.writer,
+        .keep_alive = false,
     });
     if (res.status != .ok) return error.MetadataTokenFailed;
 
