@@ -20,6 +20,11 @@
                       # the bare `zig` alias — needs zig >= 0.16
     pkgs.cmake        # proxies/pingora: flate2's zlib-ng feature vendors and
                       # cmake-builds zlib-ng, even with no TLS feature enabled
+    pkgs.yandex-cloud # `yc` — for getting ONTO a fleet host when a run wedges.
+                      # The VMs have no public address, so `yc compute ssh`
+                      # (which goes via the API) is the only way in; the nightly
+                      # itself never uses this, it authenticates with an IAM
+                      # token from OIDC and drives everything over the API.
   ];
 
   # cargo/rustc for iterating on proxies/pingora locally without a Docker
