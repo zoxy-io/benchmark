@@ -329,11 +329,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
 ///
 /// The uploaded log is the only window into an unattended run, and this suite
 /// used to print nothing at all on the happy path — a healthy c1k went 51
-/// minutes between its start and its one summary line. That made "the log
-/// stopped growing" carry no information, so `bench wait` could not tell a
-/// wedged run from a working one and had to poll until the workflow's own
-/// timeout. These lines are what make that distinction possible; see
-/// `WaitOptions.stall_s`.
+/// minutes between its start and its one summary line, which is indistinguishable
+/// from a wedged one. These lines are what make a run readable while it is still
+/// running, and what localised the c10k hang to `[zoxy] ramp`.
 fn enter(stage: *artifact.Stage, next: artifact.Stage, name: []const u8) void {
     stage.* = next;
     redact.log("bench: [{s}] {s}", .{ name, next.str() });

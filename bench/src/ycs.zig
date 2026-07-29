@@ -57,9 +57,8 @@ pub const Client = struct {
     ///
     /// This is not theoretical here: `bench wait` polls `exists` for the
     /// DONE/FAILED markers every 30s, so one hung HEAD freezes the whole poll
-    /// loop — no marker check, no stall detection, no deadline, nothing until
-    /// the workflow's own step timeout. Nightly run #9 burned 71 minutes that
-    /// way, silently.
+    /// loop — no marker check, no deadline, nothing until the workflow's own step
+    /// timeout. Nightly run #9 burned 71 minutes that way, silently.
     ///
     /// Requests here are one-per-poll, so pooling was never worth anything.
     ///

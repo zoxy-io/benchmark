@@ -100,84 +100,9 @@ pub const WaitOptions = struct {
     /// whose payload fetch failed writes NOTHING — no boot-ok, no FAILED — and
     /// the runner would otherwise poll for its full deadline with no signal.
     boot_deadline_s: u64 = 15 * 60,
-    /// Give up once the uploaded log has not grown for this long.
-    ///
-    /// `DONE`/`FAILED` only cover a suite that reached its own end. A suite that
-    /// DEADLOCKS writes neither, and this is the only thing that notices. It is
-    /// not hypothetical: a zio bug (lalinsky/zio#623) wedged zrk mid-c10k, and
-    /// the run then held three VMs for 55 further minutes until the workflow
-    /// step timed out — the whole time producing not one byte of log.
-    ///
-    /// Sized against the longest SILENCE a healthy run can have, not the longest
-    /// step. `bench suite` announces every per-proxy stage, so the real gaps are
-    /// a 300s ramp and an image build (`deadline.build` allows 900s). 20 minutes
-    /// clears both with room to spare while still catching a hang inside the
-    /// hour.
-    stall_s: u64 = 20 * 60,
 };
 
-pub const WaitResult = enum { done, failed, timed_out, never_booted, stalled };
-
-/// Liveness bookkeeping for `wait`, kept separate from the polling loop so the
-/// rule can be tested without a bucket behind it. A detector that quietly never
-/// fires is worse than no detector, because it reads as a guarantee.
-const Stall = struct {
-    limit_s: u64,
-    poll_s: u64,
-    quiet_s: u64 = 0,
-    /// Armed only once a log exists. Before that there is nothing to be quiet
-    /// about, and `boot_deadline_s` covers the window instead.
-    armed: bool = false,
-
-    fn observe(self: *Stall, log_exists: bool, grew: bool) void {
-        if (log_exists) self.armed = true;
-        if (grew) self.quiet_s = 0;
-    }
-
-    fn tripped(self: Stall) bool {
-        return self.armed and self.quiet_s >= self.limit_s;
-    }
-
-    fn tick(self: *Stall) void {
-        if (self.armed) self.quiet_s += self.poll_s;
-    }
-};
-
-test "the stall detector stays quiet while the log grows" {
-    var s: Stall = .{ .limit_s = 120, .poll_s = 30 };
-    // Five polls, growing every time: never trips.
-    for (0..5) |_| {
-        s.observe(true, true);
-        try std.testing.expect(!s.tripped());
-        s.tick();
-    }
-}
-
-test "the stall detector fires after the limit of silence, not before" {
-    var s: Stall = .{ .limit_s = 120, .poll_s = 30 };
-    s.observe(true, true); // log appears and grows
-    s.tick();
-
-    // 120s of silence is exactly the limit: three more quiet polls to reach it.
-    var polls: usize = 0;
-    while (!s.tripped() and polls < 100) : (polls += 1) {
-        s.observe(true, false);
-        if (s.tripped()) break;
-        s.tick();
-    }
-    try std.testing.expect(s.tripped());
-    try std.testing.expectEqual(@as(u64, 120), s.quiet_s);
-}
-
-test "a run that never logs is left to the boot deadline, not the stall check" {
-    var s: Stall = .{ .limit_s = 60, .poll_s = 30 };
-    for (0..10) |_| {
-        s.observe(false, false);
-        s.tick();
-    }
-    // Unarmed, so it cannot trip no matter how long nothing happens.
-    try std.testing.expect(!s.tripped());
-}
+pub const WaitResult = enum { done, failed, timed_out, never_booted };
 
 /// Poll Object Storage for the run's terminal marker, echoing the uploaded log
 /// as it grows so the Actions console shows progress rather than 45 minutes of
@@ -201,19 +126,16 @@ pub fn wait(
     var shown: usize = 0;
     var waited: u64 = 0;
     var booted = false;
-    var stall: Stall = .{ .limit_s = opts.stall_s, .poll_s = opts.poll_s };
 
     while (waited < opts.deadline_s) {
         // Echo whatever new log the loadgen has uploaded. This is the only
         // window into a run that is otherwise completely unreachable.
         if (client.get(arena, env.bucket, log_key)) |maybe| {
             if (maybe) |text| {
-                const grew = text.len > shown;
-                if (grew) {
+                if (text.len > shown) {
                     std.debug.print("{s}", .{text[shown..]});
                     shown = text.len;
                 }
-                stall.observe(true, grew);
             }
         } else |_| {}
 
@@ -231,19 +153,6 @@ pub fn wait(
                 return .never_booted;
             }
         }
-
-        // A run that has started logging and then goes quiet for this long is
-        // not working slowly, it is stuck: `bench suite` announces each stage,
-        // so even its longest legitimate step keeps the log growing.
-        if (stall.tripped()) {
-            std.debug.print(
-                "bench wait: the run's log has not grown in {d}s — treating it as wedged " ++
-                    "rather than waiting out the remaining {d}s\n",
-                .{ stall.quiet_s, opts.deadline_s -| waited },
-            );
-            return .stalled;
-        }
-        stall.tick();
 
         io.sleep(.fromNanoseconds(opts.poll_s * std.time.ns_per_s), .awake) catch break;
         waited += opts.poll_s;
