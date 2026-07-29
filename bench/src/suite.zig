@@ -95,6 +95,52 @@ const deadline = struct {
     const probe_each: u64 = 10 * std.time.ns_per_s;
     const teardown: u64 = 90 * std.time.ns_per_s;
     const inspect: u64 = 30 * std.time.ns_per_s;
+
+    /// The ramp's own bound, as a multiple of the configured duration plus a
+    /// fixed allowance for the connect storm and the final flush.
+    ///
+    /// Every deadline above bounds a REMOTE command, and the ramp — by far the
+    /// longest step, and the one that actually broke — had none, because it runs
+    /// in-process. A wedged generator therefore held the entire suite: nightly
+    /// runs #9 and #10 both stopped dead in zoxy's c10k ramp and produced
+    /// nothing further, and #9 burned the workflow's whole 115-minute budget
+    /// that way.
+    fn ramp(ramp_seconds: u64) u64 {
+        return (ramp_seconds * 2 + 120) * std.time.ns_per_s;
+    }
+};
+
+/// Bounds `ramp.run`, which blocks in-process and cannot be cancelled.
+///
+/// There is no graceful option here: the call is inside a third-party event
+/// loop, so once it fails to return there is nothing left to unwind. Ending the
+/// process is crude but bounded, and it is strictly better than what it
+/// replaces — the profile's completed proxies are already flushed to
+/// profile.json, cloud-init uploads them, and the runner gets a terminal marker
+/// in minutes rather than polling a corpse until the step times out.
+const RampWatchdog = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    limit_ns: u64,
+    name: []const u8,
+
+    fn watch(self: *RampWatchdog) void {
+        // A raw nanosleep, deliberately NOT `io.sleep`: the whole point is to
+        // stay alive when the Io loop is the thing that has wedged.
+        const tick: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+        const tick_ns = std.time.ns_per_s;
+        var waited: u64 = 0;
+        while (waited < self.limit_ns) : (waited += tick_ns) {
+            _ = std.os.linux.nanosleep(&tick, null);
+            if (self.done.load(.acquire)) return;
+        }
+        if (self.done.load(.acquire)) return;
+        redact.log(
+            "bench: [{s}] the ramp did not return within {d}s — the load generator is wedged. " ++
+                "Aborting so the completed proxies are still uploaded.",
+            .{ self.name, self.limit_ns / std.time.ns_per_s },
+        );
+        std.process.exit(4);
+    }
 };
 
 const warm_probe_attempts = 30;
@@ -424,6 +470,17 @@ fn runOne(
     const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
     const out_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ opts.out_dir, name });
+    var watchdog: RampWatchdog = .{
+        .limit_ns = deadline.ramp(p.ramp_seconds),
+        .name = name,
+    };
+    if (std.Thread.spawn(.{}, RampWatchdog.watch, .{&watchdog})) |t| {
+        t.detach();
+    } else |e| {
+        // Losing the watchdog costs the bound, not the run.
+        redact.log("bench: [{s}] no ramp watchdog ({s})", .{ name, @errorName(e) });
+    }
+
     const outcome = try ramp.run(gpa, arena, .{
         .prof = p,
         .proxy = name,
@@ -432,6 +489,7 @@ fn runOne(
         .out_base = out_base,
         .runid = opts.runid,
     });
+    watchdog.done.store(true, .release);
     const end_iso = try nowIso(io, arena);
 
     // --- classify.
