@@ -96,34 +96,39 @@ const deadline = struct {
     const teardown: u64 = 90 * std.time.ns_per_s;
     const inspect: u64 = 30 * std.time.ns_per_s;
 
-    /// The ramp's own bound, as a multiple of the configured duration plus a
-    /// fixed allowance for the connect storm and the final flush.
+    /// One proxy's whole turn — start, identity, warm, ramp, and the ramp's own
+    /// cleanup — as a multiple of the configured ramp plus a fixed allowance.
     ///
-    /// Every deadline above bounds a REMOTE command, and the ramp — by far the
-    /// longest step, and the one that actually broke — had none, because it runs
-    /// in-process. A wedged generator therefore held the entire suite: nightly
-    /// runs #9 and #10 both stopped dead in zoxy's c10k ramp and produced
-    /// nothing further, and #9 burned the workflow's whole 115-minute budget
-    /// that way.
-    fn ramp(ramp_seconds: u64) u64 {
-        return (ramp_seconds * 2 + 120) * std.time.ns_per_s;
+    /// Every deadline above bounds a REMOTE command. Everything in-process had
+    /// none, which is how a single proxy came to hold the entire suite: nightly
+    /// runs #9, #10 and #12 all stopped dead on zoxy at c10k, and #9 burned the
+    /// workflow's whole 115-minute budget that way.
+    fn proxy(ramp_seconds: u64) u64 {
+        return (ramp_seconds * 2 + 300) * std.time.ns_per_s;
     }
 };
 
-/// Bounds `ramp.run`, which blocks in-process and cannot be cancelled.
+/// Bounds one proxy's turn, which blocks in-process and cannot be cancelled.
 ///
-/// There is no graceful option here: the call is inside a third-party event
+/// There is no graceful option here: the work is inside a third-party event
 /// loop, so once it fails to return there is nothing left to unwind. Ending the
-/// process is crude but bounded, and it is strictly better than what it
-/// replaces — the profile's completed proxies are already flushed to
-/// profile.json, cloud-init uploads them, and the runner gets a terminal marker
-/// in minutes rather than polling a corpse until the step times out.
-const RampWatchdog = struct {
+/// process is crude but bounded, and strictly better than what it replaces —
+/// the profile's completed proxies are already flushed to profile.json,
+/// cloud-init uploads them, and the runner gets a terminal marker in minutes
+/// rather than polling a corpse until the step times out.
+///
+/// The stage pointer is the point. Run #12 hung with the proxy VM's CPU flat,
+/// meaning the ramp had finished, and nothing recorded whether it died in the
+/// ramp's cleanup (which cancels the cAdvisor poller — whose scrape has neither
+/// a connect nor a read timeout) or afterwards in teardown. Naming the stage
+/// turns the next occurrence into a bug report instead of a guess.
+const ProxyWatchdog = struct {
     done: std.atomic.Value(bool) = .init(false),
     limit_ns: u64,
     name: []const u8,
+    stage: *artifact.Stage,
 
-    fn watch(self: *RampWatchdog) void {
+    fn watch(self: *ProxyWatchdog) void {
         // A raw nanosleep, deliberately NOT `io.sleep`: the whole point is to
         // stay alive when the Io loop is the thing that has wedged.
         const tick: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
@@ -135,9 +140,9 @@ const RampWatchdog = struct {
         }
         if (self.done.load(.acquire)) return;
         redact.log(
-            "bench: [{s}] the ramp did not return within {d}s — the load generator is wedged. " ++
-                "Aborting so the completed proxies are still uploaded.",
-            .{ self.name, self.limit_ns / std.time.ns_per_s },
+            "bench: [{s}] stuck at stage {s} for {d}s — aborting so the completed " ++
+                "proxies are still uploaded.",
+            .{ self.name, self.stage.str(), self.limit_ns / std.time.ns_per_s },
         );
         std.process.exit(4);
     }
@@ -294,6 +299,31 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
 
         var stage: artifact.Stage = .start;
+
+        // Bound the WHOLE proxy, not just its ramp.
+        //
+        // This watchdog used to wrap `ramp.run` alone, and run #12 showed why
+        // that is not enough: the proxy VM's CPU went flat the moment zoxy's
+        // c10k ramp finished, and `bench` then sat there for over an hour
+        // without the watchdog making a sound. Covering only the ramp cannot
+        // even tell us WHERE it stopped — inside the ramp's own cleanup, which
+        // cancels the cAdvisor poller, or after it returned, in teardown.
+        //
+        // It reads `stage`, so whatever it catches, the log names the step. That
+        // is the difference between another silent hour and a diagnosis.
+        var watchdog: ProxyWatchdog = .{
+            .limit_ns = deadline.proxy(p.ramp_seconds),
+            .name = name,
+            .stage = &stage,
+        };
+        if (std.Thread.spawn(.{}, ProxyWatchdog.watch, .{&watchdog})) |t| {
+            t.detach();
+        } else |e| {
+            // Losing the watchdog costs the bound, not the run.
+            redact.log("bench: [{s}] no watchdog ({s})", .{ name, @errorName(e) });
+        }
+        defer watchdog.done.store(true, .release);
+
         const rec = runOne(gpa, arena, io, opts, name, &stage) catch |e| blk: {
             redact.log("bench: [{s}] {s} at stage {s}", .{ name, @errorName(e), stage.str() });
             break :blk artifact.ProxyRecord{
@@ -468,17 +498,6 @@ fn runOne(
     const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
     const out_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ opts.out_dir, name });
-    var watchdog: RampWatchdog = .{
-        .limit_ns = deadline.ramp(p.ramp_seconds),
-        .name = name,
-    };
-    if (std.Thread.spawn(.{}, RampWatchdog.watch, .{&watchdog})) |t| {
-        t.detach();
-    } else |e| {
-        // Losing the watchdog costs the bound, not the run.
-        redact.log("bench: [{s}] no ramp watchdog ({s})", .{ name, @errorName(e) });
-    }
-
     const outcome = try ramp.run(gpa, arena, .{
         .prof = p,
         .proxy = name,
@@ -487,7 +506,6 @@ fn runOne(
         .out_base = out_base,
         .runid = opts.runid,
     });
-    watchdog.done.store(true, .release);
     const end_iso = try nowIso(io, arena);
 
     // --- classify.

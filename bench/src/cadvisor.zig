@@ -69,12 +69,18 @@ pub fn scrape(
     addr: net.IpAddress,
     proxy: []const u8,
     scratch: []u8,
+    fd_slot: ?*std.atomic.Value(i32),
 ) !Observation {
     // No connect timeout: Io.Threaded panics on one, and a scrape that stalls
     // costs a sample rather than the run — the poller retries every second and
     // records the failure count.
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
+    // Publish the socket so `interrupt` can unblock a read that never returns.
+    // Declared after the close defer so it runs BEFORE it: the fd is cleared
+    // while it is still valid, never after it could have been reused.
+    if (fd_slot) |slot| slot.store(@intCast(stream.socket.handle), .release);
+    defer if (fd_slot) |slot| slot.store(-1, .release);
 
     {
         var wbuf: [512]u8 = undefined;
@@ -193,12 +199,36 @@ pub const Poller = struct {
     gpa: Allocator,
 
     stop: *std.atomic.Value(bool),
+    /// Socket of the scrape currently in flight, or -1.
+    ///
+    /// `stop` alone cannot end a scrape that is already blocked: the poller only
+    /// reads it between polls, and a scrape has neither a connect nor a read
+    /// timeout — so a cAdvisor that stops answering blocks the poller forever,
+    /// and `poll_group.cancel` in ramp.run then waits on it forever. That is a
+    /// stalled scrape costing the RUN, which is exactly what `scrape` promises
+    /// it cannot do.
+    ///
+    /// `interrupt` shuts this socket down from the outside, so the blocked read
+    /// returns and the poller unwinds on its own.
+    active_fd: std.atomic.Value(i32) = .init(-1),
     identity_error: std.atomic.Value(bool) = .init(false),
     scrape_failures: u32 = 0,
     /// cAdvisor was reachable and reported our container at least once. If this
     /// stays false the run produced no CPU/memory data at all, which the report
     /// must show as absent rather than as zero.
     ever_found: bool = false,
+
+    /// Force a scrape that is blocked in connect or read to return.
+    ///
+    /// Called by the caller AFTER setting `stop`, so the poller sees the flag on
+    /// its next pass and exits instead of retrying. `shutdown` rather than
+    /// `close`: the poller still owns the socket and will close it itself, and
+    /// closing an fd out from under a task in flight risks it being reused.
+    pub fn interrupt(self: *Poller) void {
+        const fd = self.active_fd.load(.acquire);
+        if (fd < 0) return;
+        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+    }
 
     pub fn run(self: *Poller) void {
         var scratch: [4096]u8 = undefined;
@@ -210,7 +240,7 @@ pub const Poller = struct {
             const now = Io.Timestamp.now(self.io, .awake);
             const t = @as(f64, @floatFromInt(self.t0.durationTo(now).nanoseconds)) / std.time.ns_per_s;
 
-            if (scrape(self.io, self.addr, self.proxy, &scratch)) |obs| {
+            if (scrape(self.io, self.addr, self.proxy, &scratch, &self.active_fd)) |obs| {
                 if (obs.intruder) |other| {
                     // A container for a DIFFERENT proxy is live while this one
                     // is being measured. Whatever is answering :8080 may not be

@@ -188,6 +188,10 @@ pub fn run(gpa: Allocator, arena: Allocator, opts: Options) !Outcome {
     }
     defer {
         poll_stop.store(true, .monotonic);
+        // Unblock a scrape already in flight before waiting on the task, or this
+        // cancel waits for a read that will never return. `stop` first, so the
+        // poller exits rather than reconnecting.
+        if (opts.cadvisor_addr != null) poller.interrupt();
         poll_group.cancel(io);
     }
 
