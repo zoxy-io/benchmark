@@ -360,14 +360,18 @@ fn runOne(
             const info = std.mem.trim(u8, res.stdout, " \n\r\t");
             if (info.len > 0) {
                 build_info = info;
-                // Every proxy targets a generic baseline, matching the stock
-                // upstream images in the comparison. A NATIVE build is the
-                // anomaly: it would hand that proxy the host's AVX2/AVX-512
-                // against others running SSE2.
-                if (std.mem.indexOf(u8, info, "NATIVE") != null) {
+                // Proxies built here compile for the host CPU, because that is
+                // how they ship. haproxy does not: it is the stock upstream
+                // image, a generic x86-64 build with no AVX. That asymmetry is
+                // deliberate but must travel WITH the numbers — a reader
+                // comparing a SIMD build against a baseline one should be told,
+                // not left to infer it from a Dockerfile.
+                if (std.mem.indexOf(u8, info, "cpu=native") != null or
+                    std.mem.indexOf(u8, info, "SIMD") != null)
+                {
                     try notes.append(arena, try std.fmt.allocPrint(
                         arena,
-                        "built for the host CPU ({s}) — an unfair advantage over the baseline-built proxies",
+                        "compiled for this host's CPU with SIMD ({s}); stock images in this comparison are generic x86-64 builds",
                         .{info},
                     ));
                 }

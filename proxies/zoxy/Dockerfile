@@ -57,40 +57,36 @@ ARG ZOXY_OPTIMIZE=ReleaseFast
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for
 # quotable numbers.
-# BASELINE cpu target, always — never `-mcpu=native`.
+# The effective cpu model is RECORDED. `bench suite` reads it into profile.json,
+# so the report can state what each proxy was actually compiled for instead of
+# leaving it to be guessed.
 #
-# The comparison includes haproxy, which ships as the stock upstream image and is
-# therefore compiled for a generic x86-64 baseline with no AVX at all. Building
-# zoxy with the host's AVX2/AVX-512 while haproxy runs SSE2 would hand zoxy a
-# large advantage that has nothing to do with its proxying, so every proxy here
-# targets the same generic baseline — which is also what a package or registry
-# image gives you in practice.
+# Static musl, as zoxy's own release workflow builds it, but with SIMD ENABLED:
 #
-# The effective target is RECORDED either way. `bench suite` reads it into
-# profile.json, so if this ever drifts back to native the artifact says so rather
-# than the run completing and the number simply being wrong.
-# Built exactly as zoxy's own release workflow builds it:
+#   zig build -Dtarget=x86_64-linux-musl -Dcpu=<model> -Doptimize=ReleaseFast
 #
-#   zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+# zoxy ships SIMD-enabled binaries, so a baseline build would measure something
+# no user runs. `native` matches the host the benchmark runs on; pin ZOXY_CPU to
+# a concrete model (e.g. `icelake_server`, `x86_64_v3`) for a build that is
+# reproducible off this machine.
 #
-# That means the benchmark measures the artifact users actually download, and it
-# settles the CPU-parity question for free: a named target implies a BASELINE cpu
-# model, matching haproxy's stock upstream image (a generic x86-64 build with no
-# AVX at all). Building zoxy with the host's AVX2/AVX-512 while haproxy runs SSE2
-# would be a large advantage that has nothing to do with proxying.
+# This deliberately gives up the CPU parity a baseline build bought against
+# haproxy's stock upstream image, which is a generic x86-64 build with no AVX.
+# zoxy and pingora are compiled here and get the host's AVX2/AVX-512; haproxy
+# does not. That asymmetry is REAL and must be read with the numbers, not
+# forgotten — build-info records the effective model for every proxy so the
+# report can state it rather than leaving it to be discovered.
 #
 # Static musl also removes the system-OpenSSL link that made a native build
-# awkward to pin to a baseline cpu.
-#
-# The effective target is RECORDED, so if this ever drifts the artifact says so
-# rather than the run completing with a quietly incomparable number.
+# awkward to pin.
+ARG ZOXY_CPU=native
 RUN case "$TARGETARCH" in \
         amd64) ztarget=x86_64-linux-musl ;; \
         arm64) ztarget=aarch64-linux-musl ;; \
         *) echo "unsupported target arch: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget" \
-    && echo "release-parity $ZOXY_OPTIMIZE $ztarget (baseline cpu)" > /zoxy-build
+    && zig build -Doptimize=$ZOXY_OPTIMIZE -Dtarget="$ztarget" -Dcpu="$ZOXY_CPU" \
+    && echo "release-parity $ZOXY_OPTIMIZE $ztarget cpu=$ZOXY_CPU (SIMD)" > /zoxy-build
 
 FROM debian:bookworm-slim
 COPY --from=build /src/zig-out/bin/zoxy /usr/local/bin/zoxy

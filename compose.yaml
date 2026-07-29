@@ -124,12 +124,17 @@ services:
         # bench/src/profile.zig's zoxy_ref.
         ZOXY_REF: ${ZOXY_REF:-main}
         ZOXY_OPTIMIZE: ${ZOXY_OPTIMIZE:-ReleaseFast}
-    # The ref and optimize mode are the only two inputs that change the binary,
-    # so they are the whole tag. Slot ceilings used to be here too, patched into
+        # SIMD on: zoxy ships SIMD-enabled binaries, so a baseline build would
+        # measure something no user runs. Pin to a concrete model for a build
+        # reproducible off this host.
+        ZOXY_CPU: ${ZOXY_CPU:-native}
+    # Ref, optimize mode and cpu model are the inputs that change the binary, so
+    # they are the whole tag — a native build on one host must not be mistaken
+    # for a native build on another. Slot ceilings used to be here too, patched into
     # zoxy's source at build time and encoded in the tag; they are runtime config
     # now (entrypoint.sh writes conn_slots/upstream_slots), so the same image
     # serves c1k and c10k.
-    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}
+    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}-${ZOXY_CPU:-native}
     container_name: zoxy
     profiles: [zoxy]
     # Docker's default seccomp profile denies io_uring_* since engine 25.0.
@@ -195,7 +200,7 @@ services:
     build:
       context: ./proxies/pingora
       args:
-        PINGORA_TARGET_CPU: ${PINGORA_TARGET_CPU:-x86-64}
+        PINGORA_TARGET_CPU: ${PINGORA_TARGET_CPU:-native}
     image: zoxy-bench/pingora-http:0.8
     container_name: pingora
     profiles: [pingora]
