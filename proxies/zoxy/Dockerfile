@@ -9,26 +9,14 @@
 # NOTE: the container must run under seccomp-iouring.json (wired in compose):
 # Docker's default seccomp profile denies io_uring_* since engine 25.0, and
 # zoxy's event loop (libxev's Linux backend) is io_uring.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS build
+# The toolchain comes from proxies/zig, built and cached separately — it is a
+# pure function of ZIG_VERSION and arch, where this image is not. See that
+# Dockerfile for why the curl-per-run it replaces was a bad idea. `bench suite`
+# guarantees this image exists before building zoxy.
+FROM --platform=$BUILDPLATFORM zoxy-bench/zig:0.16.0 AS build
 ARG ZOXY_REF=main
-ARG ZIG_VERSION=0.16.0
 ARG BUILDARCH
 ARG TARGETARCH
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN case "$BUILDARCH" in \
-        amd64) zigarch=x86_64 ;; \
-        arm64) zigarch=aarch64 ;; \
-        *) echo "unsupported build arch: $BUILDARCH" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 \
-       -o /tmp/zig.tar.xz \
-       "https://ziglang.org/download/${ZIG_VERSION}/zig-${zigarch}-linux-${ZIG_VERSION}.tar.xz" \
-    && tar -xJf /tmp/zig.tar.xz -C /opt \
-    && rm -f /tmp/zig.tar.xz \
-    && ln -s /opt/zig-*/zig /usr/local/bin/zig
 
 # Cache-bust keyed on what $ZOXY_REF currently POINTS AT, not on its name.
 #

@@ -231,6 +231,10 @@ const ProxyWatchdog = struct {
     }
 };
 
+/// Must match the `FROM` in proxies/zoxy/Dockerfile. A mismatch fails zoxy's
+/// build loudly on a missing image, which is the right way for it to fail.
+const zig_toolchain_tag = "zoxy-bench/zig:0.16.0";
+
 /// The image tag for a proxy whose build is a pure function of this repo, or
 /// null for one that is not cacheable.
 ///
@@ -373,6 +377,59 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     // were exactly the 5 minutes they are configured to be. The fleet is
     // ephemeral, so there is no docker layer cache and zoxy is rebuilt from
     // source (git clone + zig ReleaseFast) on a 2-core VM every single run.
+    // The Zig toolchain zoxy's Dockerfile does `FROM`, made to exist before it
+    // is needed. Cached in Object Storage because it is a pure function of the
+    // version and the architecture, so the 55 MB fetch from ziglang.org happens
+    // only when someone bumps it — not on every ephemeral fleet, in the critical
+    // path of an unattended run, which is how run #21 lost a profile.
+    for (opts.proxies) |name| {
+        if (!std.mem.eql(u8, name, "zoxy")) continue;
+        redact.log("bench: [zig] toolchain", .{});
+        const hit = remote.check(
+            gpa,
+            arena,
+            io,
+            opts.fleet.proxyHost(),
+            "cache restore zig",
+            try std.fmt.allocPrint(
+                arena,
+                "bench-image-cache restore zig {s} && echo HIT || true",
+                .{zig_toolchain_tag},
+            ),
+            deadline.inspect,
+        ) catch null;
+        const have = if (hit) |h| std.mem.indexOf(u8, h.stdout, "HIT") != null else false;
+        if (!have) {
+            _ = remote.check(
+                gpa,
+                arena,
+                io,
+                opts.fleet.proxyHost(),
+                "build zig toolchain",
+                try std.fmt.allocPrint(arena, "cd {s} && docker build -t {s} proxies/zig", .{
+                    opts.fleet.remote_dir, zig_toolchain_tag,
+                }),
+                deadline.build,
+            ) catch {
+                // zoxy's build will fail loudly on the missing FROM; every other
+                // proxy is unaffected.
+                redact.log("bench: [zig] toolchain build failed — zoxy cannot build", .{});
+                break;
+            };
+            _ = remote.check(
+                gpa,
+                arena,
+                io,
+                opts.fleet.proxyHost(),
+                "cache save zig",
+                try std.fmt.allocPrint(arena, "bench-image-cache save zig {s}", .{zig_toolchain_tag}),
+                deadline.build,
+            ) catch {};
+        }
+        redact.log("bench: [zig] toolchain {s}", .{if (have) "restored from cache" else "built"});
+        break;
+    }
+
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
         if (isDirect(name)) continue;
