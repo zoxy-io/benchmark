@@ -144,7 +144,42 @@ const ProxyWatchdog = struct {
                 "proxies are still uploaded.",
             .{ self.name, self.stage.str(), self.limit_ns / std.time.ns_per_s },
         );
+        logSockets();
         std.process.exit(4);
+    }
+
+    /// The kernel's socket census, printed just before giving up.
+    ///
+    /// A ramp that stops returning is usually blocked on something, and at 10k
+    /// connections per proxy across several ramps the first suspect is ephemeral
+    /// port exhaustion: `ip_local_port_range` gives ~64.5k ports, a closed
+    /// connection holds one in TIME_WAIT for 60s, and the cooldown between
+    /// proxies is 8s. The `tw` field is that count directly.
+    ///
+    /// Read from /proc rather than shelling out to `ss`, because this runs on a
+    /// thread whose entire purpose is to work when the process is wedged —
+    /// spawning a child is exactly the sort of thing that would hang too.
+    fn logSockets() void {
+        var buf: [512]u8 = undefined;
+        const fd = std.os.linux.open("/proc/net/sockstat", .{ .ACCMODE = .RDONLY }, 0);
+        const signed: isize = @bitCast(fd);
+        if (signed < 0) return;
+        const handle: i32 = @intCast(fd);
+        defer _ = std.os.linux.close(handle);
+
+        const n = std.os.linux.read(handle, &buf, buf.len);
+        const got: isize = @bitCast(n);
+        if (got <= 0) return;
+        const text = buf[0..@intCast(got)];
+
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            // "TCP: inuse N orphan N tw N alloc N mem N" — tw is TIME_WAIT.
+            if (std.mem.startsWith(u8, line, "TCP:") or std.mem.startsWith(u8, line, "sockets:")) {
+                redact.log("bench: sockets: {s}", .{line});
+            }
+        }
     }
 };
 
