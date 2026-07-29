@@ -203,6 +203,23 @@ write_files:
       IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
       for p in "$${profiles[@]}"; do
         ./bench suite --profile "$p" --proxies "$BENCH_PROXIES" || rc=$?
+        # Ship what is finished after EVERY profile, not just at the end.
+        #
+        # results.tar used to be built once, after this loop, so a profile that
+        # hung took the completed ones down with it: a c10k deadlock discarded a
+        # c1k that had run clean for 51 minutes, and the run produced no
+        # artifacts at all. The tar is cumulative (it archives the whole run
+        # directory), so re-uploading it here just means the bucket always holds
+        # everything finished so far.
+        #
+        # Deliberately NOT guarded by rc: a profile that failed still leaves
+        # per-proxy records worth publishing, and `bench suite` already writes
+        # profile.json after each proxy for the same reason.
+        if [ -n "$(find results/"$BENCH_RUNID" -type f -print -quit 2>/dev/null)" ]; then
+          tar -cf /tmp/results.tar -C results "$BENCH_RUNID" \
+            && bench-os put results.tar /tmp/results.tar \
+            || echo "warning: interim results.tar upload failed after $p" >&2
+        fi
       done
 
       # An empty result is never useful, and `tar` succeeds on a directory tree

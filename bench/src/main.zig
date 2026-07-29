@@ -99,7 +99,11 @@ fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
         // Distinguished in the exit code so the workflow can tell "the suite ran
         // and reported failure" (there may still be partial artifacts worth
         // publishing) from "nothing ever came back".
-        .failed => exit(3),
+        //
+        // A stall joins `failed` rather than `timed_out`: the suite got far
+        // enough to log, so every profile it finished has already been uploaded
+        // and is worth fetching and publishing. Only the wedged profile is lost.
+        .failed, .stalled => exit(3),
         .never_booted, .timed_out => exit(1),
     }
 }

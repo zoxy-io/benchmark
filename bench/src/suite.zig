@@ -279,6 +279,20 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
 /// One proxy, start to finish. Every failure path returns an error, which the
 /// caller turns into a `failed` record — this function never decides to skip
 /// another proxy or to stop the suite.
+/// Move to `next` and say so.
+///
+/// The uploaded log is the only window into an unattended run, and this suite
+/// used to print nothing at all on the happy path — a healthy c1k went 51
+/// minutes between its start and its one summary line. That made "the log
+/// stopped growing" carry no information, so `bench wait` could not tell a
+/// wedged run from a working one and had to poll until the workflow's own
+/// timeout. These lines are what make that distinction possible; see
+/// `WaitOptions.stall_s`.
+fn enter(stage: *artifact.Stage, next: artifact.Stage, name: []const u8) void {
+    stage.* = next;
+    redact.log("bench: [{s}] {s}", .{ name, next.str() });
+}
+
 fn runOne(
     gpa: Allocator,
     arena: Allocator,
@@ -300,7 +314,7 @@ fn runOne(
         try std.fmt.allocPrint(arena, "http://{s}:8080{s}", .{ opts.fleet.proxy_ip, p.req_path });
 
     if (!direct) {
-        stage.* = .start;
+        enter(stage, .start, name);
         _ = try remote.check(
             gpa,
             arena,
@@ -313,7 +327,7 @@ fn runOne(
             deadline.start,
         );
 
-        stage.* = .identity;
+        enter(stage, .identity, name);
         // Assert exactly this proxy is running before believing anything that
         // answers :8080. `compose up --wait` only gates on the container being
         // up, and with a healthcheck it gates on that container being healthy —
@@ -397,10 +411,10 @@ fn runOne(
         }
     }
 
-    stage.* = .warm;
+    enter(stage, .warm, name);
     try warmProbe(io, target, name);
 
-    stage.* = .ramp;
+    enter(stage, .ramp, name);
     const start_iso = try nowIso(io, arena);
 
     const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
