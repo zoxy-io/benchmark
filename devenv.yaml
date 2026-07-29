@@ -2,3 +2,8 @@
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
+
+# `yc` (pkgs.yandex-cloud) is unfree. Declared here so entering the shell just
+# works, rather than every developer discovering they need
+# NIXPKGS_ALLOW_UNFREE=1 in their environment first.
+allowUnfree: true
