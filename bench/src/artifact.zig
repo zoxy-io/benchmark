@@ -334,12 +334,17 @@ test "render distinguishes a failed proxy from one that served nothing" {
     try std.testing.expect(std.mem.indexOf(u8, s, "\"error\":\"no 200 after 30 attempts\"") != null);
 }
 
-test "render records the c10k deadline so a reader can tell the profiles apart" {
+test "render records c10k's ramp settings so a reader can tell the profiles apart" {
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try render(&w, .{ .runid = "r", .prof = profile.c10k, .started = "t" });
     const s = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":1000") != null);
+    // Both guards are off at c10k (see profile.zig). Recording the zeroes is the
+    // point: a reader comparing two runs has to be able to see that this one had
+    // no deadline, because that decides whether the tail is a value or a floor.
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"timeout_s\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"connections\":10000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"ZOXY_UPSTREAM_SLOTS\":\"11464\"") != null);
 }
 
