@@ -9,15 +9,29 @@
     // Bump with `zig fetch --save=zrk git+https://github.com/zoxy-io/zrk#<ref>`.
     // The zio pin MUST match whatever zio commit that zrk ref depends on (check
     // the fetched zrk package's own build.zig.zon), or the `Io` type won't unify
-    // across the module boundary.
+    // across the module boundary — the failure is
+    // "file exists in modules 'zio_options' and 'zio_options0'", which reads
+    // like a build-system bug rather than the two-copies-of-zio problem it is.
+    //
+    // BOTH are temporarily on zoxy-io forks, for one fix: upstream zio drops a
+    // cancel when the io_uring submission queue is full, and the target then
+    // never completes, so the awaiting task blocks forever. c10k reaches this
+    // reliably — 10k connections whose per-operation timeouts expire together
+    // submit thousands of cancels against a 256-entry ring — and it wedged a
+    // nightly run for 115 minutes.
+    //
+    // zio branch fix/cancel-sqe-exhaustion flushes the SQ and retries. The zrk
+    // branch changes NOTHING but its own zio pin, so it stays a single-variable
+    // delta on v1.3.1. Filed upstream as lalinsky/zio#623; when it lands, point
+    // both back at upstream and drop the forks.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.3.1#3940a4570c02ff70094c46d1507ecebadf3e6404",
-            .hash = "zrk-1.3.1-WqdFOzSEBABi11K0XkWd67ny1dp-nYFBXRtIOLqLBiB7",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=fix/zio-cancel-sqe#1630ff68c7cc70ce6c5669932912e859884c13b9",
+            .hash = "zrk-1.3.1-WqdFO1GEBABxb8Emp9qOdCc7fskeJ1nQ_KYQOFTq83N_",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
-            .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
+            .url = "git+https://github.com/zoxy-io/zio?ref=fix/cancel-sqe-exhaustion#87db53bdc76c66a95da7dfc5e6ed313b86e2bcbb",
+            .hash = "zio-0.16.0-xHbVVD5KJABBZ_JZWYUgHatZ65KMm2uCSto03fyE-GY8",
         },
     },
     .paths = .{
