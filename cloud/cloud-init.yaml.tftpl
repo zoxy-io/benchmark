@@ -63,6 +63,19 @@ write_files:
       ubuntu soft memlock unlimited
       ubuntu hard memlock unlimited
 
+  # `package_update: true` is needed to install the pinned docker, but Ubuntu's
+  # needrestart then RESTARTS services whose libraries were updated — including
+  # docker — and it does so minutes into the boot, i.e. underneath a run that has
+  # already started. Run #15 was killed 31 seconds in that way.
+  #
+  # `l` = list what would need restarting, restart nothing. The fleet is torn
+  # down after every run, so a service running against an older library for the
+  # next 40 minutes is exactly what we want.
+  - path: /etc/needrestart/conf.d/99-bench.conf
+    content: |
+      $nrconf{restart} = 'l';
+      $nrconf{kernelhints} = 0;
+
   # The contract's VM-side environment, in one file so the scripts below and the
   # systemd unit read the same thing. Nothing secret lives here.
   - path: /etc/bench/env
@@ -298,9 +311,17 @@ write_files:
     content: |
       [Unit]
       Description=zoxy-benchmark self-driving suite
-      Requires=docker.service
+      # Wants, NOT Requires. `Requires` propagates STOPS: restart docker and
+      # systemd stops this unit too, with a SIGTERM the suite cannot report.
+      # Run #15 died exactly that way 31 seconds in — SERVICE_RESULT=signal,
+      # EXIT_STATUS=TERM, 6.4 GB free and no OOM verdict — because
+      # `package_update: true` lets apt and needrestart bounce services
+      # underneath a run that has already started.
+      #
+      # `After` still orders it behind docker; only the stop-propagation goes.
+      # The churn itself is stopped at its source — see the needrestart drop-in.
+      Wants=docker.service network-online.target
       After=docker.service network-online.target
-      Wants=network-online.target
 
       [Service]
       Type=oneshot
