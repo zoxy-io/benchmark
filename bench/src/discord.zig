@@ -204,6 +204,42 @@ pub fn renderPayload(
 }
 
 /// Assemble the full multipart/form-data body.
+/// Add `wait=true` to a webhook URL, so Discord replies 200 with the created
+/// message instead of 204 No Content.
+///
+/// This is for the CONFIRMATION, not for the hang — a 200 means the message was
+/// actually created, where 204 only means the request was accepted. The hang
+/// that 204 used to cause is fixed by `keep_alive = false` at the call site, and
+/// that fix does not depend on Discord honouring this parameter (httpbingo.org
+/// ignores it and answers 204 regardless, which is exactly the case used to
+/// verify the real fix).
+pub fn withWait(arena: Allocator, webhook: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, webhook, "wait=") != null) return webhook;
+    const sep: u8 = if (std.mem.indexOfScalar(u8, webhook, '?') != null) '&' else '?';
+    return std.fmt.allocPrint(arena, "{s}{c}wait=true", .{ webhook, sep });
+}
+
+test "withWait appends the query the response depends on" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    try std.testing.expectEqualStrings(
+        "https://discord.com/api/webhooks/1/t?wait=true",
+        try withWait(arena, "https://discord.com/api/webhooks/1/t"),
+    );
+    // An existing query string keeps its parameters.
+    try std.testing.expectEqualStrings(
+        "https://x/y?thread_id=9&wait=true",
+        try withWait(arena, "https://x/y?thread_id=9"),
+    );
+    // Already asked for: left exactly as-is, so no duplicate parameter.
+    try std.testing.expectEqualStrings(
+        "https://x/y?wait=true",
+        try withWait(arena, "https://x/y?wait=true"),
+    );
+}
+
 pub fn buildMultipart(
     arena: Allocator,
     boundary: []const u8,
@@ -281,6 +317,7 @@ pub fn post(
     defer client.deinit();
 
     const ctype = try std.fmt.allocPrint(arena, "multipart/form-data; boundary={s}", .{boundary});
+    const url = try withWait(arena, webhook);
 
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
@@ -291,11 +328,20 @@ pub fn post(
         var discard_buf: [1024]u8 = undefined;
         var discard: std.Io.Writer.Discarding = .init(&discard_buf);
         const res = try client.fetch(.{
-            .location = .{ .url = webhook },
+            .location = .{ .url = url },
             .method = .POST,
             .payload = body,
             .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
             .response_writer = &discard.writer,
+            // Ask the server to close after replying. This is what actually
+            // makes a 204 safe: that reply has no body and no `content-length`,
+            // and `std.http.Client` then waits for a body that never comes —
+            // forever, if the connection stays open. `Connection: close` gives
+            // the read an end. Verified against httpbingo.org/status/204, which
+            // hangs without it and returns immediately with it.
+            //
+            // One request per run, so pooling buys nothing anyway.
+            .keep_alive = false,
         });
         switch (res.status) {
             .ok, .no_content => return,
