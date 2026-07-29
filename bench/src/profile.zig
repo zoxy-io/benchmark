@@ -171,12 +171,21 @@ pub const c10k: Profile = .{
     .start_rate = start_rate,
     .max_rate = max_rate,
     .ramp_seconds = ramp_seconds,
-    // The wire timeout stays OFF for now — one variable at a time. It was turned
-    // off only to match the last known-good fleet config while the c10k failure
-    // was unexplained; ten of those twelve working runs actually had
-    // `timeout_ms: 1000`, so restoring it is safe on the evidence and should
-    // follow once the deadline is shown to be fine.
-    .timeout_s = 0,
+    // Restored: turning this off is what wedged haproxy's c10k ramp in run #14.
+    //
+    // With `timeout_s = 0` zrk never arms `watchTimer` (connection.zig gates it
+    // on `timeout_ns != 0`), so nothing breaks a read that never completes. The
+    // task blocks forever, zrk's end-of-run `group.cancel` waits on it, and the
+    // ramp never returns — the proxy watchdog aborted it at 900s with
+    // "stuck at stage ramp". direct and zoxy finished the same run cleanly
+    // because their reads completed; haproxy at 10k connections left reads
+    // outstanding past the end of the run.
+    //
+    // This is the hung-connection guard the field docs describe, and it is why
+    // ten of the twelve old working 10k runs carried `timeout_ms: 1000`. It was
+    // only ever zeroed to match the last known-good config while the c10k
+    // failure was unexplained; that cause turned out to be a memory leak.
+    .timeout_s = 1,
 
     // One SLO, enforced by the load generator, identical for every proxy.
     //
