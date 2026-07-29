@@ -171,31 +171,34 @@ pub const c10k: Profile = .{
     .start_rate = start_rate,
     .max_rate = max_rate,
     .ramp_seconds = ramp_seconds,
-    // BOTH GUARDS OFF, restoring the configuration that last completed a 10k
-    // ramp. This is a revert to measured ground, not a preference.
-    //
-    // The persistent fleet ran this profile twelve times and finished every
-    // one — 300 windows, ~5M requests, 12-17k rps sustained. The nightly's
-    // version, which added `deadline_ms = 1000`, has wedged zoxy's c10k ramp on
-    // every attempt (runs #9, #10) with no output at all. Those old runs are in
-    // results/zrk-2026072[78]-* and record their config, which is how the delta
-    // was found.
-    //
-    // Note the evidence does NOT single out the wire timeout: ten of the twelve
-    // working runs had `timeout_ms: 1000`, so a 1s timeout at 10k connections
-    // demonstrably completes. The deadline is the one setting present in every
-    // failing run and absent from every passing one. Both are reverted together
-    // anyway, because matching the last known-good state exactly is what makes
-    // the next run a clean test — a green run then says "this config works", and
-    // re-introducing them one at a time says which one broke it.
-    //
-    // The cost is real and must not be forgotten: with no deadline the tail
-    // degenerates to zrk's 60s histogram ceiling (those runs recorded p50 24s,
-    // p99 pinned at the clamp), so c10k tail percentiles are a FLOOR rather than
-    // a measurement. `saturated` is set on such runs and the report already
-    // notes it.
+    // The wire timeout stays OFF for now — one variable at a time. It was turned
+    // off only to match the last known-good fleet config while the c10k failure
+    // was unexplained; ten of those twelve working runs actually had
+    // `timeout_ms: 1000`, so restoring it is safe on the evidence and should
+    // follow once the deadline is shown to be fine.
     .timeout_s = 0,
-    .deadline_ms = 0,
+
+    // One SLO, enforced by the load generator, identical for every proxy.
+    //
+    // Restored after the c10k failure turned out to be a memory leak in
+    // `ramp.run` (a zio runtime per proxy from a process-lifetime arena, which
+    // OOM-killed the loadgen). The deadline was suspected and reverted; it was
+    // never implicated.
+    //
+    // Without it every tail percentile at c10k degenerates to zrk's 60s clamp —
+    // measured on the old fleet, p90/p99/p99.9/p99.99/max ALL 60.0s, five
+    // identical constants carrying no information, so proxies cannot be ranked
+    // by tail at all. It is also the only thing that makes them answer the same
+    // question: with no loadgen bound each proxy's own config decides the
+    // outcome (haproxy `timeout client/server 60s` returns 504s, pingora has no
+    // request timeout whatsoever).
+    //
+    // It sheds hard past the knee — ~90% of scheduled requests at the top of a
+    // ramp that deliberately runs to 100k. That does not corrupt the headline
+    // latency, which is read at `ref_rate` (8000 rps, comfortably under the
+    // ~16.7k zoxy sustained here), where shedding is negligible. Past the knee
+    // it converts an unbounded tail into a bounded, comparable error rate.
+    .deadline_ms = 1000,
     .req_path = "/1k",
     // Past the connect storm: ~8000 rps is t~=47s on this ramp, by which point
     // all 10k connections are long established.
@@ -255,13 +258,12 @@ test "validate rejects the misconfigurations the env plumbing used to allow" {
     try std.testing.expectError(error.RefRateAboveRamp, p.validate());
 }
 
-test "c10k runs both guards off, matching the last configuration that finished" {
-    // Reverted after the deadline wedged zoxy's c10k ramp on every nightly
-    // attempt. The trade is explicit: no deadline means the tail saturates at
-    // zrk's 60s clamp, so c10k tail percentiles are a floor, not a value —
-    // `saturated` marks those runs and the report says so.
-    try std.testing.expectEqual(@as(u64, 0), c10k.deadline_ms);
-    try std.testing.expectEqual(@as(u64, 0), c10k.timeout_s);
+test "c10k carries the deadline SLO and c1k does not" {
+    // Without it, c10k produced p90=p99=p99_9=p99_99=max=60s — five identical
+    // clamp values, a saturated histogram rather than a measurement. It also
+    // makes the proxies answer one question instead of each applying its own
+    // timeout policy.
+    try std.testing.expect(c10k.deadline_ms > 0);
     try std.testing.expectEqual(@as(u64, 0), c1k.deadline_ms);
 }
 

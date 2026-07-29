@@ -342,7 +342,7 @@ test "render records c10k's ramp settings so a reader can tell the profiles apar
     // Both guards are off at c10k (see profile.zig). Recording the zeroes is the
     // point: a reader comparing two runs has to be able to see that this one had
     // no deadline, because that decides whether the tail is a value or a floor.
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"timeout_s\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"connections\":10000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"ZOXY_UPSTREAM_SLOTS\":\"11464\"") != null);
