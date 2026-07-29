@@ -22,6 +22,21 @@ SHELL := bash
 
 ZIG ?= zig
 ZIG_TARGET ?= x86_64-linux-musl
+# SIMD for the load generator. A named target alone implies a BASELINE cpu, and
+# `bench` embeds zrk — so without this the thing generating the load was pure
+# SSE2 (measured: zero ymm, zero zmm) while the proxies it measures are compiled
+# for the host. A loadgen that cannot keep up understates every proxy.
+#
+# NOT `native`: this binary is compiled on the CI runner and executed on the
+# loadgen VM, which are different machines. Baking in the runner's cpu features
+# risks SIGILL on the VM and would take a whole night with it. x86_64_v3 (AVX2,
+# FMA, BMI2) is satisfied by every current x86_64 server including the fleet's
+# Ice Lake, so it is safe to cross-compile for.
+#
+# x86_64_v4 would add AVX-512, which Ice Lake does have — but AMD EPYC before
+# Genoa does not, so raising this is a deliberate bet on the platform the VMs
+# land on, not a free upgrade.
+ZIG_CPU ?= x86_64_v3
 # The vendored copies of the pinned zrk/zio packages, so a build needs no network.
 ZIG_PKG ?= zig-pkg
 PROFILE ?= c1k
@@ -34,8 +49,8 @@ help:
 	@sed -n '8,13p' $(MAKEFILE_LIST)
 
 build:
-	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) --system $(ZIG_PKG)
-	@echo "built bench/zig-out/bin/bench ($(ZIG_TARGET))"
+	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) -Dcpu=$(ZIG_CPU) --system $(ZIG_PKG)
+	@echo "built bench/zig-out/bin/bench ($(ZIG_TARGET) cpu=$(ZIG_CPU))"
 
 test:
 	cd bench && $(ZIG) build test --system $(ZIG_PKG) --summary all

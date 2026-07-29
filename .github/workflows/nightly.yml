@@ -189,7 +189,11 @@ jobs:
 
       - name: Build bench (static x86_64-linux-musl)
         working-directory: bench
-        run: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+        # -Dcpu: `bench` embeds zrk, and a named target alone means a BASELINE
+        # cpu — the load generator was pure SSE2. Not `native`: this is built
+        # here and run on the loadgen VM, so the runner's features must not be
+        # baked in. See the Makefile for why v3 and not v4.
+        run: zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3 -Doptimize=ReleaseFast
 
       - name: Stage the binary
         run: |
