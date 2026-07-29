@@ -115,6 +115,56 @@ write_files:
         *)   echo "usage: bench-os get|put|say <object> <file|text>" >&2; exit 2 ;;
       esac
 
+  # Restore/save a built proxy image through Object Storage, so an ephemeral
+  # fleet stops paying to rebuild a DETERMINISTIC one every night.
+  #
+  # pingora costs 469s to build and is fully pinned — Cargo.toml, Cargo.lock and
+  # a local src/ — so its image is identical run after run and the cache hits
+  # every time. zoxy is deliberately NOT cached: it tracks floating `main`, which
+  # is the whole point of the nightly, so a correctly-keyed cache would miss on
+  # exactly the nights that matter, for 179s.
+  #
+  # The key is the danger, not the plumbing. A key that misses an input restores
+  # a stale image and the run silently benchmarks the wrong binary — the same
+  # class of bug as the cached `git clone` that made ZOXY_REF=main mean a frozen
+  # commit. So it hashes everything that reaches the build: the Dockerfile, the
+  # whole build context, and the CPU MODEL, because PINGORA_TARGET_CPU is
+  # `native` and an image built for one model must never be loaded on another.
+  - path: /usr/local/bin/bench-image-cache
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+      set -a; . /etc/bench/env; set +a
+
+      op=$${1:?usage: bench-image-cache restore|save <name> <image-tag>}
+      name=$${2:?}
+      tag=$${3:?}
+      ctx="/home/ubuntu/bench/proxies/$name"
+      [ -d "$ctx" ] || exit 1
+
+      # Every input to the build, plus the CPU this host actually is.
+      key=$( { find "$ctx" -type f -print0 | sort -z | xargs -0 cat;
+               grep -m1 '^model name' /proc/cpuinfo; } \
+             | sha256sum | cut -c1-16 )
+      obj="cache/$name-$key.tar"
+
+      case "$op" in
+        restore)
+          bench-os get "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 || exit 1
+          docker load -i /tmp/$name-cache.tar >/dev/null 2>&1 || exit 1
+          docker image inspect "$tag" >/dev/null 2>&1 || exit 1
+          echo "image cache: restored $name ($key)"
+          ;;
+        save)
+          docker save "$tag" -o /tmp/$name-cache.tar 2>/dev/null || exit 0
+          bench-os put "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 \
+            && echo "image cache: saved $name ($key)"
+          rm -f /tmp/$name-cache.tar
+          ;;
+        *) exit 2 ;;
+      esac
+
   # payload.tar is uploaded BEFORE apply, so it is already in the bucket when
   # this runs. The retry loop is for this end, not that one: the default route
   # through the NAT gateway and the instance's service-account binding both

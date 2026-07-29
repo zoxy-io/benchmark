@@ -183,6 +183,23 @@ const ProxyWatchdog = struct {
     }
 };
 
+/// The image tag for a proxy whose build is a pure function of this repo, or
+/// null for one that is not cacheable.
+///
+/// pingora qualifies: pinned Cargo.toml + Cargo.lock and a local src/, so the
+/// image is identical run after run and the cache hits every time. It is also
+/// the expensive one — 469s measured, against zoxy's 179s and haproxy's 1s.
+///
+/// zoxy is deliberately absent. It tracks floating `main` because the nightly
+/// exists to catch a regression the morning after it lands, so a correctly-keyed
+/// cache would miss on precisely the nights that matter — and a WRONGLY-keyed one
+/// would silently benchmark a stale binary, which is the bug we spent today
+/// removing from the Dockerfile's git clone.
+fn cacheableImage(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "pingora")) return "zoxy-bench/pingora-http:0.8";
+    return null;
+}
+
 const warm_probe_attempts = 30;
 const warm_probe_interval_ns = 2 * std.time.ns_per_s;
 /// Bounds the probe LOOP, because a single connect cannot be bounded:
@@ -313,19 +330,53 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         if (isDirect(name)) continue;
         redact.log("bench: [{s}] building", .{name});
         const t0 = Io.Timestamp.now(io, .awake);
-        _ = remote.check(
-            gpa,
-            arena,
-            io,
-            opts.fleet.proxyHost(),
-            try std.fmt.allocPrint(arena, "build {s}", .{name}),
-            try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
-                opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", opts.fleet.composeCmd(), name, name,
-            }),
-            deadline.build,
-        ) catch {
-            try build_failed.put(arena, name, {});
-        };
+
+        // A cache hit skips the build entirely. Only for proxies whose image is
+        // a pure function of the repo — see `cacheableImage`.
+        const restored = if (cacheableImage(name)) |tag|
+            remote.check(
+                gpa,
+                arena,
+                io,
+                opts.fleet.proxyHost(),
+                try std.fmt.allocPrint(arena, "cache restore {s}", .{name}),
+                try std.fmt.allocPrint(arena, "bench-image-cache restore {s} {s}", .{ name, tag }),
+                deadline.inspect,
+            ) catch null
+        else
+            null;
+
+        if (restored == null) {
+            _ = remote.check(
+                gpa,
+                arena,
+                io,
+                opts.fleet.proxyHost(),
+                try std.fmt.allocPrint(arena, "build {s}", .{name}),
+                try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
+                    opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", opts.fleet.composeCmd(), name, name,
+                }),
+                deadline.build,
+            ) catch {
+                try build_failed.put(arena, name, {});
+            };
+
+            // Populate the cache only from a build that succeeded.
+            if (!build_failed.contains(name)) {
+                if (cacheableImage(name)) |tag| {
+                    _ = remote.check(
+                        gpa,
+                        arena,
+                        io,
+                        opts.fleet.proxyHost(),
+                        try std.fmt.allocPrint(arena, "cache save {s}", .{name}),
+                        try std.fmt.allocPrint(arena, "bench-image-cache save {s} {s}", .{ name, tag }),
+                        deadline.build,
+                    ) catch {};
+                }
+            }
+        }
+
         const secs = @as(f64, @floatFromInt(
             t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds,
         )) / std.time.ns_per_s;

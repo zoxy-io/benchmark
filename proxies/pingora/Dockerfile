@@ -12,15 +12,19 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
-# Generic x86-64 baseline, NOT native. The comparison includes haproxy, which is
-# the stock upstream image and therefore a baseline build with no AVX at all —
-# giving pingora and zoxy the host's AVX2/AVX-512 while haproxy runs SSE2 would
-# be a large, one-sided advantage that has nothing to do with proxying.
+# NATIVE by default from compose, which passes PINGORA_TARGET_CPU=native — zoxy
+# and pingora are both built for the host CPU because that is how they ship, and
+# measuring a baseline build would measure something no user runs. The ARG
+# default below is only what a bare `docker build` with no compose gets.
 #
-# Baseline is also the honest default for this comparison: it is what a package
-# or a registry image actually gives you. Set PINGORA_TARGET_CPU=native to
-# measure peak achievable performance instead — but then build haproxy from
-# source too, or the numbers are not comparable.
+# haproxy is the stock upstream image and stays a generic x86-64 build, so this
+# comparison is NOT CPU-matched. That asymmetry is deliberate and recorded: the
+# effective model goes into /etc/pingora/build-info, `bench suite` reads it into
+# profile.json, and each SIMD-built proxy gets a note saying the stock images it
+# is compared against are generic builds.
+#
+# It is also part of the image cache key (bench-image-cache), because a `native`
+# build is only valid on the model that produced it.
 ARG PINGORA_TARGET_CPU=x86-64
 # Recorded for the same reason zoxy records its target: the comparison is only
 # fair if both were built for the same CPU, and that has to be checkable from the
