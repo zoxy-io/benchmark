@@ -164,6 +164,33 @@ pub const c1k: Profile = .{
     },
 };
 
+pub const c100: Profile = .{
+    .name = "c100",
+    .connections = 100,
+    .threads = 4,
+    .start_rate = start_rate,
+    .max_rate = max_rate,
+    .ramp_seconds = ramp_seconds,
+    .timeout_s = 1,
+    .deadline_ms = 0,
+    .req_path = "/1k",
+    // Same as c1k's: 100 connections is nowhere near a throughput ceiling
+    // (zrk reuses each connection for many sequential requests, so c1k's 1000
+    // connections already sustained 50-90k rps in practice — connections cap
+    // in-flight CONCURRENCY, not completions/sec), and a shared ref_rate keeps
+    // this profile's summary latency directly comparable to c1k's.
+    .ref_rate = 2000,
+    .ref_band = 0.20,
+    .cooldown_s = 8,
+    // No override: 100 offered connections sit at ~10% of zoxy's stock 1024
+    // conn_slots default, nowhere near the headroom pressure that made c1k
+    // pin ZOXY_UPSTREAM_SLOTS to its conn_slots. This profile exists to be
+    // the cheap, fast-turnaround control while c10k's start failures (run
+    // #25) are being chased — it should exercise zoxy's SHIPPED defaults, not
+    // a bespoke config.
+    .proxy_env = &.{},
+};
+
 pub const c10k: Profile = .{
     .name = "c10k",
     .connections = 10_000,
@@ -223,7 +250,7 @@ pub const c10k: Profile = .{
     },
 };
 
-pub const all = [_]Profile{ c1k, c10k };
+pub const all = [_]Profile{ c100, c1k, c10k };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -237,6 +264,7 @@ test "every shipped profile validates" {
 }
 
 test "byName is exhaustive and rejects unknown names" {
+    try std.testing.expect(byName("c100") != null);
     try std.testing.expect(byName("c1k") != null);
     try std.testing.expect(byName("c10k") != null);
     try std.testing.expect(byName("") == null);

@@ -48,7 +48,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k,c10k
+        default: c100,c1k
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -96,7 +96,11 @@ jobs:
 
       # `inputs` is null on a scheduled run, so every consumer needs the same
       # fallback the dispatch form defaults to.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c10k' }}
+      # c10k stays defined in profile.zig (its tuning history and the open
+      # start-failure investigation from run #25 are worth keeping) — it is
+      # just not in the default nightly set while that investigation is open.
+      # Pass `profiles: c1k,c10k` on a manual dispatch to run it anyway.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c100,c1k' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'direct,zoxy,haproxy,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
