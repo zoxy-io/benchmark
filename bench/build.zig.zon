@@ -13,28 +13,24 @@
     // "file exists in modules 'zio_options' and 'zio_options0'", which reads
     // like a build-system bug rather than the two-copies-of-zio problem it is.
     //
-    // zrk is a real RELEASE; only zio is still a fork, for one fix: upstream zio
-    // drops a
-    // cancel when the io_uring submission queue is full, and the target then
-    // never completes, so the awaiting task blocks forever. c10k reaches this
-    // reliably — 10k connections whose per-operation timeouts expire together
-    // submit thousands of cancels against a 256-entry ring — and it wedged a
-    // nightly run for 115 minutes.
-    //
-    // zio branch fix/cancel-sqe-exhaustion flushes the SQ and retries. That fix
-    // is now carried by a real zrk release — v1.4.0 pins this exact zio commit
-    // (zoxy-io/zrk#47) — so the temporary zrk fork branch is gone and only the
-    // zio pin remains a fork. v1.4.0 also guards three UB/panic paths found in
-    // review (#46). Filed upstream as lalinsky/zio#623; when it lands, point zio
-    // back at upstream and there is no fork left.
+    // No fork left as of zrk v1.4.1 (zoxy-io/zrk#48). zio used to drop a
+    // cancel when the io_uring submission queue is full, leaving the target
+    // completion stuck `.running` forever and the awaiting task blocked with
+    // it — c10k reaches this reliably (10k connections' per-operation
+    // timeouts expiring together submit thousands of cancels against a
+    // 256-entry ring) and it wedged a nightly run for 115 minutes. Filed as
+    // lalinsky/zio#623, fixed upstream in #628 ("flush a full submission
+    // queue instead of dropping SQEs", merged as b822fda). Not yet in a
+    // tagged zio release (v0.16.0 predates the fix), so this pins the commit
+    // directly rather than a tag — same as the fork pin did.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.4.0#77eb138664069f13f816c75411d8bd492294f6d1",
-            .hash = "zrk-1.4.0-WqdFO2bBBACjnQy8nf0B08mxoAzb3IeKuwATiWxXecLz",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.4.1#b2b7ddaa0b125817ea105f258710563f65d42bdc",
+            .hash = "zrk-1.4.1-WqdFO0rIBAABbP3sI9jkhfqcIn4ZQM2zQ2HL9eh4KaAP",
         },
         .zio = .{
-            .url = "git+https://github.com/zoxy-io/zio?ref=fix/cancel-sqe-exhaustion#87db53bdc76c66a95da7dfc5e6ed313b86e2bcbb",
-            .hash = "zio-0.16.0-xHbVVD5KJABBZ_JZWYUgHatZ65KMm2uCSto03fyE-GY8",
+            .url = "git+https://github.com/lalinsky/zio#b822fda55af546ce47918776950338cdf23315c0",
+            .hash = "zio-0.16.0-xHbVVJqoJADE1sz0O0ssHXOjaYODH86TWCUG9Pg4N69C",
         },
     },
     .paths = .{
