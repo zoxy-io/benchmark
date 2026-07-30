@@ -125,10 +125,25 @@ pub fn wait(
     const boot_key = try keys.bootOk(arena, "loadgen");
 
     var shown: usize = 0;
-    var waited: u64 = 0;
     var booted = false;
 
-    while (waited < opts.deadline_s) {
+    // Measured against a monotonic start time, NOT accumulated in fixed
+    // `poll_s` increments: the loop body's own `client.get`/`exists` calls
+    // take real time too, and counting only the sleeps let this deadline
+    // drift arbitrarily far behind the wall clock. A workflow chunks `wait`
+    // into back-to-back invocations sized just under this deadline so it can
+    // refresh its IAM token between them (see main.zig's `--max-wait-s`); if
+    // the drift is large enough, `wait` is still running when the CALLER's
+    // own timeout fires, which kills it before it can exit(5) and hand off to
+    // the next chunk.
+    const started = Io.Timestamp.now(io, .awake);
+    const deadline_ns = opts.deadline_s * std.time.ns_per_s;
+    const boot_deadline_ns = opts.boot_deadline_s * std.time.ns_per_s;
+
+    while (true) {
+        const elapsed_ns = started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
+        if (elapsed_ns >= deadline_ns) break;
+
         // Echo whatever new log the loadgen has uploaded. This is the only
         // window into a run that is otherwise completely unreachable.
         //
@@ -151,18 +166,17 @@ pub fn wait(
 
         if (!booted) {
             booted = client.exists(env.bucket, boot_key) catch false;
-            if (!booted and waited >= opts.boot_deadline_s) {
+            if (!booted and elapsed_ns >= boot_deadline_ns) {
                 std.debug.print(
                     "bench wait: the loadgen never wrote its boot marker after {d}s — " ++
                         "cloud-init did not finish, so no result will ever arrive\n",
-                    .{waited},
+                    .{@divTrunc(elapsed_ns, std.time.ns_per_s)},
                 );
                 return .never_booted;
             }
         }
 
         io.sleep(.fromNanoseconds(opts.poll_s * std.time.ns_per_s), .awake) catch break;
-        waited += opts.poll_s;
     }
 
     std.debug.print("bench wait: no terminal marker after {d}s\n", .{opts.deadline_s});

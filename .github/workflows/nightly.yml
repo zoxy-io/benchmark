@@ -53,7 +53,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c100,c1k
+        default: c1k
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
-    # pingora a cargo build), then 2 profiles x 4 proxies x ~350 s ~= 47 min,
+    # pingora a cargo build), then 1 profile x 5 proxies x ~350 s ~= 29 min,
     # plus fetch/report/publish. 150 leaves real headroom without letting a
     # wedged run bill for hours. `bench wait` runs as two chunked steps (each
     # with its own, tighter step timeout — see "Wait chunk 1"/"Wait chunk 2"
@@ -106,7 +106,7 @@ jobs:
       # start-failure investigation from run #25 are worth keeping) — it is
       # just not in the default nightly set while that investigation is open.
       # Pass `profiles: c1k,c10k` on a manual dispatch to run it anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c100,c1k' }}
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'direct,zoxy,haproxy,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
