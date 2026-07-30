@@ -92,6 +92,14 @@ const deadline = struct {
     const backend_up: u64 = 180 * std.time.ns_per_s;
     const build: u64 = 900 * std.time.ns_per_s;
     const start: u64 = 120 * std.time.ns_per_s;
+    /// A transient registry pull hiccup or a stale port bind (runs #26, #30)
+    /// shouldn't cost a proxy its entire night's data over one bad attempt.
+    /// Retried at the `start` call site; MUST stay reflected in `turn`'s sum
+    /// below or a retry sequence can re-introduce the run #24 watchdog
+    /// inversion (a stage running long converts its own bound into one that
+    /// costs every proxy after it).
+    const start_attempts: u32 = 3;
+    const start_retry_backoff: u64 = 15 * std.time.ns_per_s;
     const probe_each: u64 = 10 * std.time.ns_per_s;
     const teardown: u64 = 90 * std.time.ns_per_s;
     const inspect: u64 = 30 * std.time.ns_per_s;
@@ -144,7 +152,7 @@ const deadline = struct {
     /// stage bound above cannot silently re-introduce the inversion.
     fn turn(ramp_seconds: u64, cooldown_s: u64) u64 {
         return proxy(ramp_seconds) // ramp — the one stage bounded by a kill
-        + start // container start
+        + start_attempts * start + (start_attempts - 1) * start_retry_backoff // container start, with retries
         + warm_probe // first 200
         + cadvisor_warm // cAdvisor discovery head start, before the ramp
         + teardown // after runOne returns, still inside the window
@@ -742,35 +750,55 @@ fn runOne(
         } else |_| {}
 
         enter(stage, .start, name);
-        _ = remote.check(
-            gpa,
-            arena,
-            io,
-            opts.fleet.proxyHost(),
-            try std.fmt.allocPrint(arena, "start {s}", .{name}),
-            try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
-                opts.fleet.remote_dir,
-                try envPrefix(arena, p, opts.fleet, if (opts.fleet.isLocal()) null else port),
-                opts.fleet.composeCmd(),
-                name,
-                name,
-            }),
-            deadline.start,
-        ) catch |e| {
-            // `compose up --wait` only ever printed ITS OWN lifecycle events —
-            // "Container zoxy Waiting" / "exited (1)" — never the crashed
-            // process's own stderr. Run #25 had zoxy and haproxy both exit(1) the
-            // instant they started at c10k, immediately after both had run c1k
-            // cleanly on the same image, and there was nothing to read beyond
-            // that they had died. `docker inspect` distinguishes an OOM kill
-            // (OOMKilled=true, exit 137) from the container's own decision to
-            // exit(1), and `docker logs` is the container's actual reason —
-            // whichever it turns out to be, this is the one place to catch it,
-            // since a wedge later in the ramp can't produce it: the container
-            // never got that far.
-            reportStartFailure(gpa, arena, io, opts.fleet, name);
-            return e;
-        };
+        const start_label = try std.fmt.allocPrint(arena, "start {s}", .{name});
+        const start_cmd = try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
+            opts.fleet.remote_dir,
+            try envPrefix(arena, p, opts.fleet, if (opts.fleet.isLocal()) null else port),
+            opts.fleet.composeCmd(),
+            name,
+            name,
+        });
+
+        var start_attempt: u32 = 1;
+        while (true) : (start_attempt += 1) {
+            if (remote.check(
+                gpa,
+                arena,
+                io,
+                opts.fleet.proxyHost(),
+                start_label,
+                start_cmd,
+                deadline.start,
+            )) |_| {
+                break;
+            } else |e| {
+                if (start_attempt >= deadline.start_attempts) {
+                    // `compose up --wait` only ever printed ITS OWN lifecycle events —
+                    // "Container zoxy Waiting" / "exited (1)" — never the crashed
+                    // process's own stderr. Run #25 had zoxy and haproxy both exit(1) the
+                    // instant they started at c10k, immediately after both had run c1k
+                    // cleanly on the same image, and there was nothing to read beyond
+                    // that they had died. `docker inspect` distinguishes an OOM kill
+                    // (OOMKilled=true, exit 137) from the container's own decision to
+                    // exit(1), and `docker logs` is the container's actual reason —
+                    // whichever it turns out to be, this is the one place to catch it,
+                    // since a wedge later in the ramp can't produce it: the container
+                    // never got that far.
+                    reportStartFailure(gpa, arena, io, opts.fleet, name);
+                    return e;
+                }
+                // A stale port bind (run #26, EADDRINUSE) and a registry hiccup
+                // (run #30, Docker Hub auth "context deadline exceeded" while
+                // pulling haproxy) are both transient — either previously cost a
+                // proxy its entire night over one failed attempt. `deadline.turn`
+                // already budgets for every attempt here, so retrying does not
+                // risk the watchdog inversion from run #24.
+                redact.log("bench: [{s}] start attempt {d}/{d} failed, retrying", .{
+                    name, start_attempt, deadline.start_attempts,
+                });
+                io.sleep(.fromNanoseconds(deadline.start_retry_backoff), .awake) catch {};
+            }
+        }
 
         enter(stage, .identity, name);
         // Assert exactly this proxy is running before believing anything that
@@ -1079,7 +1107,7 @@ fn reportStartFailure(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, na
     const logs_cmd = std.fmt.allocPrint(arena, "docker logs {s} --tail 50 2>&1", .{name}) catch return;
     if (remote.check(gpa, arena, io, fleet.proxyHost(), "logs", logs_cmd, deadline.inspect)) |res| {
         var scrubbed: [4096]u8 = undefined;
-        const tail = res.stdout[res.stdout.len -| 2048 ..];
+        const tail = res.stdout[res.stdout.len -| 2048..];
         redact.log("bench: [{s}] container log:\n{s}", .{ name, redact.scrub(&scrubbed, tail) });
     } else |_| {}
 }
