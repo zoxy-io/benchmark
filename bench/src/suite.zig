@@ -96,8 +96,15 @@ const deadline = struct {
     const teardown: u64 = 90 * std.time.ns_per_s;
     const inspect: u64 = 30 * std.time.ns_per_s;
 
-    /// One proxy's whole turn — start, identity, warm, ramp, and the ramp's own
-    /// cleanup — as a multiple of the configured ramp plus a fixed allowance.
+    /// Bounds the warm-probe LOOP, because a single connect cannot be bounded:
+    /// `Io.Threaded` panics outright on `netConnectIp` with a timeout ("TODO
+    /// implement netConnectIpPosix with timeout"), so the per-attempt timeout has
+    /// to be `.none` and a black-holed peer costs the OS SYN timeout — minutes,
+    /// not seconds. Counting attempts alone would then let a wedged host hold the
+    /// suite for the better part of an hour.
+    const warm_probe: u64 = 90 * std.time.ns_per_s;
+
+    /// The ramp child — start to exit, including the cAdvisor poller's teardown.
     ///
     /// Every deadline above bounds a REMOTE command. Everything in-process had
     /// none, which is how a single proxy came to hold the entire suite: nightly
@@ -106,16 +113,50 @@ const deadline = struct {
     fn proxy(ramp_seconds: u64) u64 {
         return (ramp_seconds * 2 + 300) * std.time.ns_per_s;
     }
+
+    /// `ProxyWatchdog`'s window: one proxy's WHOLE turn, as the sum of every
+    /// bounded stage inside it plus a grace margin.
+    ///
+    /// This must be strictly LONGER than the longest legitimate turn, and the
+    /// arithmetic is the whole point. The watchdog's only move is to end the
+    /// process, so if it fires while an inner deadline still had time left it
+    /// converts a bound that would have cost ONE proxy into one that costs every
+    /// proxy after it.
+    ///
+    /// Run #24 shipped exactly that inversion. The ramp had just been moved into
+    /// a killable child so a wedge would be survivable — but both bounds were
+    /// `proxy(ramp_seconds)`, and the watchdog starts a whole `start` +
+    /// `identity` + `warm` earlier, so it always won the race. The child's
+    /// deadline was unreachable by construction and haproxy still took pingora
+    /// and envoy with it, in both profiles.
+    ///
+    /// Summed rather than "`proxy()` plus a round number" so that raising any
+    /// stage bound above cannot silently re-introduce the inversion.
+    fn turn(ramp_seconds: u64, cooldown_s: u64) u64 {
+        return proxy(ramp_seconds) // ramp — the one stage bounded by a kill
+        + start // container start
+        + warm_probe // first 200
+        + teardown // after runOne returns, still inside the window
+        + 4 * inspect // leftover check, identity, image id, build-info
+        + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
+    }
 };
 
-/// Bounds one proxy's turn, which blocks in-process and cannot be cancelled.
+/// The LAST-RESORT bound on one proxy's turn: the one that fires when a stage
+/// that should have bounded itself did not.
 ///
-/// There is no graceful option here: the work is inside a third-party event
-/// loop, so once it fails to return there is nothing left to unwind. Ending the
-/// process is crude but bounded, and strictly better than what it replaces —
-/// the profile's completed proxies are already flushed to profile.json,
-/// cloud-init uploads them, and the runner gets a terminal marker in minutes
-/// rather than polling a corpse until the step times out.
+/// Every stage inside a turn now has its own deadline and its own recovery — a
+/// remote command times out and its child is killed, the ramp is a child process
+/// and gets killed too, and either way `runOne` records that proxy `failed` and
+/// the suite moves to the next one. This thread exists for what is left: an
+/// in-process step with no deadline of its own (an artifact write, `io.sleep`,
+/// the Io provider itself wedging), where there is nothing to cancel.
+///
+/// Its only move is to end the process, which is why `deadline.turn` is sized to
+/// lose every race it can. Crude but bounded, and strictly better than the hang
+/// it replaces: the profile's completed proxies are already flushed to
+/// profile.json, cloud-init uploads them, and the runner gets a terminal marker
+/// in minutes rather than polling a corpse until the step times out.
 ///
 /// The stage pointer is the point. Run #12 hung with the proxy VM's CPU flat,
 /// meaning the ramp had finished, and nothing recorded whether it died in the
@@ -195,8 +236,8 @@ const ProxyWatchdog = struct {
     ///
     /// The second is not a remote possibility: haproxy is configured with
     /// `timeout client 60s` and `timeout http-keep-alive 60s`, so a healthy
-    /// haproxy closes an idle connection a minute after the ramp ends — roughly
-    /// 500 seconds before this watchdog fires.
+    /// haproxy closes an idle connection a minute after the ramp ends — many
+    /// minutes before this watchdog fires.
     fn logEstablished() void {
         var buf: [4096]u8 = undefined;
         const fd = std.os.linux.open("/proc/net/snmp", .{ .ACCMODE = .RDONLY }, 0);
@@ -270,13 +311,6 @@ fn cacheableImage(name: []const u8) ?[]const u8 {
 
 const warm_probe_attempts = 30;
 const warm_probe_interval_ns = 2 * std.time.ns_per_s;
-/// Bounds the probe LOOP, because a single connect cannot be bounded:
-/// `Io.Threaded` panics outright on `netConnectIp` with a timeout ("TODO
-/// implement netConnectIpPosix with timeout"), so the per-attempt timeout has to
-/// be `.none` and a black-holed peer costs the OS SYN timeout — minutes, not
-/// seconds. Counting attempts alone would then let a wedged host hold the suite
-/// for the better part of an hour.
-const warm_probe_deadline_ns = 90 * std.time.ns_per_s;
 
 pub const Result = struct {
     records: []artifact.ProxyRecord,
@@ -551,8 +585,13 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         //
         // It reads `stage`, so whatever it catches, the log names the step. That
         // is the difference between another silent hour and a diagnosis.
+        //
+        // `turn`, NOT `proxy`: covering the whole turn with the RAMP's bound made
+        // this the first deadline to fire rather than the last, which is how a
+        // wedged haproxy kept costing pingora and envoy their measurements even
+        // after the ramp became killable. See `deadline.turn`.
         var watchdog: ProxyWatchdog = .{
-            .limit_ns = deadline.proxy(p.ramp_seconds),
+            .limit_ns = deadline.turn(p.ramp_seconds, p.cooldown_s),
             .name = name,
             .stage = &stage,
         };
@@ -915,8 +954,8 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
         if (probeOnce(io, addr, path)) |_| return else |_| {}
 
         const elapsed = started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
-        if (elapsed >= warm_probe_deadline_ns) {
-            redact.log("bench: [{s}] never served 200 within {d}s", .{ name, warm_probe_deadline_ns / std.time.ns_per_s });
+        if (elapsed >= deadline.warm_probe) {
+            redact.log("bench: [{s}] never served 200 within {d}s", .{ name, deadline.warm_probe / std.time.ns_per_s });
             return error.WarmProbeFailed;
         }
         io.sleep(.fromNanoseconds(warm_probe_interval_ns), .awake) catch {};
@@ -1095,6 +1134,22 @@ fn nowIso(io: Io, arena: Allocator) ![]const u8 {
         ds.getMinutesIntoHour(),
         ds.getSecondsIntoMinute(),
     });
+}
+
+test "the watchdog is the outer bound, so an inner deadline always fires first" {
+    // The stages the watchdog covers but the ramp child's own deadline does not.
+    // Unless `turn` exceeds `proxy` by more than these, the watchdog — whose only
+    // move is to end the process — fires while the child still had time left, and
+    // one wedged proxy costs every proxy after it. That was run #24's bug: both
+    // were `proxy(ramp_seconds)`, so haproxy still took pingora and envoy.
+    const outside_ramp = deadline.start + deadline.warm_probe +
+        deadline.teardown + 4 * deadline.inspect;
+
+    for (&profile.all) |p| {
+        const turn = deadline.turn(p.ramp_seconds, p.cooldown_s);
+        const ramp_child = deadline.proxy(p.ramp_seconds);
+        try std.testing.expect(turn > ramp_child + outside_ramp);
+    }
 }
 
 test "isKnownProxy excludes direct, which has no container" {
