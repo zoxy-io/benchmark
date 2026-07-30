@@ -657,3 +657,31 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      # Tells the landing site to pull tonight's numbers in, now that they're
+      # actually live at the URL it fetches from — precise timing instead of a
+      # guessed cron over there, which would either race a slow run (this job
+      # times out at 150 minutes) or sit idle after a fast one. Best-effort: a
+      # missed dispatch just leaves the site's numbers one night stale, not a
+      # failed deploy here.
+      #
+      # ZOXY_IO_DISPATCH_TOKEN is a fine-grained PAT scoped to Contents: read
+      # and write on zoxy-io/site ONLY — nothing on this repo, nothing broader.
+      # Same secret-handling rule as DISCORD_WEBHOOK above: only ever through
+      # `env:`, never interpolated into a command line.
+      - name: Notify zoxy-io to refresh benchmark numbers
+        if: always() && steps.deployment.outcome == 'success'
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.ZOXY_IO_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "ZOXY_IO_DISPATCH_TOKEN is unset — skipping the dispatch"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/zoxy-io/site/dispatches" \
+            -d '{"event_type":"bench-nightly","client_payload":{"profile":"c1k"}}'
