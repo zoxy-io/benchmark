@@ -310,8 +310,23 @@ write_files:
       bench-os put log "$LOG" || true
       # rc 3 is `bench suite` reporting that it ran but some proxy failed — real
       # data worth publishing, with the per-proxy status recorded in
-      # profile.json. Anything else means the suite itself broke.
-      if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+      # profile.json. rc 4 is the SAME situation reached a different way: the
+      # per-proxy watchdog (suite.zig's ProxyWatchdog) had to end the whole
+      # process because one proxy wedged somewhere no ordinary error path could
+      # catch — every OTHER proxy in that profile still ran to completion and
+      # flushed its own record before the wedge, exactly like an rc-3 run.
+      #
+      # Run 20260730-112927 is why this matters: envoy wedged mid-ramp in BOTH
+      # profiles, rc=4 both times, and this check (as `-eq 0 || -eq 3`) sent
+      # FAILED even though the render step immediately after logged "rendered
+      # 2 of 2 profile(s)" — direct/zoxy/haproxy/pingora's numbers were
+      # complete and correct in both. A red run with nothing wrong in it is
+      # worse than a quiet one: it trains whoever is watching Discord to
+      # expect noise on a genuine failure too.
+      #
+      # Anything else means the suite itself broke before producing anything
+      # worth trusting.
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
         bench-os say DONE "rc=$rc"
         : > "$TERMINAL" || true
       else
