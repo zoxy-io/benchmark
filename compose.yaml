@@ -28,13 +28,22 @@
 # pins the container to core 0 (cpuset).
 x-proxy-common: &proxy-common
   cpus: 1
-  # 1g, not 512m: haproxy alone wants ~312 MiB of buffers at c10k (default
-  # tune.bufsize 16 KiB, two per connection, 10000 connections) before any
-  # per-connection state, and a proxy killed by its own cgroup limit mid-ramp
-  # looks like a proxy that hung. The cap still has to BIND — it is the fairness
-  # mechanism that replaces "identical VMs" — but it must bound the proxy, not
-  # decide the benchmark.
-  mem_limit: ${PROXY_MEM:-1g}
+  # 4g, not 1g: run #25 had zoxy AND haproxy refuse to start at c10k (`docker
+  # compose up --wait` reporting "exited (1)" the instant each container
+  # started, immediately after both had run c1k cleanly on the same image and
+  # the same host) while pingora started fine in the identical host state —
+  # ruling out host-level resource exhaustion and pointing at each container's
+  # own startup allocation. zoxy pre-allocates its conn/upstream slot arrays
+  # at boot (TigerStyle: no dynamic growth), and c10k asks for 11464 of each,
+  # ~8x c1k's 1386 — plausibly enough to blow a 1g cap during startup itself,
+  # which is a controlled `error.OutOfMemory` exit(1), not a cgroup SIGKILL
+  # (that would show as exited(137)). haproxy's maxconn is unchanged between
+  # rounds, so its buffer footprint is not profile-driven the same way — 4g is
+  # a blunt first move for both, not a confirmed diagnosis; see the
+  # start-failure log capture below for what actually happens next.
+  # The cap still has to BIND — it is the fairness mechanism that replaces
+  # "identical VMs" — but it must bound the proxy, not decide the benchmark.
+  mem_limit: ${PROXY_MEM:-4g}
   ulimits:
     nofile:
       soft: 1048576

@@ -697,7 +697,7 @@ fn runOne(
         } else |_| {}
 
         enter(stage, .start, name);
-        _ = try remote.check(
+        _ = remote.check(
             gpa,
             arena,
             io,
@@ -707,7 +707,21 @@ fn runOne(
                 opts.fleet.remote_dir, try envPrefix(arena, p, opts.fleet), opts.fleet.composeCmd(), name, name,
             }),
             deadline.start,
-        );
+        ) catch |e| {
+            // `compose up --wait` only ever printed ITS OWN lifecycle events —
+            // "Container zoxy Waiting" / "exited (1)" — never the crashed
+            // process's own stderr. Run #25 had zoxy and haproxy both exit(1) the
+            // instant they started at c10k, immediately after both had run c1k
+            // cleanly on the same image, and there was nothing to read beyond
+            // that they had died. `docker inspect` distinguishes an OOM kill
+            // (OOMKilled=true, exit 137) from the container's own decision to
+            // exit(1), and `docker logs` is the container's actual reason —
+            // whichever it turns out to be, this is the one place to catch it,
+            // since a wedge later in the ramp can't produce it: the container
+            // never got that far.
+            reportStartFailure(gpa, arena, io, opts.fleet, name);
+            return e;
+        };
 
         enter(stage, .identity, name);
         // Assert exactly this proxy is running before believing anything that
@@ -984,6 +998,29 @@ fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
     // Only a 2xx counts. A proxy that is up but whose origin is dead answers
     // 502, and treating that as ready would ramp against an error page.
     if (std.mem.indexOf(u8, line, " 2") == null) return error.NotServing;
+}
+
+/// Best-effort: why `name`'s container did not start.
+///
+/// Never returns an error — a diagnostic that could fail the run it is trying
+/// to explain would defeat the point. Bounded by `deadline.inspect` per probe,
+/// same as every other in-band inspection.
+fn reportStartFailure(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: []const u8) void {
+    const inspect_cmd = std.fmt.allocPrint(
+        arena,
+        "docker inspect {s} --format '{{{{.State.ExitCode}}}} oom={{{{.State.OOMKilled}}}} {{{{.State.Error}}}}'",
+        .{name},
+    ) catch return;
+    if (remote.check(gpa, arena, io, fleet.proxyHost(), "inspect", inspect_cmd, deadline.inspect)) |res| {
+        redact.log("bench: [{s}] {s}", .{ name, std.mem.trim(u8, res.stdout, " \n\r\t") });
+    } else |_| {}
+
+    const logs_cmd = std.fmt.allocPrint(arena, "docker logs {s} --tail 50 2>&1", .{name}) catch return;
+    if (remote.check(gpa, arena, io, fleet.proxyHost(), "logs", logs_cmd, deadline.inspect)) |res| {
+        var scrubbed: [4096]u8 = undefined;
+        const tail = res.stdout[res.stdout.len -| 2048 ..];
+        redact.log("bench: [{s}] container log:\n{s}", .{ name, redact.scrub(&scrubbed, tail) });
+    } else |_| {}
 }
 
 /// Fail unless `expected` is the only known proxy container running.
