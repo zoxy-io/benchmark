@@ -28,21 +28,15 @@
 # pins the container to core 0 (cpuset).
 x-proxy-common: &proxy-common
   cpus: 1
-  # 4g, not 1g: run #25 had zoxy AND haproxy refuse to start at c10k (`docker
-  # compose up --wait` reporting "exited (1)" the instant each container
-  # started, immediately after both had run c1k cleanly on the same image and
-  # the same host) while pingora started fine in the identical host state —
-  # ruling out host-level resource exhaustion and pointing at each container's
-  # own startup allocation. zoxy pre-allocates its conn/upstream slot arrays
-  # at boot (TigerStyle: no dynamic growth), and c10k asks for 11464 of each,
-  # ~8x c1k's 1386 — plausibly enough to blow a 1g cap during startup itself,
-  # which is a controlled `error.OutOfMemory` exit(1), not a cgroup SIGKILL
-  # (that would show as exited(137)). haproxy's maxconn is unchanged between
-  # rounds, so its buffer footprint is not profile-driven the same way — 4g is
-  # a blunt first move for both, not a confirmed diagnosis; see the
-  # start-failure log capture below for what actually happens next.
-  # The cap still has to BIND — it is the fairness mechanism that replaces
-  # "identical VMs" — but it must bound the proxy, not decide the benchmark.
+  # 4g, not 1g: run #25 had zoxy AND haproxy refuse to start at c10k, which
+  # looked memory-shaped (zoxy pre-allocates its conn/upstream slot arrays at
+  # boot, and c10k asks for ~8x c1k's). `reportStartFailure`'s `docker
+  # inspect`/`docker logs` (added the same night) settled it on the VERY NEXT
+  # run: `oom=false` and a literal EADDRINUSE / "cannot bind socket (Address
+  # in use) for [0.0.0.0:8080]" for both — a port-reuse problem, not memory.
+  # See PROXY_PORT below for the actual fix. Left at 4g anyway: it costs
+  # nothing and a real OOM is still exactly what this cap exists to bound
+  # rather than decide the benchmark.
   mem_limit: ${PROXY_MEM:-4g}
   ulimits:
     nofile:
@@ -53,6 +47,30 @@ x-proxy-common: &proxy-common
     backend:
       condition: service_healthy
       required: false # cloud: backend runs on another VM, service absent there
+
+# PROXY_PORT: the actual fix for the run #25/#26 start failures. `bench`
+# gives every (profile, proxy) TURN its own host port (see
+# bench/src/suite.zig's `proxyPort`) instead of every turn binding a fixed
+# :8080 — so a proxy's second start in a run never has to reuse the exact
+# port its first start used. Root cause is still open (an isolated,
+# traffic-free bind/teardown/rebind cycle on :8080 under real host networking
+# does NOT reproduce the failure — only a turn that actually served load
+# does), so this makes the question moot rather than answered.
+#
+# Each proxy resolves it differently because each gets its config a
+# different way: pingora's LISTEN and this default are compose-file values,
+# resolved at PARSE time from bench's shell env. haproxy.cfg and
+# envoy.yaml.template are static mounted files compose interpolation cannot
+# reach, so they resolve it themselves — haproxy natively, at its own
+# startup, from the container env below; envoy has no such mechanism, so
+# its `command` runs `sed` over the template BEFORE compose parsing ever
+# matters, baking the same parse-time value in as a literal. zoxy's
+# entrypoint.sh already renders a template this same way for @BACKEND_ADDR@,
+# so @PORT@ just rides along.
+#
+# Local mode never sets this (see runOne's `isLocal` branch) — bridge
+# networking already tears down and rebinds through Docker's own NAT layer,
+# not a raw app bind(), and never reproduced the failure either.
 
 # Every proxy is healthchecked, and the check is a real request THROUGH it to
 # the backend's /1k — the very body the benchmark asks for. Without one,
@@ -80,7 +98,7 @@ x-healthcheck-timing: &healthcheck-timing
 # assumed: the alpine-based one (haproxy) carries busybox wget.
 x-healthcheck-wget: &healthcheck-wget
   <<: *healthcheck-timing
-  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/1k"]
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PROXY_PORT:-8080}/1k"]
 
 # The debian-based ones (zoxy, pingora) have neither — zoxy's
 # runtime stage is a bare debian-slim carrying the binary and its entrypoint,
@@ -94,7 +112,7 @@ x-healthcheck-bash: &healthcheck-bash
     - CMD
     - bash
     - -c
-    - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
+    - 'exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT:-8080} && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
 
 services:
   # ---------------------------------------------------------------- origin --
@@ -183,6 +201,9 @@ services:
       ZOXY_WORKERS: 1
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
       ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
+      # entrypoint.sh renders this into config.template.json's @PORT@ — see
+      # x-proxy-common for why the cloud overlay varies it per turn.
+      PROXY_PORT: ${PROXY_PORT:-8080}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
     ports:
@@ -198,6 +219,10 @@ services:
       # hostname locally (bridge DNS + runtime resolver); the cloud overlay
       # replaces it with an IP literal because 127.0.0.11 doesn't exist there
       BACKEND_ADDR: backend:9000
+      # haproxy.cfg's `bind` reads this via its OWN native env-var expansion
+      # (same mechanism BACKEND_ADDR already uses) — haproxy.cfg is a static
+      # mounted file, so compose's `${}` interpolation never reaches it.
+      PROXY_PORT: ${PROXY_PORT:-8080}
     volumes:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
@@ -215,9 +240,21 @@ services:
     # --concurrency 1: envoy sizes its worker threads from the visible CPU count,
     # not the cgroup quota, so on a 4-core VM it would start four workers inside a
     # 1-CPU box. Every proxy here is pinned to one worker.
-    command: ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "1"]
+    #
+    # envoy.yaml has no native env-var substitution and is a static mounted
+    # file, so compose's `${}` interpolation cannot reach its listener port
+    # either — unlike haproxy.cfg's `bind`, there is no runtime mechanism to
+    # lean on. `${PROXY_PORT:-8080}` below IS interpolated, but at COMPOSE
+    # PARSE time (this string lives in compose.yaml itself), which bakes the
+    # literal port into the sed command before the container ever starts —
+    # see x-proxy-common for why the port varies per turn at all.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        sed 's/@PORT@/${PROXY_PORT:-8080}/' /etc/envoy/envoy.yaml.template > /tmp/envoy.yaml &&
+        exec envoy -c /tmp/envoy.yaml --concurrency 1
     volumes:
-      - ./proxies/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./proxies/envoy/envoy.yaml.template:/etc/envoy/envoy.yaml.template:ro
     ports:
       - "8080:8080"
     healthcheck: *healthcheck-bash
@@ -235,7 +272,11 @@ services:
     container_name: pingora
     profiles: [pingora]
     environment:
-      LISTEN: 0.0.0.0:8080
+      # Baked at compose PARSE time (this whole value lives in compose.yaml,
+      # unlike haproxy.cfg/envoy.yaml which are static mounted files) — pingora
+      # reads LISTEN once at its own startup, so the resolved literal is all it
+      # ever needs. See x-proxy-common for why the port varies per turn.
+      LISTEN: 0.0.0.0:${PROXY_PORT:-8080}
       UPSTREAM: backend:9000
     ports:
       - "8080:8080"

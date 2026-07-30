@@ -41,7 +41,10 @@ if [ -z "$ip" ]; then
     exit 1
 fi
 
-sed -e "s/@BACKEND_ADDR@/$ip:$port/" -e "s/@LIMITS@/$LIMITS/" \
+# PROXY_PORT varies per (profile, proxy) turn on the cloud fleet — see
+# compose.yaml's x-proxy-common for why — always set by compose (defaulting
+# to 8080), never literally unset.
+sed -e "s/@BACKEND_ADDR@/$ip:$port/" -e "s/@LIMITS@/$LIMITS/" -e "s/@PORT@/${PROXY_PORT:-8080}/" \
     /etc/zoxy/config.template.json > /etc/zoxy/config.json
 
 # One event loop per PROCESS (no thread/worker knob), capped to 1 CPU and pinned

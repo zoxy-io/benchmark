@@ -520,7 +520,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
                 opts.fleet.proxyHost(),
                 try std.fmt.allocPrint(arena, "build {s}", .{name}),
                 try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
-                    opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet) catch "", opts.fleet.composeCmd(), name, name,
+                    opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet, null) catch "", opts.fleet.composeCmd(), name, name,
                 }),
                 deadline.build,
             ) catch {
@@ -560,7 +560,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     }
 
     // --- the measurement loop.
-    for (opts.proxies) |name| {
+    for (opts.proxies, 0..) |name, proxy_idx| {
         if (build_failed.contains(name)) {
             try records.append(arena, .{
                 .name = name,
@@ -603,7 +603,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
         defer watchdog.done.store(true, .release);
 
-        const rec = runOne(gpa, arena, io, opts, name, &stage) catch |e| blk: {
+        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, &stage) catch |e| blk: {
             redact.log("bench: [{s}] {s} at stage {s}", .{ name, @errorName(e), stage.str() });
             break :blk artifact.ProxyRecord{
                 .name = name,
@@ -652,10 +652,18 @@ fn runOne(
     io: Io,
     opts: Options,
     name: []const u8,
+    proxy_idx: usize,
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
     const p = opts.prof;
     const direct = isDirect(name);
+    // Local mode never varies the port — bridge networking already tears down
+    // and rebinds cleanly (Docker's own NAT layer, not a raw app bind()), and
+    // varying it there would also mean varying compose.yaml's static
+    // `ports: "8080:8080"` mapping for no reason. 8080 stays correct for a
+    // local run purely because `PROXY_PORT` is then left unset and every
+    // proxy's own default is 8080 — see `envPrefix`.
+    const port: u16 = if (opts.fleet.isLocal()) 8080 else proxyPort(p, proxy_idx);
 
     var notes: std.ArrayList([]const u8) = .empty;
     var zoxy_commit: ?[]const u8 = null;
@@ -664,7 +672,7 @@ fn runOne(
     const target = if (direct)
         try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ip, p.req_path })
     else
-        try std.fmt.allocPrint(arena, "http://{s}:8080{s}", .{ opts.fleet.proxy_ip, p.req_path });
+        try std.fmt.allocPrint(arena, "http://{s}:{d}{s}", .{ opts.fleet.proxy_ip, port, p.req_path });
 
     if (!direct) {
         // What the PREVIOUS proxy left behind on the proxy host, before this one
@@ -704,7 +712,11 @@ fn runOne(
             opts.fleet.proxyHost(),
             try std.fmt.allocPrint(arena, "start {s}", .{name}),
             try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
-                opts.fleet.remote_dir, try envPrefix(arena, p, opts.fleet), opts.fleet.composeCmd(), name, name,
+                opts.fleet.remote_dir,
+                try envPrefix(arena, p, opts.fleet, if (opts.fleet.isLocal()) null else port),
+                opts.fleet.composeCmd(),
+                name,
+                name,
             }),
             deadline.start,
         ) catch |e| {
@@ -1119,7 +1131,49 @@ fn teardownProxy(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: [
 /// it does not fail loudly — compose substitutes an empty string and each proxy
 /// starts with `extra_hosts: "backend:"`, so the failure surfaces much later as
 /// a warm probe that never gets a 200.
-fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet) ![]const u8 {
+/// Base of the per-turn port pool used for the CLOUD proxy listener, so a
+/// proxy's Nth start on this host never has to reuse the exact host port its
+/// (N-1)th start used.
+const proxy_port_base: u16 = 18080;
+/// Headroom per profile's block. Current profiles run at most 4
+/// container-backed proxies (zoxy, haproxy, pingora, envoy); double that so a
+/// slightly longer proxy list still cannot spill into the next profile's
+/// block.
+const proxy_port_slots: u16 = 8;
+
+/// A host port for this (profile, proxy) turn, distinct from every other
+/// turn `bench suite` could run in one dispatch — including this SAME
+/// proxy's own turn in a DIFFERENT profile.
+///
+/// Runs #25 and #26: zoxy and haproxy both refused to start — `docker logs`
+/// (via `reportStartFailure`) showed a literal EADDRINUSE, "cannot bind
+/// socket (Address in use) for [0.0.0.0:8080]" — on their SECOND start
+/// within a run, immediately after running a full ramp under real load on
+/// their FIRST. An isolated, traffic-free bind/teardown/rebind cycle on the
+/// same host port, under the same `network_mode: host`, reproduces cleanly
+/// every time — so whatever holds the port only outlives teardown when the
+/// prior occupant actually served load, and the exact mechanism is still
+/// open. Giving every turn its own port makes the question moot rather than
+/// answered: nothing before a turn could ever be bound to the port it is
+/// about to use, regardless of what the mechanism turns out to be.
+///
+/// Keyed off `profile.all`'s COMPILED order, not the night's BENCH_PROFILES
+/// selection, so a subset (tonight: c100,c1k) still gets fixed,
+/// non-overlapping blocks — c10k's block stays reserved even on a night
+/// that never runs it, so re-enabling it later cannot collide with tonight's
+/// ports by coincidence.
+fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
+    var profile_idx: u16 = 0;
+    for (profile.all, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate.name, p.name)) {
+            profile_idx = @intCast(i);
+            break;
+        }
+    }
+    return proxy_port_base + profile_idx * proxy_port_slots + @as(u16, @intCast(proxy_idx));
+}
+
+fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, port: ?u16) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     // Only the cloud overlay interpolates BACKEND_IP; locally the proxies reach
     // the origin by its compose service name over docker DNS.
@@ -1127,6 +1181,10 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet) ![]const u8 {
     // Without this, compose falls back to `${ZOXY_REF:-main}` and builds a
     // floating main rather than the pinned commit — see profile.zig's note.
     try buf.print(arena, "ZOXY_REF={s} ", .{profile.zoxy_ref});
+    // Only for the `start` call — `build` has no listener to bind and no
+    // meaningful per-turn port, so it passes null and every proxy's config
+    // falls back to its own compose-level `${PROXY_PORT:-8080}` default.
+    if (port) |pt| try buf.print(arena, "PROXY_PORT={d} ", .{pt});
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
     }
@@ -1209,13 +1267,42 @@ test "envPrefix carries BACKEND_IP as well as the profile's tuning" {
         .backend_ip = "10.10.0.13",
         .ssh = .{ .key_path = "k", .known_hosts = "kh" },
     };
-    const s = try envPrefix(arena, profile.c10k, fleet);
+    const s = try envPrefix(arena, profile.c10k, fleet, 18096);
 
     // Without this every proxy starts with extra_hosts "backend:" and fails its
     // warm probe much later, with a symptom that does not name the cause.
     try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND_IP=10.10.0.13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT=18096") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11464") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11464") != null);
+}
+
+test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const fleet: Fleet = .{
+        .proxy_ip = "10.10.0.12",
+        .backend_ip = "10.10.0.13",
+        .ssh = .{ .key_path = "k", .known_hosts = "kh" },
+    };
+    const s = try envPrefix(arena, profile.c1k, fleet, null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT") == null);
+}
+
+test "proxyPort never repeats within one suite dispatch, including a proxy's own repeat turn across profiles" {
+    var seen = std.AutoHashMap(u16, void).init(std.testing.allocator);
+    defer seen.deinit();
+
+    for (profile.all) |p| {
+        // Generous upper bound — comfortably above today's 5-proxy set.
+        for (0..proxy_port_slots) |proxy_idx| {
+            const port = proxyPort(p, proxy_idx);
+            try std.testing.expect(!seen.contains(port));
+            try seen.put(port, {});
+        }
+    }
 }
 
 test "nowIso produces a sortable UTC stamp" {
