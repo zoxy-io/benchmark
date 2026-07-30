@@ -85,7 +85,26 @@ const ProgressCtx = struct {
     /// all (its .hgrm and cadvisor samples are written after the run), so it is
     /// the whole evidence base for diagnosing one.
     nd: *Io.File.Writer,
+
+    /// The proxy this ramp is measuring, for the heartbeat's log line.
+    name: []const u8,
+    /// Heartbeat bookkeeping: when it last spoke, and the completed count then.
+    last_log_s: f64 = 0,
+    last_completed: u64 = 0,
 };
+
+/// How often the ramp says where it is.
+///
+/// Silence was the single worst property of a wedged ramp. Its output is a pipe
+/// the parent replays on exit, so for 300 seconds — or 900, when it never exits —
+/// nothing at all reached the journal, and reconstructing where it stopped meant
+/// counting rows in the .ndjson afterwards. Run #21 put that at t≈259s for
+/// haproxy and t≈269s for pingora, which is the most useful fact anyone has about
+/// this bug, and it should not have taken a post-mortem to learn.
+///
+/// Coarse on purpose: one line per 15s is ~20 per ramp, next to nothing in a
+/// journal, and the ndjson remains the fine-grained record.
+const heartbeat_s: f64 = 15;
 
 fn onProgress(
     context: ?*anyopaque,
@@ -111,6 +130,31 @@ fn onProgress(
         .offered = 0,
         .achieved = 0,
     }) catch {};
+
+    // The heartbeat. Its value is where it STOPS, so it reports the throughput of
+    // the interval rather than a cumulative average — a rate collapsing towards
+    // zero over the last few beats is a different failure from one that is healthy
+    // right up to the last line.
+    if (elapsed_s - ctx.last_log_s < heartbeat_s) return;
+    const done = snapshot.counters.completed;
+    const dt = elapsed_s - ctx.last_log_s;
+    const rate = if (dt > 0) @as(f64, @floatFromInt(done - ctx.last_completed)) / dt else 0;
+    redact.log(
+        "bench: [{s}] t={d:.0}s done={d} rate={d:.0}/s " ++
+            "status={d} connect={d} read={d} write={d} timeout={d} deadline={d}",
+        .{
+            ctx.name,          elapsed_s,
+            done,              rate,
+            snapshot.counters.status_errors,
+            snapshot.counters.connect_errors,
+            snapshot.counters.read_errors,
+            snapshot.counters.write_errors,
+            snapshot.counters.timeouts,
+            snapshot.counters.deadline_errors,
+        },
+    );
+    ctx.last_log_s = elapsed_s;
+    ctx.last_completed = done;
 }
 
 /// Raise `flag` after `ns`. The ramp's own backstop: if zrk somehow does not
@@ -196,7 +240,13 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
     defer ts.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    var ctx: ProgressCtx = .{ .ts = &ts, .rows = &rows, .arena = arena, .nd = &nd_fw };
+    var ctx: ProgressCtx = .{
+        .ts = &ts,
+        .rows = &rows,
+        .arena = arena,
+        .nd = &nd_fw,
+        .name = opts.proxy,
+    };
 
     // --- cAdvisor sampling, concurrent with the ramp.
     var samples: std.ArrayList(cadvisor.Sample) = .empty;

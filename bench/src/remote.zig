@@ -68,6 +68,18 @@ pub const ExecOptions = struct {
     /// failed to finish, and a hook that can block is a hook that turns a bounded
     /// timeout back into a hang.
     on_deadline: ?*const fn () void = null,
+    /// Print the child's output AS IT ARRIVES rather than only when it exits.
+    ///
+    /// Off by default: for the short control commands the buffered-and-echoed-on-
+    /// failure behaviour is what you want. On for the ramp, which is the one child
+    /// that runs for minutes, because buffering it has two costs that only show up
+    /// when something is wrong. Run #24: haproxy's ramp wedged, the watchdog ended
+    /// the parent, and the child's ENTIRE buffer died with it unprinted — the one
+    /// proxy whose output was wanted was the only one guaranteed not to produce
+    /// any. And even on a clean kill the parent echoes a tail, so the earlier
+    /// lines are gone; meanwhile the runner tailing the journal sees nothing at
+    /// all for 15 minutes and the whole step looks hung.
+    stream_output: bool = false,
 };
 
 /// How long a killed child gets to actually die before we stop waiting for it.
@@ -134,8 +146,8 @@ pub fn exec(
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    var drain_out = Drain{ .io = io, .gpa = gpa, .file = child.stdout.?, .into = &out, .max = opts.max_output };
-    var drain_err = Drain{ .io = io, .gpa = gpa, .file = child.stderr.?, .into = &err, .max = opts.max_output };
+    var drain_out = Drain{ .io = io, .gpa = gpa, .file = child.stdout.?, .into = &out, .max = opts.max_output, .echo = opts.stream_output };
+    var drain_err = Drain{ .io = io, .gpa = gpa, .file = child.stderr.?, .into = &err, .max = opts.max_output, .echo = opts.stream_output };
     group.async(io, Drain.run, .{&drain_out});
     group.async(io, Drain.run, .{&drain_err});
 
@@ -206,6 +218,10 @@ const Drain = struct {
     file: Io.File,
     into: *std.ArrayList(u8),
     max: usize,
+    /// Print each line as it arrives, as well as accumulating it.
+    echo: bool = false,
+    /// How much of `into` has already been printed.
+    echoed: usize = 0,
 
     fn run(self: *Drain) void {
         var buf: [8192]u8 = undefined;
@@ -215,9 +231,48 @@ const Drain = struct {
             if (self.into.items.len >= self.max) continue;
             const take = @min(n, self.max - self.into.items.len);
             self.into.appendSlice(self.gpa, buf[0..take]) catch break;
+            if (self.echo) self.flushLines();
         }
+        // Whatever is left has no trailing newline; it is still worth printing.
+        if (self.echo) self.flushRest();
+    }
+
+    /// Print every COMPLETE line accumulated since the last call.
+    ///
+    /// Line-at-a-time, not chunk-at-a-time, and that is the whole reason this is
+    /// not simply `.inherit` on the child's stdio: `redact.scrub` matches an
+    /// address as a literal, so a read boundary falling inside one would let it
+    /// through unscrubbed. Scrubbing whole lines out of the contiguous
+    /// accumulation buffer means a read can split anything it likes.
+    fn flushLines(self: *Drain) void {
+        const pending = self.into.items[self.echoed..];
+        const end = std.mem.lastIndexOfScalar(u8, pending, '\n') orelse return;
+        printScrubbed(pending[0 .. end + 1]);
+        self.echoed += end + 1;
+    }
+
+    fn flushRest(self: *Drain) void {
+        if (self.echoed >= self.into.items.len) return;
+        printScrubbed(self.into.items[self.echoed..]);
+        self.echoed = self.into.items.len;
     }
 };
+
+/// Print `text` a line at a time, each line scrubbed.
+///
+/// Per line rather than in one pass because `scrub` stops at the end of its
+/// output buffer: handing it a whole burst would silently drop the tail.
+fn printScrubbed(text: []const u8) void {
+    var scrubbed: [4096]u8 = undefined;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // `scrub` can only grow a line (each address becomes a longer
+        // placeholder), so an over-long one is truncated rather than risked.
+        const safe = line[0..@min(line.len, scrubbed.len / 2)];
+        std.debug.print("{s}\n", .{redact.scrub(&scrubbed, safe)});
+    }
+}
 
 /// Builds ssh command lines for the fleet's private network.
 pub const Ssh = struct {
@@ -299,6 +354,37 @@ pub fn check(
         return error.RemoteCommandFailed;
     }
     return res;
+}
+
+test "the streaming echo consumes only complete lines" {
+    // The property that makes streaming safe to scrub: a read boundary landing
+    // inside a line — or inside an ADDRESS — never reaches `scrub`, because
+    // nothing is printed until its newline arrives.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var d = Drain{
+        .io = undefined,
+        .gpa = std.testing.allocator,
+        .file = undefined,
+        .into = &buf,
+        .max = 1 << 20,
+        .echo = true,
+    };
+
+    try buf.appendSlice(std.testing.allocator, "a\nb");
+    d.flushLines();
+    try std.testing.expectEqual(@as(usize, 2), d.echoed); // "a\n" only
+
+    try buf.appendSlice(std.testing.allocator, "c\n");
+    d.flushLines();
+    try std.testing.expectEqual(@as(usize, 5), d.echoed); // now "bc\n" too
+
+    // A last line with no newline is still worth printing at EOF.
+    try buf.appendSlice(std.testing.allocator, "d");
+    d.flushLines();
+    try std.testing.expectEqual(@as(usize, 5), d.echoed);
+    d.flushRest();
+    try std.testing.expectEqual(@as(usize, 6), d.echoed);
 }
 
 /// Set by the test below; a hook is a plain fn, so there is nowhere else to

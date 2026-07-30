@@ -851,23 +851,13 @@ fn runOne(
         .{
             .deadline_ns = deadline.proxy(p.ramp_seconds),
             .on_deadline = ProxyWatchdog.logSockets,
+            .stream_output = true,
         },
     );
-    // The child's own output, or it is lost. `remote.check` echoes a command's
-    // output only when it FAILS, so moving the ramp into a child process
-    // swallowed everything it logs — including the reason a proxy came back
-    // `degraded` with no cAdvisor samples, which is exactly the question that
-    // then took three local runs to even see.
-    //
-    // BOTH streams: `redact.log` goes through `std.debug.print`, i.e. stderr, so
-    // echoing stdout alone still lost every line the ramp writes.
-    for ([_][]const u8{ ramp_res.stdout, ramp_res.stderr }) |stream| {
-        if (stream.len == 0) continue;
-        var scrubbed: [8192]u8 = undefined;
-        const tail = stream[stream.len -| 4096 ..];
-        std.debug.print("{s}", .{redact.scrub(&scrubbed, tail)});
-    }
-    // Echo first, then judge: the output above is the whole reason to know why.
+    // `stream_output` above has already printed both streams, line by line, as
+    // they arrived — so there is deliberately no echo here. This used to replay a
+    // 4 KB tail after the fact, which lost the earlier lines on a long ramp and
+    // everything at all when the process did not survive to do the replay.
     if (!ramp_res.ok()) {
         var buf: [64]u8 = undefined;
         redact.log("bench: [{s}] ramp failed ({s})", .{ name, ramp_res.describe(&buf) });
