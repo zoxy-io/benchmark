@@ -54,7 +54,50 @@ pub const ExecOptions = struct {
     /// Log the argv on failure. Off by default because argv carries peer
     /// addresses; turn it on only for commands built from constants.
     log_argv: bool = false,
+    /// Called once, immediately BEFORE the deadline's kill — the last moment the
+    /// child's state can still be observed.
+    ///
+    /// It exists because the evidence a timeout needs is usually destroyed by the
+    /// timeout itself: a wedged ramp holds thousands of ESTABLISHED connections,
+    /// and killing it closes every one, so a census read after the fact reports an
+    /// aftermath instead of the wedge. /proc/net is per-netns and the loadgen runs
+    /// this child on the host, so the parent can read the child's sockets — but
+    /// only while it is alive.
+    ///
+    /// Must not touch `io`: by definition this fires when something has already
+    /// failed to finish, and a hook that can block is a hook that turns a bounded
+    /// timeout back into a hang.
+    on_deadline: ?*const fn () void = null,
 };
+
+/// How long a killed child gets to actually die before we stop waiting for it.
+const kill_grace_ns: u64 = 5 * std.time.ns_per_s;
+
+/// SIGKILL the child's whole process GROUP, and reap nothing.
+///
+/// Not `Child.kill`, for two reasons.
+///
+/// It signals the direct child only, so an `ssh` that has forked leaves the
+/// grandchild holding the connection — the thing `.pgid = 0` was set up to
+/// prevent. A negative pid targets the group, which with `.pgid = 0` is exactly
+/// this child and its descendants.
+///
+/// And it reaps: it waits on the child it just signalled, which races the
+/// `Waiter` already waiting on the same pid. The waiter wins, `Child.kill`'s
+/// `waitpid` gets ECHILD, and std reads that as a double-free — a hard panic in
+/// a Debug build (so `bench suite --local` died on any deadline), silently
+/// swallowed in the ReleaseFast build the fleet runs, which instead lost the
+/// exit status and left the term `unknown`. Leaving the reap to the one thread
+/// already doing it removes the race rather than tolerating it.
+///
+/// Takes the pid rather than the `Child`, because `Child.id` is set to null by
+/// whichever of `wait`/`kill` runs first — so by the time a deadline fires the
+/// waiter may already have cleared the only record of what to signal.
+fn killGroup(pid: std.posix.pid_t) void {
+    // Raw syscall: nothing here may touch `io`, which by definition is already
+    // failing to make progress when a deadline fires.
+    _ = std.os.linux.kill(-pid, std.os.linux.SIG.KILL);
+}
 
 /// Spawn `argv`, capture both streams, and enforce a wall-clock deadline.
 pub fn exec(
@@ -72,6 +115,10 @@ pub fn exec(
         // ssh has spawned rather than leaving one holding the connection.
         .pgid = 0,
     });
+    // Captured now, while it is still there to capture: `Child.id` is cleared by
+    // the reap, and the reap happens on another thread. With `.pgid = 0` the
+    // child's group id IS its pid, so this is the group to signal.
+    const pid = child.id.?;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -102,8 +149,27 @@ pub fn exec(
     var waited: u64 = 0;
     while (!waiter.done.load(.acquire)) {
         if (waited >= opts.deadline_ns) {
+            // Re-checked before committing to the timeout, for the child that
+            // finishes right on the wire: reporting it `timed_out` would be a
+            // lie, and a pid that has already been reaped can be REUSED, so
+            // signalling it would aim SIGKILL at whatever inherited the number.
+            if (waiter.done.load(.acquire)) break;
             timed_out = true;
-            child.kill(io);
+            if (opts.on_deadline) |hook| hook();
+            killGroup(pid);
+            // Let `Waiter` do the reaping, then move on.
+            //
+            // SIGKILL is prompt, so this normally returns on the first tick. It
+            // is bounded anyway because "prompt" is not "guaranteed": a process
+            // blocked in an uninterruptible kernel operation — the ramp child
+            // sitting in io_uring is exactly that shape — does not die until the
+            // operation completes, and waiting on it without a bound would put
+            // the hang straight back.
+            var grace: u64 = 0;
+            while (!waiter.done.load(.acquire) and grace < kill_grace_ns) {
+                io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
+                grace += step_ns;
+            }
             break;
         }
         io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
@@ -233,6 +299,66 @@ pub fn check(
         return error.RemoteCommandFailed;
     }
     return res;
+}
+
+/// Set by the test below; a hook is a plain fn, so there is nowhere else to
+/// record that it ran.
+var hook_fired: bool = false;
+
+test "the deadline hook runs, and runs before the child is killed" {
+    // The ordering is the entire point: the hook exists to observe state that
+    // the kill destroys. The child below never finishes on its own, so a hook
+    // that fires at all can only have fired on the deadline path.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    hook_fired = false;
+    const res = try exec(
+        std.testing.allocator,
+        threaded.io(),
+        // Absolute path and a shell BUILTIN loop, because a test has neither: PATH
+        // comes from `std.process.Init`, which only `main` receives, so a bare
+        // `sleep` here fails to resolve with FileNotFound.
+        &.{ "/bin/sh", "-c", "while :; do :; done" },
+        .{
+            .deadline_ns = 200 * std.time.ns_per_ms,
+            .on_deadline = struct {
+                fn f() void {
+                    hook_fired = true;
+                }
+            }.f,
+        },
+    );
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+
+    try std.testing.expect(res.timed_out);
+    try std.testing.expect(!res.ok());
+    try std.testing.expect(hook_fired);
+
+    // The termination survives the kill, which is the other half of `killGroup`:
+    // reaping from two threads lost it to ECHILD and left this `unknown`.
+    switch (res.term) {
+        .signal => |s| try std.testing.expectEqual(@as(u32, 9), @intFromEnum(s)),
+        else => return error.TestExpectedSignalledChild,
+    }
+}
+
+test "no hook is not an error" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const res = try exec(
+        std.testing.allocator,
+        threaded.io(),
+        // Absolute path and a shell BUILTIN loop, because a test has neither: PATH
+        // comes from `std.process.Init`, which only `main` receives, so a bare
+        // `sleep` here fails to resolve with FileNotFound.
+        &.{ "/bin/sh", "-c", "while :; do :; done" },
+        .{ .deadline_ns = 200 * std.time.ns_per_ms },
+    );
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try std.testing.expect(res.timed_out);
 }
 
 test "Outcome.ok is true only for a clean exit" {

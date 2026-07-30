@@ -835,14 +835,23 @@ fn runOne(
             "--out-base {s} --runid {s} --outcome {s}{s}",
         .{ try selfExe(arena), p.name, name, target, out_base, opts.runid, outcome_path, cad_arg },
     );
-    const ramp_res = try remote.check(
+    // `exec` rather than `check`, for the hook alone.
+    //
+    // The socket census belongs to whichever bound actually fires, and now that
+    // is this one rather than `ProxyWatchdog` — so making the ramp killable would
+    // otherwise have silently taken the census with it, and `CurrEstab` vs `inuse`
+    // is the measurement that decides what the c10k stall IS (see
+    // `logEstablished`). It has to run BEFORE the kill: killing the ramp closes
+    // every connection it holds, so a census read afterwards describes the
+    // cleanup, not the wedge.
+    const ramp_res = try remote.exec(
         gpa,
-        arena,
         io,
-        .local,
-        try std.fmt.allocPrint(arena, "ramp {s}", .{name}),
-        ramp_cmd,
-        deadline.proxy(p.ramp_seconds),
+        try arena.dupe([]const u8, &.{ "sh", "-c", ramp_cmd }),
+        .{
+            .deadline_ns = deadline.proxy(p.ramp_seconds),
+            .on_deadline = ProxyWatchdog.logSockets,
+        },
     );
     // The child's own output, or it is lost. `remote.check` echoes a command's
     // output only when it FAILS, so moving the ramp into a child process
@@ -857,6 +866,12 @@ fn runOne(
         var scrubbed: [8192]u8 = undefined;
         const tail = stream[stream.len -| 4096 ..];
         std.debug.print("{s}", .{redact.scrub(&scrubbed, tail)});
+    }
+    // Echo first, then judge: the output above is the whole reason to know why.
+    if (!ramp_res.ok()) {
+        var buf: [64]u8 = undefined;
+        redact.log("bench: [{s}] ramp failed ({s})", .{ name, ramp_res.describe(&buf) });
+        return error.RampFailed;
     }
     const outcome = try ramp.readOutcome(arena, io, outcome_path);
     const end_iso = try nowIso(io, arena);
