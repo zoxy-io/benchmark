@@ -26,6 +26,7 @@ const zio = @import("zio");
 const zrk = @import("zrk");
 
 const cadvisor = @import("cadvisor.zig");
+const redact = @import("redact.zig");
 const profile = @import("profile.zig");
 
 const cli = zrk.cli;
@@ -73,6 +74,17 @@ const ProgressCtx = struct {
     ts: *zreport.TimeSeries,
     rows: *std.ArrayList(Row),
     arena: Allocator,
+    /// Flushed after every window, so a ramp that never returns still leaves its
+    /// timeseries on disk.
+    ///
+    /// This used to be flushed once, after `runner.run` — which meant a wedged
+    /// ramp kept whatever the buffer happened to have spilled and nothing else.
+    /// Run #21 survived with 269 of 300 windows for pingora and 259 for haproxy
+    /// purely by luck of buffer size; a stall nearer the start would have left an
+    /// empty file. The .ndjson is the only artifact a wedged proxy produces at
+    /// all (its .hgrm and cadvisor samples are written after the run), so it is
+    /// the whole evidence base for diagnosing one.
+    nd: *Io.File.Writer,
 };
 
 fn onProgress(
@@ -92,6 +104,7 @@ fn onProgress(
     // the NDJSON is byte-for-byte what the zrk CLI would have written and the
     // report's parser stays a single implementation.
     ctx.ts.record(snapshot, elapsed_s) catch {};
+    ctx.nd.interface.flush() catch {};
 
     ctx.rows.append(ctx.arena, .{
         .t = elapsed_s,
@@ -183,7 +196,7 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
     defer ts.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    var ctx: ProgressCtx = .{ .ts = &ts, .rows = &rows, .arena = arena };
+    var ctx: ProgressCtx = .{ .ts = &ts, .rows = &rows, .arena = arena, .nd = &nd_fw };
 
     // --- cAdvisor sampling, concurrent with the ramp.
     var samples: std.ArrayList(cadvisor.Sample) = .empty;
@@ -249,6 +262,19 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         try cfw.interface.flush();
     }
 
+    if (opts.cadvisor_addr != null) {
+        // The poller's own view. "0 samples" alone cannot distinguish "never
+        // reached cAdvisor" from "reached it and never saw our container", and
+        // those have different causes — one is the address, the other is
+        // cAdvisor's container discovery.
+        redact.log("bench: [{s}] cadvisor: {d} samples, {d} scrape failures, ever_found={}", .{
+            opts.proxy,
+            samples.items.len,
+            poller.scrape_failures,
+            poller.ever_found,
+        });
+    }
+
     const c = result.snapshot.counters;
     return .{
         .elapsed_s = result.elapsed_s,
@@ -308,4 +334,120 @@ test "coverage classifies a truncated run" {
     var stub = full;
     stub.elapsed_s = 20;
     try std.testing.expect(coverage(stub) < min_coverage);
+}
+
+
+// --- child/parent Outcome hand-off -----------------------------------------
+//
+// `ramp.run` is invoked as a CHILD (`bench ramp`) so a wedged generator can be
+// killed on a deadline. Once `runner.run` blocks, zio owns the calling thread, so
+// no in-process bound is possible — the only way to abandon it and keep measuring
+// the remaining proxies is for it to be a separate process. Runs #21 and #22 each
+// lost two proxies entirely because the only available bound was killing the
+// whole suite.
+//
+// `Outcome` is scalars, so the hand-off is lossless. Rendering and parsing are
+// split from the file I/O so the round-trip is testable without a filesystem.
+
+pub fn renderOutcome(w: *std.Io.Writer, o: Outcome) !void {
+    try w.print(
+        "{{\"elapsed_s\":{d},\"configured_s\":{d},\"launched\":{d}," ++
+            "\"interrupted\":{},\"completed\":{d},\"status_errors\":{d}," ++
+            "\"socket_errors\":{d},\"deadline_errors\":{d},\"max_behind_ns\":{d}," ++
+            "\"saturated\":{},\"identity_error\":{},\"cadvisor_samples\":{d}}}",
+        .{
+            o.elapsed_s,      o.configured_s,   o.launched,
+            o.interrupted,    o.completed,      o.status_errors,
+            o.socket_errors,  o.deadline_errors, o.max_behind_ns,
+            o.saturated,      o.identity_error, o.cadvisor_samples,
+        },
+    );
+}
+
+pub fn parseOutcome(arena: Allocator, text: []const u8) !Outcome {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+    const o = v.object;
+    return .{
+        .elapsed_s = jnum(o, "elapsed_s"),
+        .configured_s = jnum(o, "configured_s"),
+        .launched = @intFromFloat(jnum(o, "launched")),
+        .interrupted = jbool(o, "interrupted"),
+        .completed = @intFromFloat(jnum(o, "completed")),
+        .status_errors = @intFromFloat(jnum(o, "status_errors")),
+        .socket_errors = @intFromFloat(jnum(o, "socket_errors")),
+        .deadline_errors = @intFromFloat(jnum(o, "deadline_errors")),
+        .max_behind_ns = @intFromFloat(jnum(o, "max_behind_ns")),
+        .saturated = jbool(o, "saturated"),
+        .identity_error = jbool(o, "identity_error"),
+        .cadvisor_samples = @intFromFloat(jnum(o, "cadvisor_samples")),
+    };
+}
+
+fn jnum(o: std.json.ObjectMap, key: []const u8) f64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => 0,
+    };
+}
+
+fn jbool(o: std.json.ObjectMap, key: []const u8) bool {
+    const v = o.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+pub fn writeOutcome(io: Io, path: []const u8, o: Outcome) !void {
+    const f = try Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [1024]u8 = undefined;
+    var fw: Io.File.Writer = .init(f, io, &buf);
+    try renderOutcome(&fw.interface, o);
+    try fw.interface.flush();
+}
+
+pub fn readOutcome(arena: Allocator, io: Io, path: []const u8) !Outcome {
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 10));
+    return parseOutcome(arena, text);
+}
+
+test "an Outcome survives the child/parent round-trip" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Every field, with the shape a real c10k run produces. A silently zeroed
+    // field here would read downstream as a proxy that served nothing.
+    const want: Outcome = .{
+        .elapsed_s = 300.408,
+        .configured_s = 300.0,
+        .launched = 10000,
+        .interrupted = true,
+        .completed = 5544684,
+        .status_errors = 7,
+        .socket_errors = 80339,
+        .deadline_errors = 9299907,
+        .max_behind_ns = 111892499000,
+        .saturated = true,
+        .identity_error = false,
+        .cadvisor_samples = 287,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderOutcome(&w, want);
+    const got = try parseOutcome(arena, w.buffered());
+
+    try std.testing.expectApproxEqAbs(want.elapsed_s, got.elapsed_s, 1e-6);
+    try std.testing.expectApproxEqAbs(want.configured_s, got.configured_s, 1e-6);
+    try std.testing.expectEqual(want.launched, got.launched);
+    try std.testing.expectEqual(want.interrupted, got.interrupted);
+    try std.testing.expectEqual(want.completed, got.completed);
+    try std.testing.expectEqual(want.status_errors, got.status_errors);
+    try std.testing.expectEqual(want.socket_errors, got.socket_errors);
+    try std.testing.expectEqual(want.deadline_errors, got.deadline_errors);
+    try std.testing.expectEqual(want.max_behind_ns, got.max_behind_ns);
+    try std.testing.expectEqual(want.saturated, got.saturated);
+    try std.testing.expectEqual(want.identity_error, got.identity_error);
+    try std.testing.expectEqual(want.cadvisor_samples, got.cadvisor_samples);
 }

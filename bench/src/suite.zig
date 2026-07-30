@@ -231,6 +231,22 @@ const ProxyWatchdog = struct {
     }
 };
 
+/// This binary's own path, resolved HERE rather than written as
+/// `/proc/self/exe` into the command.
+///
+/// `remote.check` runs a command through `sh -c`, so a literal /proc/self/exe in
+/// the command string resolves to the SHELL, not to bench — the first attempt at
+/// spawning the ramp died with exit 127 that way. Resolving it in the parent also
+/// keeps the guarantee that matters: the ramp is the same build as the suite that
+/// spawned it, not whatever `bench` happens to be on PATH.
+fn selfExe(arena: Allocator) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
+    const got: isize = @bitCast(n);
+    if (got <= 0) return error.SelfExeUnavailable;
+    return arena.dupe(u8, buf[0..@intCast(got)]);
+}
+
 /// Must match the `FROM` in proxies/zoxy/Dockerfile. A mismatch fails zoxy's
 /// build loudly on a missing image, which is the right way for it to fail.
 const zig_toolchain_tag = "zoxy-bench/zig:0.16.0";
@@ -751,14 +767,59 @@ fn runOne(
     const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
     const out_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ opts.out_dir, name });
-    const outcome = try ramp.run(gpa, arena, .{
-        .prof = p,
-        .proxy = name,
-        .target = target,
-        .cadvisor_addr = cadvisor_addr,
-        .out_base = out_base,
-        .runid = opts.runid,
-    });
+
+    // The ramp runs as a CHILD, on a hard deadline.
+    //
+    // It used to be an in-process call, which could not be bounded: once
+    // `runner.run` blocks, zio owns this thread and there is nothing left to
+    // unwind. The only available bound was `ProxyWatchdog` killing the whole
+    // process, so a single wedged proxy took every proxy after it — runs #21 and
+    // #22 each lost two that way, which is why pingora and envoy still have no
+    // c10k measurement.
+    //
+    // As a separate process it can simply be killed (`remote.exec` does that on
+    // deadline), and this proxy is recorded `failed` while the rest of the profile
+    // proceeds. `Outcome` is scalars, handed back through a small JSON file.
+    //
+    // /proc/self/exe rather than a looked-up name: the child MUST be this exact
+    // binary. The suite and the ramp sharing one build is the property that makes
+    // "the agent drifted from the controller" impossible, and re-resolving it by
+    // path would quietly give that up.
+    const outcome_path = try std.fmt.allocPrint(arena, "{s}.outcome.json", .{out_base});
+    const cad_arg = if (cadvisor_addr != null)
+        try std.fmt.allocPrint(arena, " --cadvisor {s}:8081", .{opts.fleet.proxy_ip})
+    else
+        "";
+    const ramp_cmd = try std.fmt.allocPrint(
+        arena,
+        "{s} ramp --profile {s} --proxy {s} --target {s} " ++
+            "--out-base {s} --runid {s} --outcome {s}{s}",
+        .{ try selfExe(arena), p.name, name, target, out_base, opts.runid, outcome_path, cad_arg },
+    );
+    const ramp_res = try remote.check(
+        gpa,
+        arena,
+        io,
+        .local,
+        try std.fmt.allocPrint(arena, "ramp {s}", .{name}),
+        ramp_cmd,
+        deadline.proxy(p.ramp_seconds),
+    );
+    // The child's own output, or it is lost. `remote.check` echoes a command's
+    // output only when it FAILS, so moving the ramp into a child process
+    // swallowed everything it logs — including the reason a proxy came back
+    // `degraded` with no cAdvisor samples, which is exactly the question that
+    // then took three local runs to even see.
+    //
+    // BOTH streams: `redact.log` goes through `std.debug.print`, i.e. stderr, so
+    // echoing stdout alone still lost every line the ramp writes.
+    for ([_][]const u8{ ramp_res.stdout, ramp_res.stderr }) |stream| {
+        if (stream.len == 0) continue;
+        var scrubbed: [8192]u8 = undefined;
+        const tail = stream[stream.len -| 4096 ..];
+        std.debug.print("{s}", .{redact.scrub(&scrubbed, tail)});
+    }
+    const outcome = try ramp.readOutcome(arena, io, outcome_path);
     const end_iso = try nowIso(io, arena);
 
     // --- classify.

@@ -43,6 +43,7 @@ const usage =
     \\  notify  <rundir> [--dry-run]                     post to Discord
     \\  sweep                                            delete orphaned fleet VMs
     \\  wait    <runid>                                  await the self-driving run
+    \\  ramp    --profile .. --proxy .. --target ..      one proxy's ramp (spawned by `suite`)
     \\
 ;
 
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "suite")) return cmdSuite(init, rest);
     if (std.mem.eql(u8, cmd, "notify")) return cmdNotify(init, rest);
     if (std.mem.eql(u8, cmd, "index")) return cmdIndex(init, rest);
+    if (std.mem.eql(u8, cmd, "ramp")) return cmdRamp(init, rest);
 
     std.debug.print("bench: unknown command '{s}'\n\n{s}", .{ cmd, usage });
     std.process.exit(2);
@@ -493,4 +495,60 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// One proxy's ramp, as its own process.
+///
+/// Spawned by `bench suite` rather than called in-process, so a generator that
+/// stops making progress can be KILLED on a deadline. Once zrk's `runner.run`
+/// blocks there is no way to bound it from inside — zio owns the thread — and the
+/// only previous bound was killing the whole suite, which cost every proxy queued
+/// behind the wedged one.
+///
+/// Not in CONTRACT.md's original command list on purpose: that said "there is no
+/// separate ramp subcommand", and this is the reason that changed.
+fn cmdRamp(init: std.process.Init, args: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+
+    const prof_name = try flagValue(args, "--profile") orelse
+        return fail("bench ramp: --profile is required", .{});
+    const prof = profile.byName(prof_name) orelse
+        return fail("bench ramp: unknown profile '{s}'", .{prof_name});
+    const proxy = try flagValue(args, "--proxy") orelse
+        return fail("bench ramp: --proxy is required", .{});
+    const target = try flagValue(args, "--target") orelse
+        return fail("bench ramp: --target is required", .{});
+    const out_base = try flagValue(args, "--out-base") orelse
+        return fail("bench ramp: --out-base is required", .{});
+    const outcome_path = try flagValue(args, "--outcome") orelse
+        return fail("bench ramp: --outcome is required", .{});
+    const runid = try flagValue(args, "--runid") orelse "";
+
+    const cad: ?std.Io.net.IpAddress = if (try flagValue(args, "--cadvisor")) |spec| blk: {
+        const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse
+            return fail("bench ramp: --cadvisor wants host:port", .{});
+        const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch
+            return fail("bench ramp: bad --cadvisor port", .{});
+        break :blk try std.Io.net.IpAddress.parse(spec[0..colon], port);
+    } else null;
+
+    // Echo what the child actually parsed. The suite hands these across a process
+    // boundary now, so a flag that silently failed to arrive shows up as a
+    // `degraded` result with no cAdvisor samples and no explanation.
+    redact.log("bench: [{s}] ramp child: profile={s} cadvisor={s}", .{
+        proxy,
+        prof.name,
+        if (cad != null) "yes" else "none",
+    });
+
+    const outcome = try ramp.run(init.gpa, arena, .{
+        .prof = prof,
+        .proxy = proxy,
+        .target = target,
+        .cadvisor_addr = cad,
+        .out_base = out_base,
+        .runid = runid,
+    });
+    try ramp.writeOutcome(init.io, outcome_path, outcome);
+    exit(0);
 }
