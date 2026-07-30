@@ -10,7 +10,7 @@ function fmt(v, kind) {
   if (v>=1e3) return (v/1e3).toFixed(1)+'k';
   return v>=10 ? v.toFixed(0) : v.toFixed(2);
 }
-document.querySelectorAll('.hover-capture').forEach(cap => {
+document.querySelectorAll('.hover-capture[data-chart]').forEach(cap => {
   const id = cap.dataset.chart;
   const data = JSON.parse(document.getElementById('data-'+id).textContent);
   const wrap = document.getElementById('wrap-'+id);
@@ -35,6 +35,49 @@ document.querySelectorAll('.hover-capture').forEach(cap => {
               `<span class="tval">${fmt(best, data.yfmt)}</span></div>`;
     }
     tip.innerHTML = `<div class="trow"><span class="tname">offered</span><span class="tval">${fmt(x)} req/s</span></div>` + rows;
+    tip.hidden = false;
+    const wr = wrap.getBoundingClientRect();
+    let lx = e.clientX - wr.left + 14;
+    if (lx + tip.offsetWidth > wr.width - 8) lx = e.clientX - wr.left - tip.offsetWidth - 14;
+    tip.style.left = lx + 'px';
+    tip.style.top = Math.min(e.clientY - wr.top + 12, wr.height - tip.offsetHeight - 8) + 'px';
+  });
+  cap.addEventListener('mouseleave', () => { tip.hidden = true; cross.setAttribute('hidden',''); });
+});
+
+// Distribution-chart tooltip: same crosshair/tip mechanics as above, but a
+// LOG x-scale (percentile, n = 1/(1-p)) and one series instead of several
+// named ones, so it is not the same data shape or scale function — kept as
+// its own small block rather than folded into the handler above.
+document.querySelectorAll('.hover-capture[data-hist]').forEach(cap => {
+  const id = cap.dataset.hist;
+  const data = JSON.parse(document.getElementById('data-hist-'+id).textContent);
+  const wrap = document.getElementById('wrap-hist-'+id);
+  const tip = document.getElementById('tip-hist-'+id);
+  const svg = cap.ownerSVGElement;
+  const [W,H,ML,MR,MT,MB] = data.geom;
+  // Mirrors svg.zig's histChart X.f(n, decades) exactly — n=1 sits at ML.
+  const xOf = n => ML + (W-ML-MR) * Math.min(Math.max(Math.log10(Math.max(n,1)),0), data.decades) / data.decades;
+  const cross = document.createElementNS('http://www.w3.org/2000/svg','line');
+  cross.setAttribute('class','axis'); cross.setAttribute('y1',MT); cross.setAttribute('y2',H-MB);
+  cross.setAttribute('hidden',''); svg.insertBefore(cross, cap);
+  cap.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect();
+    const mx = (e.clientX - r.left) * (W / r.width);
+    let best = null, bd = Infinity, bx = 0;
+    for (const [n, ms] of data.pts) {
+      const px = xOf(n);
+      const d = Math.abs(px - mx);
+      if (d < bd) { bd = d; best = [n, ms]; bx = px; }
+    }
+    if (!best) return;
+    const [n, ms] = best;
+    cross.removeAttribute('hidden');
+    cross.setAttribute('x1', bx); cross.setAttribute('x2', bx);
+    const pct = 100 * (1 - 1/n);
+    const digits = pct < 99 ? 0 : pct < 99.9 ? 1 : pct < 99.99 ? 2 : 3;
+    tip.innerHTML = `<div class="trow"><span class="tname">1 in ${n.toFixed(0)} (p${pct.toFixed(digits)})</span>` +
+                     `<span class="tval">${fmt(ms/1000, 'ms')}</span></div>`;
     tip.hidden = false;
     const wr = wrap.getBoundingClientRect();
     let lx = e.clientX - wr.left + 14;

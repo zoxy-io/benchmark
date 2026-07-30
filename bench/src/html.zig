@@ -18,6 +18,7 @@ const std = @import("std");
 
 const analysis = @import("analysis.zig");
 const artifact = @import("artifact.zig");
+const jsonw = @import("jsonw.zig");
 const report = @import("report.zig");
 const svg = @import("svg.zig");
 
@@ -173,19 +174,23 @@ pub fn render(
     try out.writeAll("</div>");
 
     // --- per-proxy latency distributions
+    //
+    // Plots `dist_hist` (every window merged, warmup included) rather than
+    // `hist` (the summary table's reference-band histogram) — a reader
+    // hovering this chart should see what the whole run actually did, not a
+    // fairness-filtered slice of it. The downloadable `.hgrm` file is the
+    // SAME data (see analysis.wholeRunHist's doc comment), so the two no
+    // longer describe different things under one heading.
     var any_hist = false;
     for (g.present) |*p| {
-        if (p.hist) |*hh| {
+        if (p.dist_hist) |*hh| {
             if (hh.count() > 0) any_hist = true;
         }
     }
     if (any_hist) {
-        try out.print(
-            "<h2 class=\"dist-h\">Latency distribution · HdrHistogram (at {s} req/s reference load)</h2><div class=\"grid2\">",
-            .{svg.fmtSi(&buf, opts.ref_rate)},
-        );
+        try out.writeAll("<h2 class=\"dist-h\">Latency distribution · HdrHistogram (whole run)</h2><div class=\"grid2\">");
         for (g.present) |*p| {
-            const hh = if (p.hist) |*x| x else continue;
+            const hh = if (p.dist_hist) |*x| x else continue;
             if (hh.count() == 0) continue;
 
             try out.print("<section class=\"card\" id=\"hist-{s}\"><h2>{s}</h2><p class=\"sub\">latency by percentile", .{ p.name, p.name });
@@ -197,13 +202,13 @@ pub fn render(
             }
             if (p.hgrm_file.len > 0) {
                 try out.print(
-                    " · raw <a href=\"{s}{s}\" download>{s}</a> = whole run",
+                    " · raw <a href=\"{s}{s}\" download>{s}</a>",
                     .{ opts.base_url, p.hgrm_file, p.hgrm_file },
                 );
             }
-            try out.writeAll("</p><div class=\"chartwrap\">");
-            _ = try svg.histChart(out, p.name, try toSvgPoints(arena, try analysis.hdrPoints(arena, hh)));
-            try out.writeAll("</div></section>");
+            try out.writeAll("</p>");
+            try histCard(arena, out, p.name, try analysis.hdrPoints(arena, hh));
+            try out.writeAll("</section>");
         }
         try out.writeAll("</div>");
     }
@@ -254,7 +259,10 @@ fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
         .ok => try out.writeAll("<span class=\"badge\">ok</span>"),
         .degraded => {
             try out.writeAll("<span class=\"badge warn\">⚠ degraded");
-            if (r.notes.len > 0) try out.print(" · {s}", .{r.notes[0]});
+            if (r.notes.len > 0) {
+                var nbuf: [512]u8 = undefined;
+                try out.print(" · {s}", .{escapeHtml(&nbuf, r.notes[0])});
+            }
             try out.writeAll("</span>");
         },
         .failed => {
@@ -264,6 +272,35 @@ fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
         },
         .skipped => try out.writeAll("<span class=\"badge\">skipped</span>"),
     }
+}
+
+/// Escape `text` for HTML text content.
+///
+/// This page has no other genuinely free-text sink: everything else `{s}`
+/// interpolates is a name this harness generates itself (a proxy name from
+/// `commands.parseProxies`'s allowlist, a `Stage`'s own `.str()`, a filename
+/// it wrote) — but `notes` carries text built in `suite.zig` from a docker
+/// image's `/etc/<proxy>/build-info` file, which is not proxy-name-shaped and
+/// has no allowlist behind it.
+fn escapeHtml(buf: []u8, text: []const u8) []const u8 {
+    var len: usize = 0;
+    for (text) |c| {
+        const rep: []const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            else => {
+                if (len == buf.len) break;
+                buf[len] = c;
+                len += 1;
+                continue;
+            },
+        };
+        if (len + rep.len > buf.len) break;
+        @memcpy(buf[len..][0..rep.len], rep);
+        len += rep.len;
+    }
+    return buf[0..len];
 }
 
 /// analysis and svg each own their own Point type deliberately: one is a
@@ -333,23 +370,43 @@ fn card(
 
     // The hover layer reads its data from this blob. The synthetic y=x diagonal
     // is excluded: its value at any x is just x, already shown in the header.
+    //
+    // Built with jsonw.Writer, like every other JSON artifact in this
+    // codebase, rather than hand-rolled `print`/`writeByte` calls: a proxy
+    // name containing `"` would corrupt this blob for every series, not just
+    // that one, and one containing `</script>` would break out of the
+    // surrounding element into the page itself. Proxy names are allowlisted
+    // upstream today (commands.parseProxies), but this closes the sink
+    // regardless of that, and removes the only hand-rolled JSON left in the
+    // codebase outside jsonw.zig itself.
     try out.print("<script type=\"application/json\" id=\"data-{s}\">", .{opts.id});
-    try out.writeAll("{\"series\":[");
-    var first = true;
+    var j = jsonw.Writer{ .w = out };
+    try j.beginObject();
+    try j.key("series");
+    try j.beginArray();
     for (series) |s| {
         if (s.pts.len == 0 or s.ref) continue;
-        if (!first) try out.writeByte(',');
-        first = false;
-        try out.print("{{\"name\":\"{s}\",\"pts\":[", .{s.name});
-        for (s.pts, 0..) |p, i| {
-            if (i > 0) try out.writeByte(',');
-            try out.print("[{d:.1},{d}]", .{ p.x, p.y });
+        try j.beginObject();
+        try j.key("name");
+        try j.string(s.name);
+        try j.key("pts");
+        try j.beginArray();
+        for (s.pts) |p| {
+            try j.beginArray();
+            try j.float(p.x, 4);
+            try j.float(p.y, 4);
+            try j.endArray();
         }
-        try out.writeAll("]}");
+        try j.endArray();
+        try j.endObject();
     }
-    try out.print("],\"yfmt\":\"{s}\",\"geom\":[{d:.0},{d:.0},{d:.0},{d:.0},{d:.0},{d:.0}]", .{
-        @tagName(opts.yfmt), svg.w, svg.h, svg.ml, svg.mr, svg.mt, svg.mb,
-    });
+    try j.endArray();
+    try j.key("yfmt");
+    try j.string(@tagName(opts.yfmt));
+    try j.key("geom");
+    try j.beginArray();
+    for ([_]f64{ svg.w, svg.h, svg.ml, svg.mr, svg.mt, svg.mb }) |v| try j.int(@intFromFloat(v));
+    try j.endArray();
 
     var xmax: f64 = opts.xmax orelse blk: {
         var m: f64 = 0;
@@ -361,8 +418,53 @@ fn card(
     if (xmax <= 0) xmax = 1;
     const ticks = svg.niceTicks(0, xmax, 5);
     const t = ticks.slice();
-    try out.print(",\"xmax\":{d}}}", .{t[t.len - 1]});
+    try j.key("xmax");
+    try j.float(t[t.len - 1], 4);
+    try j.endObject();
     try out.writeAll("</script></section>");
+}
+
+/// The distribution chart: `svg.histChart` plus the same hover-tooltip
+/// wiring `card` gives the line charts, adapted for a LOG x-axis (percentile,
+/// as n = 1/(1-p)) and a single series instead of several named ones —
+/// `report.js` has its own small handler for this shape, distinguished by the
+/// `data-hist` attribute on the hover-capture rect rather than `data-chart`.
+fn histCard(arena: Allocator, out: *Writer, name: []const u8, pts: []const analysis.Point) !void {
+    const conv = try toSvgPoints(arena, pts);
+
+    try out.print("<div class=\"chartwrap\" id=\"wrap-hist-{s}\">", .{name});
+    _ = try svg.histChart(out, name, conv);
+    try out.print("<div class=\"tooltip\" id=\"tip-hist-{s}\" hidden></div></div>", .{name});
+
+    // `decades` here must match svg.histChart's OWN internal computation
+    // exactly — it defines the log-x scale report.js needs to invert to find
+    // the nearest point under the cursor. Duplicated rather than threaded
+    // back out of histChart, matching how `card` above already recomputes
+    // `xmax`/ticks itself instead of getting them back from `svg.chart`.
+    var max_n: f64 = 1;
+    for (conv) |p| max_n = @max(max_n, p.x);
+    const decades = @max(1.0, @ceil(std.math.log10(max_n)));
+
+    try out.print("<script type=\"application/json\" id=\"data-hist-{s}\">", .{name});
+    var j = jsonw.Writer{ .w = out };
+    try j.beginObject();
+    try j.key("pts");
+    try j.beginArray();
+    for (conv) |p| {
+        try j.beginArray();
+        try j.float(p.x, 4);
+        try j.float(p.y, 4);
+        try j.endArray();
+    }
+    try j.endArray();
+    try j.key("decades");
+    try j.float(decades, 4);
+    try j.key("geom");
+    try j.beginArray();
+    for ([_]f64{ svg.w, svg.h, svg.ml, svg.mr, svg.mt, svg.mb }) |v| try j.int(@intFromFloat(v));
+    try j.endArray();
+    try j.endObject();
+    try out.writeAll("</script>");
 }
 
 test "a failed proxy renders no numbers and names its stage" {
@@ -377,6 +479,7 @@ test "a failed proxy renders no numbers and names its stage" {
         // publish it — that is precisely the zeros-look-like-data failure.
         .sustained = 12345,
         .hist = null,
+        .dist_hist = null,
         .hgrm_file = "",
         .mem = null,
         .cpu = &.{},
@@ -454,6 +557,86 @@ test "the c10k deadline is stated, because it changes what p99 means" {
     const s = out.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "1000ms client-side deadline") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "within the SLO") != null);
+}
+
+test "escapeHtml neutralizes the three HTML metacharacters" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "a &lt;script&gt; &amp; more",
+        escapeHtml(&buf, "a <script> & more"),
+    );
+}
+
+test "a degraded proxy's note is escaped in the badge" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var present = [_]report.ProxyData{.{
+        .name = "zoxy",
+        .rows = &.{},
+        .sustained = 100,
+        .hist = null,
+        .dist_hist = null,
+        .hgrm_file = "",
+        .mem = null,
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed_raw = &.{},
+    }};
+    const statuses = [_]artifact.ProxyRecord{.{
+        .name = "zoxy",
+        .status = .degraded,
+        .notes = &.{"<script>alert(1)</script> & friends"},
+    }};
+
+    var buf: [128 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try render(arena, &out, .{
+        .present = &present,
+        .rps = &.{},
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed = &.{},
+    }, &statuses, .{
+        .runid = "r",
+        .profile_name = "c1k",
+        .ref_rate = 2000,
+        .connections = 1000,
+        .deadline_ms = 0,
+    });
+
+    const s = out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, s, "<script>alert") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; friends") != null);
+}
+
+test "the chart data blob is well-formed JSON built through jsonw, not string concatenation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [16 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const series = [_]report.Series{.{
+        .name = "zo\"xy", // a quote, to prove the writer escapes rather than corrupting the blob
+        .pts = &.{ .{ .x = 1, .y = 2.5 }, .{ .x = 3, .y = 4 } },
+    }};
+    try card(arena, &out, "title", "sub", .{ .id = "rps", .yfmt = .si }, &series);
+
+    const s = out.buffered();
+    const start = std.mem.indexOf(u8, s, "<script type=\"application/json\" id=\"data-rps\">").? +
+        "<script type=\"application/json\" id=\"data-rps\">".len;
+    const end = std.mem.indexOf(u8, s[start..], "</script>").? + start;
+    const blob = s[start..end];
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, blob, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("zo\"xy", root.get("series").?.array.items[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("si", root.get("yfmt").?.string);
+    try std.testing.expect(root.get("geom").?.array.items.len == 6);
+    try std.testing.expect(root.get("xmax") != null);
 }
 
 test "the page carries no external font imports" {

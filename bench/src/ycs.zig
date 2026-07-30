@@ -24,52 +24,120 @@ const Allocator = std.mem.Allocator;
 pub const storage_host = "storage.yandexcloud.net";
 pub const compute_host = "compute.api.cloud.yandex.net";
 
+/// How long a single request gets before it is abandoned as failed.
+///
+/// Nothing in `std.http.Client.fetch` bounds a stalled connect or a response
+/// that arrives a byte at a time forever. `bench wait` polls `exists` for the
+/// DONE/FAILED markers every 30s over up to 110 minutes with no deadline of
+/// its own other than counting elapsed time BETWEEN calls — so one hung
+/// request used to freeze the whole poll loop silently until the workflow's
+/// own step timeout. Nightly run #9 burned 71 minutes that way. Same shape as
+/// `discord.zig`'s `attemptOnce`: run the call on its own thread, poll an
+/// atomic flag, give up on the wall clock if it never flips.
+const fetch_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+const FetchTask = struct {
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    result: ?(std.http.Client.FetchError!std.http.Client.FetchResult) = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *FetchTask) void {
+        self.result = self.client.fetch(self.options);
+        self.done.store(true, .release);
+    }
+};
+
+/// Run one bounded request on a throwaway client and thread of its own.
+/// A `null` return means it never came back within `fetch_deadline_ns`.
+///
+/// Each call gets its OWN `std.http.Client` — deliberately not `Client`'s own
+/// long-lived one — because `bench wait` calls this every 30s for up to 110
+/// minutes, and a request that times out is ABANDONED rather than torn down:
+/// nothing here can force a thread blocked in a syscall to unwind, and calling
+/// `deinit` out from under it would race its connection pool. A shared,
+/// reused client would mean every LATER poll racing that same zombie thread;
+/// a throwaway one confines the damage to itself and is simply never freed.
+///
+/// For the same reason, `options.response_writer`'s backing buffer must stay
+/// valid forever if this returns null — see `newSink`'s doc comment for the
+/// discard-buffer case, and `get`/`listInstances` for why their arena-backed
+/// writers need no special handling at all.
+fn fetchBounded(gpa: Allocator, io: Io, options: std.http.Client.FetchOptions) !?std.http.Client.FetchResult {
+    const client = try gpa.create(std.http.Client);
+    client.* = .{ .allocator = gpa, .io = io };
+
+    const task = try gpa.create(FetchTask);
+    task.* = .{ .client = client, .options = options };
+
+    const thread = try std.Thread.spawn(.{}, FetchTask.run, .{task});
+
+    const step_ns: u64 = 100 * std.time.ns_per_ms;
+    var waited: u64 = 0;
+    while (!task.done.load(.acquire) and waited < fetch_deadline_ns) {
+        io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
+        waited += step_ns;
+    }
+    if (!task.done.load(.acquire)) return null; // abandoned; see doc comment above
+
+    thread.join();
+    const result = task.result.?;
+    client.deinit();
+    gpa.destroy(client);
+    gpa.destroy(task);
+    return try result;
+}
+
+/// A throwaway sink for a response body nobody reads (HEAD/PUT/DELETE all
+/// discard theirs). Heap-allocated rather than a caller's stack buffer,
+/// because it must stay valid if `fetchBounded` abandons the request on
+/// timeout: `exists` in particular is called every 30s in a loop, and a stack
+/// buffer would be reused by the NEXT call while an earlier abandoned thread
+/// might still be writing through the OLD one — corrupting whichever call's
+/// struct happens to land there, not merely wasting a few bytes. Freed by the
+/// caller only when the request did NOT time out; see `freeSink`.
+///
+/// The response_writer itself is still mandatory even though the body is
+/// discarded: without one, std.http.Client takes an internal discard path
+/// that segfaults in `Reader.discardRemaining`. It does not reproduce in a
+/// Debug build against glibc — only in the ReleaseFast static-musl binary CI
+/// actually ships, which is how it reached a real run: the first `bench wait`
+/// died two seconds in, on a HEAD, immediately after tofu had brought up the
+/// whole fleet. `keep_alive = false` matters too: it is what keeps a reply
+/// whose body has no discoverable end (a HEAD's `content-length` with no
+/// body, or Discord's 204) from hanging forever waiting for bytes that will
+/// never come — see discord.zig's identical note.
+fn newSink(gpa: Allocator) !*std.Io.Writer.Discarding {
+    const buf = try gpa.alloc(u8, 1024);
+    const d = try gpa.create(std.Io.Writer.Discarding);
+    d.* = .init(buf);
+    return d;
+}
+
+fn freeSink(gpa: Allocator, d: *std.Io.Writer.Discarding) void {
+    gpa.free(d.writer.buffer);
+    gpa.destroy(d);
+}
+
 pub const Client = struct {
     gpa: Allocator,
+    io: Io,
     token: []const u8,
-    http: std.http.Client,
 
     pub fn init(gpa: Allocator, io: Io, token: []const u8) Client {
-        return .{
-            .gpa = gpa,
-            .token = token,
-            .http = .{ .allocator = gpa, .io = io },
-        };
+        return .{ .gpa = gpa, .io = io, .token = token };
     }
 
+    /// No-op: every request now builds and tears down its own throwaway
+    /// client (see `fetchBounded`), so there is no longer any persistent
+    /// connection state for `Client` itself to hold. Kept so call sites that
+    /// pair `init`/`defer deinit()` need no change.
     pub fn deinit(self: *Client) void {
-        self.http.deinit();
+        _ = self;
     }
 
     fn authHeader(self: *Client, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "Bearer {s}", .{self.token});
-    }
-
-    /// Every `fetch` MUST be given a `response_writer` AND `keep_alive = false`,
-    /// even when the body is of no interest.
-    ///
-    /// `keep_alive = false` is what keeps a reply whose body has no discoverable
-    /// end from hanging the client forever. `exists` uses HEAD, which answers
-    /// with a `content-length` and no body at all, and the client will sit
-    /// waiting for bytes that are never sent unless the connection closes. The
-    /// same defect showed up against Discord's 204 (see discord.zig) and is
-    /// reproducible against httpbingo.org/status/204.
-    ///
-    /// This is not theoretical here: `bench wait` polls `exists` for the
-    /// DONE/FAILED markers every 30s, so one hung HEAD freezes the whole poll
-    /// loop — no marker check, no deadline, nothing until the workflow's own step
-    /// timeout. Nightly run #9 burned 71 minutes that way, silently.
-    ///
-    /// Requests here are one-per-poll, so pooling was never worth anything.
-    ///
-    /// Without one, std.http.Client takes an internal discard path that
-    /// segfaults in `Reader.discardRemaining`. It does not reproduce in a Debug
-    /// build against glibc — only in the ReleaseFast static-musl binary CI
-    /// actually ships, which is how it reached a real run: the first `bench
-    /// wait` died two seconds in, on a HEAD, immediately after tofu had brought
-    /// up the whole fleet.
-    fn sink(buf: []u8) std.Io.Writer.Discarding {
-        return .init(buf);
     }
 
     pub const PutOptions = struct {
@@ -111,9 +179,8 @@ pub const Client = struct {
             try extra.append(self.gpa, .{ .name = "x-amz-acl", .value = "public-read" });
         }
 
-        var discard_buf: [1024]u8 = undefined;
-        var discard = sink(&discard_buf);
-        const res = try self.http.fetch(.{
+        const discard = try newSink(self.gpa);
+        const res = try fetchBounded(self.gpa, self.io, .{
             .location = .{ .url = url },
             .method = .PUT,
             .payload = body,
@@ -121,7 +188,11 @@ pub const Client = struct {
             .extra_headers = extra.items,
             .response_writer = &discard.writer,
             .keep_alive = false,
-        });
+        }) orelse {
+            std.debug.print("bench: PUT {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
+            return error.RequestTimedOut;
+        };
+        freeSink(self.gpa, discard);
         if (res.status != .ok and res.status != .created) {
             std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
             return error.ObjectPutFailed;
@@ -132,35 +203,6 @@ pub const Client = struct {
     /// `public = true`.
     pub fn publicUrl(arena: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "https://{s}/{s}/{s}", .{ storage_host, bucket, key });
-    }
-
-    /// PUT an object. `key` is the full path within the bucket.
-    pub fn put(self: *Client, bucket: []const u8, key: []const u8, body: []const u8) !void {
-        const url = try std.fmt.allocPrint(
-            self.gpa,
-            "https://{s}/{s}/{s}",
-            .{ storage_host, bucket, key },
-        );
-        defer self.gpa.free(url);
-
-        var auth_buf: [4096]u8 = undefined;
-        const auth = try self.authHeader(&auth_buf);
-
-        var discard_buf: [1024]u8 = undefined;
-        var discard = sink(&discard_buf);
-        const res = try self.http.fetch(.{
-            .location = .{ .url = url },
-            .method = .PUT,
-            .payload = body,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .response_writer = &discard.writer,
-            .keep_alive = false,
-        });
-        if (res.status != .ok and res.status != .created) {
-            // The status alone — a storage error body can echo request content.
-            std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
-            return error.ObjectPutFailed;
-        }
     }
 
     /// GET an object, or null if it does not exist yet. A 404 is an expected,
@@ -176,14 +218,21 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
+        // Arena-backed, unlike the discard sinks above: `wait`'s arena lives
+        // for the whole poll loop and is never reset mid-loop, so an
+        // abandoned thread writing into it on timeout has nothing to corrupt
+        // — the memory is simply never reused before the process exits.
         var body: std.Io.Writer.Allocating = .init(arena);
-        const res = try self.http.fetch(.{
+        const res = try fetchBounded(self.gpa, self.io, .{
             .location = .{ .url = url },
             .method = .GET,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &body.writer,
             .keep_alive = false,
-        });
+        }) orelse {
+            std.debug.print("bench: GET {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
+            return error.RequestTimedOut;
+        };
         if (res.status == .not_found) return null;
         if (res.status != .ok) {
             std.debug.print("bench: GET {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
@@ -203,15 +252,21 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        var discard_buf: [1024]u8 = undefined;
-        var discard = sink(&discard_buf);
-        const res = try self.http.fetch(.{
+        const discard = try newSink(self.gpa);
+        const res = try fetchBounded(self.gpa, self.io, .{
             .location = .{ .url = url },
             .method = .HEAD,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &discard.writer,
             .keep_alive = false,
-        });
+        }) orelse {
+            // Not fatal: `wait`'s loop treats a failed `exists` as `false` and
+            // polls again next tick, which is exactly right for one stalled
+            // HEAD in a 110-minute loop — see `wait`'s own catch sites.
+            std.debug.print("bench: HEAD {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
+            return error.RequestTimedOut;
+        };
+        freeSink(self.gpa, discard);
         return res.status == .ok;
     }
 
@@ -227,14 +282,15 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
+        // Arena-backed; see the comment in `get` above.
         var body: std.Io.Writer.Allocating = .init(arena);
-        const res = try self.http.fetch(.{
+        const res = try fetchBounded(self.gpa, self.io, .{
             .location = .{ .url = url },
             .method = .GET,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &body.writer,
             .keep_alive = false,
-        });
+        }) orelse return error.RequestTimedOut;
         if (res.status != .ok) return error.ListInstancesFailed;
 
         return parseInstances(arena, body.written());
@@ -251,15 +307,15 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        var discard_buf: [1024]u8 = undefined;
-        var discard = sink(&discard_buf);
-        const res = try self.http.fetch(.{
+        const discard = try newSink(self.gpa);
+        const res = try fetchBounded(self.gpa, self.io, .{
             .location = .{ .url = url },
             .method = .DELETE,
             .headers = .{ .authorization = .{ .override = auth } },
             .response_writer = &discard.writer,
             .keep_alive = false,
-        });
+        }) orelse return error.RequestTimedOut;
+        freeSink(self.gpa, discard);
         if (res.status != .ok) return error.DeleteInstanceFailed;
     }
 };
@@ -300,34 +356,6 @@ pub fn parseInstances(arena: Allocator, json: []const u8) ![]Instance {
         });
     }
     return out.toOwnedSlice(arena);
-}
-
-/// Fetch an IAM token from the VM metadata service.
-///
-/// Requires the instance to have a service account attached and the
-/// `gce-http-token` metadata key set. This is what keeps a benchmark VM — a
-/// machine deliberately saturated with load traffic — free of any stored
-/// credential: the token is minted on demand, scoped to that service account,
-/// and expires on its own.
-pub fn metadataToken(gpa: Allocator, io: Io, arena: Allocator) ![]const u8 {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    var body: std.Io.Writer.Allocating = .init(arena);
-    const res = try client.fetch(.{
-        .location = .{
-            .url = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
-        },
-        .method = .GET,
-        .extra_headers = &.{.{ .name = "Metadata-Flavor", .value = "Google" }},
-        .response_writer = &body.writer,
-        .keep_alive = false,
-    });
-    if (res.status != .ok) return error.MetadataTokenFailed;
-
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body.written(), .{});
-    const tok = parsed.object.get("access_token") orelse return error.MetadataTokenFailed;
-    return tok.string;
 }
 
 test "parseInstances picks out the sweep labels" {

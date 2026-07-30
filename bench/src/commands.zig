@@ -131,10 +131,16 @@ pub fn wait(
     while (waited < opts.deadline_s) {
         // Echo whatever new log the loadgen has uploaded. This is the only
         // window into a run that is otherwise completely unreachable.
+        //
+        // Scrubbed with `logAnyIp`, not `redact.log`: this process runs on the
+        // CI runner, relaying a log object a DIFFERENT machine (the loadgen)
+        // wrote, so it never had a `redact.register` call to learn the
+        // fleet's addresses from — `redact.log`'s scrub table would be empty
+        // here regardless of what the log actually contains.
         if (client.get(arena, env.bucket, log_key)) |maybe| {
             if (maybe) |text| {
                 if (text.len > shown) {
-                    std.debug.print("{s}", .{text[shown..]});
+                    redact.logAnyIp(text[shown..]);
                     shown = text.len;
                 }
             }
@@ -372,8 +378,8 @@ pub fn readProfile(
     const pj = Io.Dir.cwd().readFileAlloc(io, pj_path, arena, .limited(4 << 20)) catch return null;
     const pv = try std.json.parseFromSliceLeaky(std.json.Value, arena, pj, .{});
     const proxies = (pv.object.get("proxies") orelse return null).object;
-    const origin: artifact.Origin = if (pv.object.get("fleet")) |f|
-        (std.meta.stringToEnum(artifact.Origin, f.string) orelse .cloud)
+    const origin: artifact.Origin = if (strOf(pv.object.get("fleet"))) |f|
+        (std.meta.stringToEnum(artifact.Origin, f) orelse .cloud)
     else
         .cloud;
 
@@ -393,18 +399,18 @@ pub fn readProfile(
     if (rv.object.get("proxies")) |arr| {
         for (arr.array.items) |item| {
             const o = item.object;
-            const pname = if (o.get("name")) |v| v.string else continue;
+            const pname = strOf(o.get("name")) orelse continue;
 
             var status: artifact.Status = .ok;
             var stage: ?artifact.Stage = null;
             var saturated = false;
             if (proxies.get(pname)) |st| {
                 const so = st.object;
-                if (so.get("status")) |v| {
-                    status = std.meta.stringToEnum(artifact.Status, v.string) orelse .ok;
+                if (strOf(so.get("status"))) |v| {
+                    status = std.meta.stringToEnum(artifact.Status, v) orelse .ok;
                 }
-                if (so.get("stage")) |v| {
-                    if (v == .string) stage = std.meta.stringToEnum(artifact.Stage, v.string);
+                if (strOf(so.get("stage"))) |v| {
+                    stage = std.meta.stringToEnum(artifact.Stage, v);
                 }
                 if (so.get("saturated")) |v| saturated = v == .bool and v.bool;
             }
@@ -440,6 +446,21 @@ fn numOf(v: ?std.json.Value) ?f64 {
     return switch (x) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
+/// Like `numOf`, for a string field. `readProfile` reads a `profile.json`
+/// written by THIS binary and should never see the wrong JSON type in
+/// practice, but this is production's ReleaseFast build: an unguarded
+/// `.string` access on an unexpected type is undefined behavior there, not a
+/// safe panic, and this feeds both `notify` (Discord) and `buildIndex`
+/// (Pages) — the whole nightly publish path, for a malformed or legacy
+/// profile.json.
+fn strOf(v: ?std.json.Value) ?[]const u8 {
+    const x = v orelse return null;
+    return switch (x) {
+        .string => |s| s,
         else => null,
     };
 }
@@ -626,15 +647,24 @@ pub fn buildIndex(
     }
 
     // history = everything we had + tonight, republished because deploy-pages
-    // replaces the site wholesale.
+    // replaces the site wholesale. Built into memory first (like index.html
+    // below) so `assertNoIps` runs before anything reaches disk — this is the
+    // longest-lived artifact of any this harness produces, since it carries
+    // forward every prior night's rows rather than aging out with its own run,
+    // so a leak here would be the worst case of any artifact in the system.
     {
+        var buf: std.ArrayList(u8) = .empty;
+        var hw: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
+        try index.writeHistory(&hw.writer, prior);
+        try index.writeHistory(&hw.writer, tonight.items);
+        try redact.assertNoIps("history.ndjson", hw.written());
+
         const path = try std.fmt.allocPrint(arena, "{s}/history.ndjson", .{out_dir});
         const f = try Io.Dir.cwd().createFile(io, path, .{});
         defer f.close(io);
-        var buf: [64 * 1024]u8 = undefined;
-        var fw: Io.File.Writer = .init(f, io, &buf);
-        try index.writeHistory(&fw.interface, prior);
-        try index.writeHistory(&fw.interface, tonight.items);
+        var fbuf: [64 * 1024]u8 = undefined;
+        var fw: Io.File.Writer = .init(f, io, &fbuf);
+        try fw.interface.writeAll(hw.written());
         try fw.interface.flush();
     }
 

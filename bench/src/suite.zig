@@ -104,6 +104,16 @@ const deadline = struct {
     /// suite for the better part of an hour.
     const warm_probe: u64 = 90 * std.time.ns_per_s;
 
+    /// Bounds `cadvisor.waitUntilFound`'s poll, giving cAdvisor a head start
+    /// before the ramp's own sampling window opens (see that function's doc
+    /// comment — nightly run #28's motivation). Best-effort and non-fatal on
+    /// its own, but it still runs BEFORE the ramp starts, inside the same
+    /// turn the watchdog bounds, so it has to be counted in `turn` below —
+    /// the whole point of summing every stage there is that forgetting one
+    /// silently re-narrows the watchdog's margin over the ramp child's own
+    /// deadline.
+    const cadvisor_warm: u64 = 60 * std.time.ns_per_s;
+
     /// The ramp child — start to exit, including the cAdvisor poller's teardown.
     ///
     /// Every deadline above bounds a REMOTE command. Everything in-process had
@@ -136,6 +146,7 @@ const deadline = struct {
         return proxy(ramp_seconds) // ramp — the one stage bounded by a kill
         + start // container start
         + warm_probe // first 200
+        + cadvisor_warm // cAdvisor discovery head start, before the ramp
         + teardown // after runOne returns, still inside the window
         + 4 * inspect // leftover check, identity, image id, build-info
         + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
@@ -574,6 +585,29 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
 
         var stage: artifact.Stage = .start;
 
+        // A PLACEHOLDER, overwritten below once this proxy's turn actually
+        // finishes. Written and flushed to disk BEFORE the risky work starts,
+        // so if the watchdog below has to end the whole process, there is
+        // already a `.failed` record for this proxy on disk instead of none
+        // at all.
+        //
+        // Run #28: envoy wedged as the LAST proxy in the list, the watchdog
+        // fired `std.process.exit(4)`, and the process died before `runOne`
+        // ever returned — so the normal `records.append` + `flush.write` a
+        // few lines below never ran for envoy. It had no entry whatsoever in
+        // profile.json, not even a failed one, so it silently vanished from
+        // every report rather than showing up as failed. `std.process.exit`
+        // also does not touch the ramp CHILD process (`.pgid = 0` gives it
+        // its own group, and exiting the parent does not signal it), so the
+        // watchdog's only real recovery is making sure THIS record survives.
+        try records.append(arena, .{
+            .name = name,
+            .status = .failed,
+            .stage = stage,
+            .err = "turn did not complete (the suite's watchdog ended the process before it could)",
+        });
+        try flush.write();
+
         // Bound the WHOLE proxy, not just its ramp.
         //
         // This watchdog used to wrap `ramp.run` alone, and run #12 showed why
@@ -612,7 +646,10 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
                 .err = @errorName(e),
             };
         };
-        try records.append(arena, rec);
+        // Overwrites the placeholder appended above — this proxy's turn
+        // reached here, so its real result replaces the "did not complete"
+        // stand-in rather than adding a second entry for the same proxy.
+        records.items[records.items.len - 1] = rec;
         try flush.write();
 
         // Always tear down, whatever happened. Best-effort: a failure here is
@@ -826,10 +863,22 @@ fn runOne(
     enter(stage, .warm, name);
     try warmProbe(io, target, name);
 
+    const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
+
+    // Best-effort: give cAdvisor a bounded head start before the ramp opens
+    // its own 300s sampling window. See cadvisor.waitUntilFound's doc
+    // comment for why — a miss here just gets logged, never fails the turn.
+    if (cadvisor_addr) |addr| {
+        if (!cadvisor.waitUntilFound(io, addr, name, deadline.cadvisor_warm)) {
+            redact.log(
+                "bench: [{s}] cadvisor had not reported this container after {d}s; CPU/mem may be absent for this ramp",
+                .{ name, deadline.cadvisor_warm / std.time.ns_per_s },
+            );
+        }
+    }
+
     enter(stage, .ramp, name);
     const start_iso = try nowIso(io, arena);
-
-    const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
     const out_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ opts.out_dir, name });
 
@@ -1242,7 +1291,7 @@ test "the watchdog is the outer bound, so an inner deadline always fires first" 
     // move is to end the process — fires while the child still had time left, and
     // one wedged proxy costs every proxy after it. That was run #24's bug: both
     // were `proxy(ramp_seconds)`, so haproxy still took pingora and envoy.
-    const outside_ramp = deadline.start + deadline.warm_probe +
+    const outside_ramp = deadline.start + deadline.warm_probe + deadline.cadvisor_warm +
         deadline.teardown + 4 * deadline.inspect;
 
     for (&profile.all) |p| {
@@ -1250,6 +1299,39 @@ test "the watchdog is the outer bound, so an inner deadline always fires first" 
         const ramp_child = deadline.proxy(p.ramp_seconds);
         try std.testing.expect(turn > ramp_child + outside_ramp);
     }
+}
+
+test "a proxy's placeholder record is replaced in place, not duplicated" {
+    // Pins the exact pattern `run`'s measurement loop uses: append a
+    // placeholder before the risky work, then overwrite the SAME index once
+    // the real result is known — so a process that dies in between (the
+    // watchdog's std.process.exit) leaves the placeholder as the final,
+    // on-disk record instead of leaving no record at all. Run #28: envoy's
+    // c100 turn had no entry whatsoever in profile.json for exactly this
+    // reason, before this pattern existed.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var records: std.ArrayList(artifact.ProxyRecord) = .empty;
+    try records.append(arena, .{ .name = "zoxy", .status = .ok });
+
+    // Simulates one proxy's turn: placeholder in, then overwritten.
+    try records.append(arena, .{
+        .name = "haproxy",
+        .status = .failed,
+        .err = "turn did not complete (the suite's watchdog ended the process before it could)",
+    });
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+
+    records.items[records.items.len - 1] = .{ .name = "haproxy", .status = .ok, .err = null };
+
+    // Overwritten in place, not appended alongside — exactly one "haproxy"
+    // entry, holding the REAL result.
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+    try std.testing.expectEqualStrings("haproxy", records.items[1].name);
+    try std.testing.expectEqual(artifact.Status.ok, records.items[1].status);
+    try std.testing.expect(records.items[1].err == null);
 }
 
 test "isKnownProxy excludes direct, which has no container" {

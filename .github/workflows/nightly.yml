@@ -14,6 +14,11 @@
 #     could write state, token expired). The IAM token is re-minted immediately
 #     before teardown, because a 150-minute job outlives a one-hour token and a
 #     teardown that 401s is exactly the failure this design cannot tolerate.
+#     The same reasoning applies to the whole rest of the job: `bench wait` runs
+#     as two ~55-minute chunks so it can pick up a fresh token between them
+#     instead of one open-ended call outliving its own, and the token is
+#     re-minted again before `fetch` — a 401 there would look like a fetch
+#     failure with a perfectly good run sitting in the bucket.
 #
 #  2. NO ADDRESS REACHES THE LOG. This log is public. `tofu output` is
 #     sensitive, and nothing here reads one — but `apply`/`destroy` print the
@@ -78,8 +83,9 @@ jobs:
     # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
     # pingora a cargo build), then 2 profiles x 4 proxies x ~350 s ~= 47 min,
     # plus fetch/report/publish. 150 leaves real headroom without letting a
-    # wedged run bill for hours. `bench wait` carries its own, tighter step
-    # timeout so that a loadgen which never writes DONE fails the STEP, leaving
+    # wedged run bill for hours. `bench wait` runs as two chunked steps (each
+    # with its own, tighter step timeout — see "Wait chunk 1"/"Wait chunk 2"
+    # below) so that a loadgen which never writes DONE fails a STEP, leaving
     # the teardown steps to run normally instead of being raced by a job-level
     # cancellation.
     timeout-minutes: 150
@@ -289,27 +295,97 @@ jobs:
       #
       # "What if DONE is never written" is answered TWICE, and the inner answer
       # is the one that should fire. `bench wait` carries its own deadlines
-      # (commands.WaitOptions: 110 min overall, 15 min for the first boot
-      # marker) and exits cleanly with a diagnosis. `timeout-minutes` here is a
-      # few minutes wider, so it only fires if `wait` ITSELF wedges — and it
+      # (commands.WaitOptions: 15 min for the first boot marker) and exits
+      # cleanly with a diagnosis. `timeout-minutes` here is a few minutes wider
+      # than `--max-wait-s`, so it only fires if `wait` ITSELF wedges — and it
       # bounds the STEP rather than the job, because a job-level timeout cancels
       # the job and races the teardown, whereas a step timeout leaves the
       # `if: always()` steps below to run normally.
       #
+      # Split into two 55-minute CHUNKS, each on its own IAM token, rather than
+      # one open-ended 110-minute call: the federated token this job started
+      # with is short-lived (~1h — see the top-of-file comment), and boot plus
+      # cold docker builds plus two profiles' ramps can genuinely run past that
+      # in the worst case. A single long call would start 401ing partway
+      # through and the run would look dead even though the fleet is healthy.
+      # `--max-wait-s` bounds ONE call; exit 5 means that chunk's deadline
+      # elapsed with no terminal marker yet (the fleet may be fine), distinct
+      # from exit 1 (`never_booted` — no amount of retrying helps). Only a 5
+      # earns a second chunk with a freshly-minted token.
+      #
       # Exit codes (bench/CONTRACT.md): 0 done, 3 the suite ran and reported
-      # failures, 1 it never booted or never finished.
-      - name: Wait for the run (streams the fleet's log)
+      # failures, 1 it never booted, 5 this chunk's deadline elapsed.
+      - name: Wait chunk 1
         id: wait
         continue-on-error: true
-        timeout-minutes: 115
+        timeout-minutes: 58
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
         run: |
+          set -uo pipefail
+          code=0
+          "$BENCH" wait --runid "$RUNID" --max-wait-s 3300 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Re-mint the IAM token (wait chunk 2)
+        id: iam_wait2
+        if: always() && steps.wait.outputs.code == '5'
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the refreshed token (wait chunk 2)
+        if: always() && steps.wait.outputs.code == '5' && steps.iam_wait2.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.iam_wait2.outputs.token }}
+        run: |
           set -euo pipefail
-          "$BENCH" wait --runid "$RUNID"
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # Only runs if chunk 1's OWN deadline elapsed (code 5). If the re-mint
+      # above failed, this still tries with whatever token is current — the old
+      # one may still be good, same trade the teardown re-mint below makes.
+      - name: Wait chunk 2 (only if chunk 1's deadline elapsed)
+        id: wait2
+        if: always() && steps.wait.outputs.code == '5'
+        continue-on-error: true
+        timeout-minutes: 58
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -uo pipefail
+          code=0
+          "$BENCH" wait --runid "$RUNID" --max-wait-s 3300 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # A fresh token immediately before `fetch`, regardless of whether chunk 2
+      # ran: on the common fast path (chunk 1 alone finishes) the token in use
+      # is still the one this job started with, and by now it may be close to
+      # an hour old. Same proven pattern as the teardown re-mint — failure is
+      # tolerated, the old token may still be good.
+      - name: Re-mint the IAM token before fetch
+        id: iam_fetch
+        if: always()
+        continue-on-error: true
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the token for fetch
+        if: always() && steps.iam_fetch.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.iam_fetch.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Fetch the results
         id: fetch
+        if: always()
         continue-on-error: true
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
@@ -384,11 +460,35 @@ jobs:
 
       # ------------------------------------------------------------- publish --
 
+      # Computed once, early, and reused by both the report render below (for
+      # .hgrm download links) and "Fetch the published history"/"Notify
+      # Discord" — a single source rather than three copies of the same two
+      # lines drifting apart.
+      - name: Compute the Pages base URL
+        id: base
+        if: always() && steps.fetch.outcome == 'success'
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          repo="${GITHUB_REPOSITORY#*/}"
+          echo "base=https://${owner}.github.io/${repo}/" >> "$GITHUB_OUTPUT"
+
+      # `--base-url` is what makes a proxy's ".hgrm" download link resolve
+      # from EVERY place report.html ends up, not just alongside its own
+      # siblings. Without it the link is bare ("zoxy.hgrm"), which only
+      # resolves on Pages (where `bench index` copies the .hgrm files
+      # alongside it) — the copy Discord links to is uploaded to Object
+      # Storage STANDALONE (see commands.notify's own comment on why it's
+      # linked rather than attached), with no .hgrm siblings anywhere near it,
+      # so that copy's links 404. Pointing every copy at the same stable Pages
+      # URL means the link resolves regardless of which copy of report.html
+      # someone is actually looking at.
       - name: Render the per-profile reports
         id: report
-        if: always() && steps.fetch.outcome == 'success'
+        if: always() && steps.base.outcome == 'success'
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
+          BASE: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
           IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
@@ -405,7 +505,7 @@ jobs:
               echo "no artifacts for $p — skipping (the run did not get that far)"
               continue
             fi
-            "$BENCH" report "results/$RUNID/$p" --profile "$p"
+            "$BENCH" report "results/$RUNID/$p" --profile "$p" --base-url "${BASE}${p}/"
             rendered=$((rendered + 1))
           done
           # Nothing at all is still a failure: there is no report to publish and
@@ -427,17 +527,14 @@ jobs:
       - name: Fetch the published history
         id: history
         if: always() && steps.report.outcome == 'success'
+        env:
+          BASE: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
-          owner="$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
-          repo="${GITHUB_REPOSITORY#*/}"
-          base="https://${owner}.github.io/${repo}/"
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-
           # A custom Pages domain would make this the wrong URL; the trend just
           # restarts, nothing else breaks. --max-time so a hanging CDN cannot
           # eat the budget.
-          if curl -fsS --max-time 60 -o history.ndjson "${base}history.ndjson"; then
+          if curl -fsS --max-time 60 -o history.ndjson "${BASE}history.ndjson"; then
             echo "carried forward $(wc -l < history.ndjson) history row(s)"
           else
             echo "no published history yet (first run, or Pages not live) — starting fresh"
@@ -479,7 +576,7 @@ jobs:
         continue-on-error: true
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
-          BASE_URL: ${{ steps.history.outputs.base }}
+          BASE_URL: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
           # No webhook configured (a fork, or a first run) — render and validate
@@ -504,8 +601,18 @@ jobs:
         run: |
           set -euo pipefail
           bad=0
+
+          # Fold the two wait chunks into one outcome: chunk 1 alone if it
+          # never needed a second (its own deadline never elapsed), otherwise
+          # whatever chunk 2 concluded with — chunk 1's own "failure" in that
+          # case was just its deadline elapsing (code 5), not a real problem.
+          wait_outcome="${{ steps.wait.outcome }}"
+          if [ "${{ steps.wait.outputs.code }}" = "5" ]; then
+            wait_outcome="${{ steps.wait2.outcome }}"
+          fi
+
           for pair in \
-            "wait:${{ steps.wait.outcome }}" \
+            "wait:$wait_outcome" \
             "fetch:${{ steps.fetch.outcome }}" \
             "report:${{ steps.report.outcome }}" \
             "index:${{ steps.index.outcome }}" \

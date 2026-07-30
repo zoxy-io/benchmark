@@ -2,11 +2,13 @@
 #
 # One file describes every role; compose profiles pick what runs where:
 #   backend     nginx origin                    (local: always; cloud: backend VM)
-#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|pingora)
-# The comparison is direct/zoxy/haproxy/pingora. envoy, traefik and nginx were
+#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|pingora|envoy)
+# The comparison is direct/zoxy/haproxy/pingora/envoy. traefik and nginx were
 # removed rather than parked: an unexercised proxy config rots — its TLS/ALPN
 # pinning and its healthcheck probe go stale unnoticed — so git history is a
-# better starting point for re-adding one than a stale file is.
+# better starting point for re-adding one than a stale file is. envoy went
+# through that same removal once and came back (its config was restored from
+# git history and re-verified end to end) — see commands.zig's parseProxies.
 # The load generator is not a compose service: the `bench` binary runs directly
 # on the loadgen host (static musl, no container, so no seccomp profile to
 # reconcile with io_uring) and drives this file over ssh.
@@ -313,9 +315,3 @@ services:
       - /var/lib/docker/:/var/lib/docker:ro
     ports:
       - "8081:8080"
-
-  # Host-level metrics. UNCLAIMED as of the Prometheus removal: its only readers
-  # were the deleted scrape config and report.py's node_cpu cpuset fallback for
-  # proxy CPU, which the driver now takes from cAdvisor instead. Kept because
-  # nothing else answers "was the HOST itself saturated" — decide to keep or
-  # drop it deliberately, not by forgetting it exists.

@@ -423,12 +423,24 @@ package_update: true
 
 runcmd:
   - sysctl --system
-  # pin docker-ce to the same major.minor everywhere (same compose CLI as local)
+  # Pin docker-ce to the same major.minor everywhere (same compose CLI as
+  # local). The other three packages have their own, unrelated version
+  # numbering (docker-compose-plugin's version is nothing like docker-ce's),
+  # so they cannot share `$VERSION` — but leaving them unpinned meant only
+  # docker-ce/docker-ce-cli were actually reproducible night to night, and a
+  # `docker-compose-plugin` bump landing between two runs is exactly the kind
+  # of drift this whole pin exists to prevent. Pin each to whatever apt
+  # resolves as newest AT THIS BOOT, so it is at least fixed for the rest of
+  # this VM's life even though it can still differ from a previous night's.
   - >-
     VERSION=$(apt-cache madison docker-ce | awk '$3 ~ /${docker_version}/ {print $3; exit}');
-    apt-get install -y docker-ce=$VERSION docker-ce-cli=$VERSION containerd.io
-    docker-buildx-plugin docker-compose-plugin
-  - apt-mark hold docker-ce docker-ce-cli
+    CONTAINERD_VERSION=$(apt-cache madison containerd.io | awk 'NR==1{print $3}');
+    BUILDX_VERSION=$(apt-cache madison docker-buildx-plugin | awk 'NR==1{print $3}');
+    COMPOSE_VERSION=$(apt-cache madison docker-compose-plugin | awk 'NR==1{print $3}');
+    apt-get install -y docker-ce=$VERSION docker-ce-cli=$VERSION
+    containerd.io=$CONTAINERD_VERSION docker-buildx-plugin=$BUILDX_VERSION
+    docker-compose-plugin=$COMPOSE_VERSION
+  - apt-mark hold docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   - systemctl enable --now docker
   - /usr/local/bin/bench-payload
   # One object per role (bench's ycs.Keys.bootOk, which exists so cloud-init and

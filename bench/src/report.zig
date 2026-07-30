@@ -50,7 +50,15 @@ pub const ProxyData = struct {
     name: []const u8,
     rows: []analysis.Window,
     sustained: f64,
+    /// Reference-band histogram (fixed rate, warmup excluded): the summary
+    /// table's p50/p99 columns read from this, so every proxy is compared at
+    /// the same fair, sub-knee load — see profile.zig's `ref_rate` docs.
     hist: ?Histogram,
+    /// The WHOLE run's histogram (every window, warmup included): the
+    /// distribution chart plots this, and it matches what `hgrm_file` holds
+    /// on disk. Deliberately a separate field from `hist` — conflating the
+    /// two would either wrongly filter the chart or wrongly widen the table.
+    dist_hist: ?Histogram,
     hgrm_file: []const u8,
     /// Peak container working-set bytes; null for `direct` (no container) and
     /// for any run whose cAdvisor samples are absent.
@@ -85,6 +93,8 @@ pub const Gathered = struct {
         for (self.present) |*p| {
             if (p.hist) |*h| h.deinit();
             p.hist = null;
+            if (p.dist_hist) |*h| h.deinit();
+            p.dist_hist = null;
         }
     }
 };
@@ -141,6 +151,7 @@ pub fn gather(
             .rows = rows,
             .sustained = analysis.sustained(rows),
             .hist = try analysis.refHist(gpa, first, ref_rate, ref_band),
+            .dist_hist = try analysis.wholeRunHist(gpa, first),
             .hgrm_file = try hgrmFilename(arena, io, dir, in.name, in.tags),
             .mem = in.mem,
             .cpu = in.cpu,

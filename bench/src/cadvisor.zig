@@ -45,7 +45,7 @@ pub const Error = error{
 /// has a live container while one proxy is being measured, which is what makes
 /// a leftover from the previous iteration detectable.
 pub const known_proxies = [_][]const u8{
-    "zoxy", "haproxy", "pingora",
+    "zoxy", "haproxy", "pingora", "envoy",
 };
 
 pub const Observation = struct {
@@ -68,7 +68,6 @@ pub fn scrape(
     io: Io,
     addr: net.IpAddress,
     proxy: []const u8,
-    scratch: []u8,
     fd_slot: ?*std.atomic.Value(i32),
 ) !Observation {
     // No connect timeout: Io.Threaded panics on one, and a scrape that stalls
@@ -112,7 +111,6 @@ pub fn scrape(
             },
             else => return err,
         };
-        _ = scratch;
 
         if (parseMetric(line, "container_cpu_usage_seconds_total")) |m| {
             if (nameLabel(m.labels)) |n| {
@@ -121,16 +119,16 @@ pub fn scrape(
                     // named one is the container itself.
                     obs.cpu_seconds_total += m.value;
                     seen_expected += 1;
-                } else if (isKnownProxy(n)) {
-                    obs.intruder = n;
+                } else if (matchKnownProxy(n)) |static_name| {
+                    obs.intruder = static_name;
                 }
             }
         } else if (parseMetric(line, "container_memory_working_set_bytes")) |m| {
             if (nameLabel(m.labels)) |n| {
                 if (std.mem.eql(u8, n, proxy)) {
                     obs.mem_ws = @max(obs.mem_ws, @as(u64, @intFromFloat(m.value)));
-                } else if (isKnownProxy(n)) {
-                    obs.intruder = n;
+                } else if (matchKnownProxy(n)) |static_name| {
+                    obs.intruder = static_name;
                 }
             }
         }
@@ -141,10 +139,25 @@ pub fn scrape(
 }
 
 fn isKnownProxy(name: []const u8) bool {
+    return matchKnownProxy(name) != null;
+}
+
+/// The `known_proxies` entry equal to `name`, or null.
+///
+/// Returns the STATIC string from `known_proxies` rather than `name` itself.
+/// `name` is a slice into `scrape()`'s per-call read buffer (`rbuf`, a stack
+/// array) and does not outlive `scrape()` returning — `Observation.intruder`
+/// used to be set directly to `name`, which meant every caller that read it
+/// after the call returned was already looking at a dangling pointer. One
+/// local repro printed the container name as "ompose_", a scrap of the
+/// process's own prior stack contents, instead of the real intruder.
+/// `known_proxies` has program lifetime, so returning its own entry sidesteps
+/// the dangling-pointer problem entirely rather than copying into a buffer.
+fn matchKnownProxy(name: []const u8) ?[]const u8 {
     for (known_proxies) |p| {
-        if (std.mem.eql(u8, name, p)) return true;
+        if (std.mem.eql(u8, name, p)) return p;
     }
-    return false;
+    return null;
 }
 
 const Metric = struct { labels: []const u8, value: f64 };
@@ -180,6 +193,29 @@ fn nameLabel(labels: []const u8) ?[]const u8 {
         if (i < labels.len and labels[i] == ',') i += 1;
     }
     return null;
+}
+
+/// Poll `scrape` until it reports `proxy`'s container, or `timeout_ns`
+/// elapses. Best-effort: returns whether it was seen, never an error — a
+/// cAdvisor that never catches up should cost the CPU/mem chart, not the
+/// throughput measurement.
+///
+/// Exists because cAdvisor's own container discovery can lag well behind the
+/// container actually starting. Nightly run #28: cAdvisor answered every
+/// scrape correctly (zero failures) for the WHOLE 300s ramp without once
+/// reporting c100's zoxy or haproxy, while the very next proxy (pingora) —
+/// and every proxy in that same night's later c1k profile — worked fine. On
+/// a healthy run this returns on its first scrape, so the cost here is one
+/// HTTP round trip; the bound only matters on the run it exists for.
+pub fn waitUntilFound(io: Io, addr: net.IpAddress, proxy: []const u8, timeout_ns: u64) bool {
+    const started = Io.Timestamp.now(io, .awake);
+    while (true) {
+        if (scrape(io, addr, proxy, null)) |obs| {
+            if (obs.found) return true;
+        } else |_| {}
+        if (started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds >= timeout_ns) return false;
+        io.sleep(.fromNanoseconds(std.time.ns_per_s), .awake) catch return false;
+    }
 }
 
 /// Samples one container for the length of a ramp, appending to `out`.
@@ -231,7 +267,6 @@ pub const Poller = struct {
     }
 
     pub fn run(self: *Poller) void {
-        var scratch: [4096]u8 = undefined;
         // A counter needs two points to become a rate, and the first scrape
         // lands mid-startup, so it is dropped.
         var first = true;
@@ -240,7 +275,7 @@ pub const Poller = struct {
             const now = Io.Timestamp.now(self.io, .awake);
             const t = @as(f64, @floatFromInt(self.t0.durationTo(now).nanoseconds)) / std.time.ns_per_s;
 
-            if (scrape(self.io, self.addr, self.proxy, &scratch, &self.active_fd)) |obs| {
+            if (scrape(self.io, self.addr, self.proxy, &self.active_fd)) |obs| {
                 if (obs.intruder) |other| {
                     // A container for a DIFFERENT proxy is live while this one
                     // is being measured. Whatever is answering :8080 may not be
@@ -308,6 +343,19 @@ test "parseMetric tolerates a trailing timestamp and rejects other metrics" {
     try std.testing.expect(parseMetric("# TYPE container_cpu_usage_seconds_total counter", "container_cpu_usage_seconds_total") == null);
 }
 
+test "matchKnownProxy returns the static entry, not the caller's slice" {
+    // The point of the fix: the returned slice must be `known_proxies[i]`
+    // itself, never `name`, or `Observation.intruder` dangles the moment the
+    // caller's buffer (scrape()'s stack-local rbuf, in production) is reused.
+    var buf: [16]u8 = undefined;
+    const scratch = std.fmt.bufPrint(&buf, "{s}", .{"haproxy"}) catch unreachable;
+    const matched = matchKnownProxy(scratch).?;
+    try std.testing.expect(matched.ptr != scratch.ptr);
+    try std.testing.expectEqualStrings("haproxy", matched);
+
+    try std.testing.expect(matchKnownProxy("nginx") == null);
+}
+
 test "nameLabel finds name regardless of label order" {
     try std.testing.expectEqualStrings("zoxy", nameLabel("id=\"/docker/x\",name=\"zoxy\",image=\"z\"").?);
     try std.testing.expectEqualStrings("zoxy", nameLabel("name=\"zoxy\"").?);
@@ -336,9 +384,27 @@ test "toCores differentiates the counter and drops the first sample" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), pts[1].cores, 1e-9);
 }
 
+test "waitUntilFound gives up after its bound against an address nothing answers on" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A closed local port: connect() fails immediately (ECONNREFUSED), so
+    // this exercises the "never found, must eventually give up" path without
+    // actually waiting out a long timeout.
+    const addr = try net.IpAddress.parse("127.0.0.1", 1);
+    const found = waitUntilFound(io, addr, "zoxy", 300 * std.time.ns_per_ms);
+    try std.testing.expect(!found);
+}
+
 test "isKnownProxy covers the comparison set" {
     try std.testing.expect(isKnownProxy("zoxy"));
     try std.testing.expect(isKnownProxy("pingora"));
+    // envoy came back as a default proxy (see commands.zig's parseProxies); it
+    // was missing here for a while, which meant a leftover envoy container was
+    // invisible to the preflight sweep AND the identity witness — exactly the
+    // corruption class this whole mechanism exists to catch.
+    try std.testing.expect(isKnownProxy("envoy"));
     // `direct` has no container at all — it must never be treated as an
     // intruder, or every direct baseline would fail its identity check.
     try std.testing.expect(!isKnownProxy("direct"));

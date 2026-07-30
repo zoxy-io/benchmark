@@ -163,6 +163,43 @@ fn fmtTick(out: []u8, v: f64, yfmt: YFormat) []const u8 {
     };
 }
 
+// --- markup shared between `chart` and `histChart` ---------------------
+//
+// Only the pieces that need no chart-specific TRANSFORM function are shared
+// here — `y`/`label` below are already-computed values, not callbacks, so
+// this stays plain data in, markup out. The point-scaling loops in `chart`
+// and `histChart` are deliberately NOT unified with each other: chart's
+// (possibly log) y-scale and histChart's log-x/linear-y decade scale are
+// different enough that forcing them through one shared callback-based
+// abstraction would cost more in indirection than the ~4 lines it would save,
+// and would require materializing a scaled-points array where both currently
+// stream straight into `out` with no allocation at all.
+
+fn writeSvgOpen(out: *std.Io.Writer) !void {
+    try out.print("<svg viewBox=\"0 0 {d:.0} {d:.0}\" role=\"img\">", .{ w, h });
+}
+
+/// One y-axis gridline plus its tick label, at a Y COORDINATE the caller has
+/// already scaled (`ctx.y(t)` or `Y.f(t, ymaxt)`) and a label it has already
+/// formatted (`fmtTick` or `fmtSi`) — the two charts differ only in how they
+/// get to those two values, not in how the line and label are drawn.
+fn writeYGridLine(out: *std.Io.Writer, y: f64, label: []const u8) !void {
+    try out.print("<line class=\"grid\" x1=\"{d:.0}\" y1=\"{d:.1}\" x2=\"{d:.0}\" y2=\"{d:.1}\"/>", .{ ml, y, w - mr, y });
+    try out.print("<text class=\"tick\" x=\"{d:.0}\" y=\"{d:.1}\" text-anchor=\"end\">{s}</text>", .{ ml - 8, y + 4, label });
+}
+
+/// The x-axis line plus its centred label.
+fn writeXAxis(out: *std.Io.Writer, label: []const u8) !void {
+    try out.print("<line class=\"axis\" x1=\"{d:.0}\" y1=\"{d:.0}\" x2=\"{d:.0}\" y2=\"{d:.0}\"/>", .{ ml, h - mb, w - mr, h - mb });
+    try out.print("<text class=\"axis-label\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ (ml + w - mr) / 2, h - 6, label });
+}
+
+/// The small top-left label naming the y-axis's unit.
+fn writeYUnitLabel(out: *std.Io.Writer, unit: []const u8) !void {
+    if (unit.len == 0) return;
+    try out.print("<text class=\"axis-label\" x=\"14\" y=\"10\" text-anchor=\"start\">{s}</text>", .{unit});
+}
+
 /// Render one chart. Returns false if there was nothing to draw, in which case
 /// the caller should emit its own empty state.
 pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
@@ -239,7 +276,7 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
         .ylog = opts.ylog,
     };
 
-    try out.print("<svg viewBox=\"0 0 {d:.0} {d:.0}\" role=\"img\">", .{ w, h });
+    try writeSvgOpen(out);
     try out.print(
         "<clipPath id=\"clip-{s}\"><rect x=\"{d:.0}\" y=\"{d:.0}\" width=\"{d:.0}\" height=\"{d:.0}\"/></clipPath>",
         .{ opts.id, ml, mt, w - ml - mr, h - mt - mb },
@@ -247,18 +284,13 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
 
     var buf: [128]u8 = undefined;
     for (yticks.slice()) |t| {
-        const y = ctx.y(t);
-        try out.print("<line class=\"grid\" x1=\"{d:.0}\" y1=\"{d:.1}\" x2=\"{d:.0}\" y2=\"{d:.1}\"/>", .{ ml, y, w - mr, y });
-        try out.print("<text class=\"tick\" x=\"{d:.0}\" y=\"{d:.1}\" text-anchor=\"end\">{s}</text>", .{ ml - 8, y + 4, fmtTick(&buf, t, opts.yfmt) });
+        try writeYGridLine(out, ctx.y(t), fmtTick(&buf, t, opts.yfmt));
     }
     for (xt) |t| {
         try out.print("<text class=\"tick\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ ctx.x(t), h - mb + 18, fmtSi(&buf, t) });
     }
-    try out.print("<line class=\"axis\" x1=\"{d:.0}\" y1=\"{d:.0}\" x2=\"{d:.0}\" y2=\"{d:.0}\"/>", .{ ml, h - mb, w - mr, h - mb });
-    try out.print("<text class=\"axis-label\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ (ml + w - mr) / 2, h - 6, opts.x_label });
-    if (opts.y_unit.len > 0) {
-        try out.print("<text class=\"axis-label\" x=\"14\" y=\"10\" text-anchor=\"start\">{s}</text>", .{opts.y_unit});
-    }
+    try writeXAxis(out, opts.x_label);
+    try writeYUnitLabel(out, opts.y_unit);
 
     try out.print("<g clip-path=\"url(#clip-{s})\">", .{opts.id});
     for (series) |s| {
@@ -333,12 +365,10 @@ pub fn histChart(out: *std.Io.Writer, id: []const u8, pts: []const Point) !bool 
         }
     };
 
-    try out.print("<svg viewBox=\"0 0 {d:.0} {d:.0}\" role=\"img\">", .{ w, h });
+    try writeSvgOpen(out);
     var buf: [128]u8 = undefined;
     for (yticks.slice()) |t| {
-        const y = Y.f(t, ymaxt);
-        try out.print("<line class=\"grid\" x1=\"{d:.0}\" y1=\"{d:.1}\" x2=\"{d:.0}\" y2=\"{d:.1}\"/>", .{ ml, y, w - mr, y });
-        try out.print("<text class=\"tick\" x=\"{d:.0}\" y=\"{d:.1}\" text-anchor=\"end\">{s}</text>", .{ ml - 8, y + 4, fmtSi(&buf, t) });
+        try writeYGridLine(out, Y.f(t, ymaxt), fmtSi(&buf, t));
     }
     var d: f64 = 0;
     while (d <= decades) : (d += 1) {
@@ -347,9 +377,8 @@ pub fn histChart(out: *std.Io.Writer, id: []const u8, pts: []const Point) !bool 
         const label = if (d == 0) "p0" else std.fmt.bufPrint(&buf, "p{d}", .{pct}) catch "p?";
         try out.print("<text class=\"tick\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ X.f(n, decades), h - mb + 18, label });
     }
-    try out.print("<line class=\"axis\" x1=\"{d:.0}\" y1=\"{d:.0}\" x2=\"{d:.0}\" y2=\"{d:.0}\"/>", .{ ml, h - mb, w - mr, h - mb });
-    try out.print("<text class=\"axis-label\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">percentile</text>", .{ (ml + w - mr) / 2, h - 6 });
-    try out.writeAll("<text class=\"axis-label\" x=\"14\" y=\"10\" text-anchor=\"start\">ms</text>");
+    try writeXAxis(out, "percentile");
+    try writeYUnitLabel(out, "ms");
 
     try out.print("<polyline class=\"line s-{s}\" points=\"", .{id});
     for (pts, 0..) |p, i| {
@@ -357,6 +386,16 @@ pub fn histChart(out: *std.Io.Writer, id: []const u8, pts: []const Point) !bool 
         try out.print("{d:.1},{d:.1}", .{ X.f(p.x, decades), Y.f(p.y, ymaxt) });
     }
     try out.writeAll("\" fill=\"none\" stroke-width=\"2\"/>");
+
+    // `data-hist`, not `data-chart`: report.js's line-chart hover handler
+    // assumes a linear x-scale and several named series, neither true here
+    // (log-x percentile scale, one series) — a distinct attribute routes this
+    // rect to its own handler instead of silently misbehaving under the
+    // wrong one.
+    try out.print(
+        "<rect class=\"hover-capture\" data-hist=\"{s}\" x=\"{d:.0}\" y=\"{d:.0}\" width=\"{d:.0}\" height=\"{d:.0}\" fill=\"transparent\"/>",
+        .{ id, ml, mt, w - ml - mr, h - mt - mb },
+    );
     try out.writeAll("</svg>");
     return true;
 }
@@ -444,4 +483,9 @@ test "histChart draws percentile decades" {
     const s = out.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "percentile") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "p0") != null);
+    // The hover-capture target for report.js's histogram tooltip handler,
+    // distinguished from the line-chart one by `data-hist` rather than
+    // `data-chart` — the two charts' x-scales are not interchangeable.
+    try std.testing.expect(std.mem.indexOf(u8, s, "data-hist=\"zoxy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "data-chart=") == null);
 }

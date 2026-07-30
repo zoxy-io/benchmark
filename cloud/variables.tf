@@ -66,7 +66,10 @@ variable "bench_profiles" {
 
 variable "bench_proxies" {
   type        = string
-  default     = "direct,zoxy,haproxy,envoy,traefik,nginx,pingora"
+  # Matches nightly.yml's own default. traefik/nginx were deleted rather than
+  # parked (commands.zig's parseProxies rejects them outright); envoy came
+  # back after being temporarily out of the comparison.
+  default     = "direct,zoxy,haproxy,pingora,envoy"
   description = "BENCH_PROXIES — comma-separated, passed straight to `bench suite --proxies`."
 }
 

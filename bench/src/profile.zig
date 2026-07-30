@@ -57,11 +57,12 @@ pub const Profile = struct {
     /// where a single per-proxy latency number is actually fair, because it
     /// reflects per-request COST rather than standing-queue wait.
     ///
-    /// Per-profile because the connect storm moves. On a 200->50000/300s ramp,
-    /// offered 2000 rps is t~=[8.4, 13.2]s — and at 10000 connections zrk is
-    /// still ESTABLISHING connections then (zrk/src/runner.zig:153-156 launches
-    /// them all at once), so a 2000 rps reading at c10k measures connection
-    /// setup, not proxying.
+    /// Per-profile because the connect storm moves. On a 200->100000/300s ramp
+    /// (the compiled-in `start_rate`/`max_rate`/`ramp_seconds` below), offered
+    /// 2000 rps at c1k's +/-20% band is t~=[4.2, 6.6]s — and at 10000
+    /// connections zrk is still ESTABLISHING connections then
+    /// (zrk/src/runner.zig:153-156 launches them all at once), so a 2000 rps
+    /// reading at c10k measures connection setup, not proxying.
     ref_rate: f64,
     /// Merge windows with offered within +/-ref_band of ref_rate.
     ref_band: f64,

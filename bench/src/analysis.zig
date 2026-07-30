@@ -302,6 +302,37 @@ pub fn refHist(
     return acc;
 }
 
+/// The whole run's latency histogram: every window merged, no rate band and no
+/// warmup exclusion. This is the same aggregate `ramp.zig` writes to the
+/// `.hgrm` file (`result.snapshot.hist`, zrk's own cumulative histogram) —
+/// reconstructed here from the per-window blobs already in the `.ndjson`
+/// rather than re-parsed from the `.hgrm` text, because the `.hgrm` format is
+/// a percentile TABLE (lossy, meant for a human or `hdrhistogram` tooling to
+/// read) rather than something meant to round-trip back into a `Histogram`.
+///
+/// Deliberately separate from `refHist`: that one exists so the SUMMARY
+/// TABLE'S p50/p99 read at one common, fair, sub-knee rate — this one is for
+/// the DISTRIBUTION CHART, which should show what actually happened over the
+/// whole ramp, warmup included, not a fairness-filtered slice of it.
+/// Returns null only when the run produced no histogram data at all.
+pub fn wholeRunHist(gpa: Allocator, rows: []const TsRow) !?Histogram {
+    var acc: ?Histogram = null;
+    errdefer if (acc) |*h| h.deinit();
+
+    for (rows) |r| {
+        if (r.latency_histogram.len == 0) continue;
+
+        var h = try zrk.hdr.decodeBase64(gpa, r.latency_histogram);
+        if (acc) |*a| {
+            defer h.deinit();
+            try addCompatible(a, &h);
+        } else {
+            acc = h;
+        }
+    }
+    return acc;
+}
+
 /// An empty histogram with the same geometry as `src`, so `add` is legal.
 fn emptyLike(gpa: Allocator, src: *const Histogram) !Histogram {
     return Histogram.init(gpa, src.lowest_discernible, src.highest_trackable, src.sig_figs);
@@ -592,6 +623,46 @@ test "refHist merges only the windows inside the reference band" {
     var h = (try refHist(gpa, &rows, 2000, 0.20)).?;
     defer h.deinit();
     try std.testing.expectEqual(@as(u64, 2), h.count());
+}
+
+test "wholeRunHist merges every window, unlike refHist's band+warmup filter" {
+    const gpa = std.testing.allocator;
+
+    var below = try zrk.stats.newHistogram(gpa);
+    defer below.deinit();
+    below.record(999);
+    const below_b64 = try below.encodeBase64(gpa);
+    defer gpa.free(below_b64);
+
+    var inside = try zrk.stats.newHistogram(gpa);
+    defer inside.deinit();
+    inside.record(1234);
+    inside.record(5678);
+    const inside_b64 = try inside.encodeBase64(gpa);
+    defer gpa.free(inside_b64);
+
+    // Same three rows `refHist`'s band test uses, PLUS a t<3 warmup row —
+    // wholeRunHist must include all four, where refHist(2000, 0.20) would
+    // keep only the "inside" one.
+    const rows = [_]TsRow{
+        .{ .t = 1, .target_rate = 100, .latency_histogram = below_b64 }, // warmup
+        .{ .t = 5, .target_rate = 500, .latency_histogram = below_b64 }, // below band
+        .{ .t = 6, .target_rate = 2000, .latency_histogram = inside_b64 }, // inside band
+        .{ .t = 7, .target_rate = 9000, .latency_histogram = below_b64 }, // above band
+    };
+
+    var h = (try wholeRunHist(gpa, &rows)).?;
+    defer h.deinit();
+    try std.testing.expectEqual(@as(u64, 5), h.count()); // 1+1+2+1
+
+    var band = (try refHist(gpa, &rows, 2000, 0.20)).?;
+    defer band.deinit();
+    try std.testing.expectEqual(@as(u64, 2), band.count());
+}
+
+test "wholeRunHist returns null for an empty run" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect((try wholeRunHist(gpa, &.{})) == null);
 }
 
 test "refHist skips the warmup and returns null when the band is never reached" {

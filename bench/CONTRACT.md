@@ -10,7 +10,7 @@ independently.
 | Command | Runs on | Purpose |
 |---|---|---|
 | `bench sweep` | runner | Delete any instance labelled `bench=nightly` left over from a previous run |
-| `bench wait --runid <id>` | runner | Poll Object Storage for `DONE`/`FAILED`, streaming the uploaded log to stdout |
+| `bench wait --runid <id> [--max-wait-s <n>]` | runner | Poll Object Storage for `DONE`/`FAILED`, streaming the uploaded log to stdout |
 | `bench fetch --runid <id> --out <dir>` | runner | Download the run's artifacts |
 | `bench suite --profile <name> [--proxies a,b,c]` | loadgen | Run every proxy's ramp for one profile (calls the ramp in-process; there is no separate `ramp` subcommand) |
 | `bench report <dir> --profile <name>` | runner | `<dir>` → `report.json` + `report.html` |
@@ -19,6 +19,13 @@ independently.
 
 Exit codes: `0` ok, `2` usage error, `3` the operation completed but the run had
 failures worth failing CI over, `1` unexpected error.
+
+`bench wait` also uses `5`: the `--max-wait-s` deadline elapsed with no
+DONE/FAILED marker yet, but the fleet may still be healthy — unlike `1`
+(`never_booted`), which means no VM ever wrote its boot marker and no amount of
+retrying will help. `5` is what tells the workflow to re-mint the IAM token and
+call `wait` again rather than give up; see nightly.yml's "Wait for the run"
+steps.
 
 ## Environment
 

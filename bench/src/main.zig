@@ -42,7 +42,7 @@ const usage =
     \\  index   <rundir>                                 build the Pages site
     \\  notify  <rundir> [--dry-run]                     post to Discord
     \\  sweep                                            delete orphaned fleet VMs
-    \\  wait    <runid>                                  await the self-driving run
+    \\  wait    <runid> [--max-wait-s <n>]                await the self-driving run
     \\  ramp    --profile .. --proxy .. --target ..      one proxy's ramp (spawned by `suite`)
     \\
 ;
@@ -92,7 +92,19 @@ fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
     env.runid = try flagValue(args, "--runid") orelse env.runid;
     if (env.runid.len == 0) return fail("bench wait: --runid or BENCH_RUNID is required", .{});
 
-    const res = try commands.wait(init.gpa, arena, init.io, env, .{});
+    var opts: commands.WaitOptions = .{};
+    // Lets the workflow bound a single invocation to less than the federated
+    // IAM token's ~1h TTL, so it can re-mint a fresh one and call `wait` again
+    // rather than have the SAME invocation's token expire mid-poll — Object
+    // Storage then starts 401ing every `exists`/`get` and the run looks dead
+    // even though the fleet is healthy. Exit code 5 (below) is what tells the
+    // workflow "that was a chunk boundary, not the end" so it knows to retry.
+    if (try flagValue(args, "--max-wait-s")) |v| {
+        opts.deadline_s = std.fmt.parseUnsigned(u64, v, 10) catch
+            return fail("bench wait: --max-wait-s must be a non-negative integer", .{});
+    }
+
+    const res = try commands.wait(init.gpa, arena, init.io, env, opts);
     switch (res) {
         .done => {
             std.debug.print("bench wait: run complete\n", .{});
@@ -103,7 +115,12 @@ fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
         // publishing) from "nothing ever came back".
         //
         .failed => exit(3),
-        .never_booted, .timed_out => exit(1),
+        .never_booted => exit(1),
+        // Distinct from `never_booted`: the fleet may be perfectly healthy and
+        // just still running when THIS invocation's deadline (`--max-wait-s`)
+        // ran out — worth calling `wait` again with a fresh token, unlike
+        // `never_booted`, which no amount of retrying will fix.
+        .timed_out => exit(5),
     }
 }
 
@@ -173,15 +190,26 @@ fn cmdIndex(init: std.process.Init, args: []const [:0]const u8) !void {
     ));
 }
 
+/// Every flag in this CLI that is checked with `hasFlag` rather than read with
+/// `flagValue` — i.e. every flag `positional` must NOT treat as consuming the
+/// argument after it. A flag added to a `hasFlag` call site anywhere in this
+/// file but not to this list is silently misparsed: `positional` would treat
+/// whatever follows it as ITS value and skip past a real positional argument.
+const valueless_flags = [_][]const u8{ "--dry-run", "--local" };
+
+fn isValueless(name: []const u8) bool {
+    for (valueless_flags) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
+}
+
 /// The first argument that is not a flag or a flag's value.
 fn positional(args: []const [:0]const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.startsWith(u8, args[i], "--")) {
-            // These take no value; every other flag does.
-            const valueless = std.mem.eql(u8, args[i], "--dry-run") or
-                std.mem.eql(u8, args[i], "--local");
-            if (!valueless) i += 1;
+            if (!isValueless(args[i])) i += 1;
             continue;
         }
         return args[i];
@@ -194,6 +222,16 @@ fn hasFlag(args: []const [:0]const u8, name: []const u8) bool {
         if (std.mem.eql(u8, a, name)) return true;
     }
     return false;
+}
+
+test "positional does not consume the argument after a valueless flag" {
+    const args: []const [:0]const u8 = &.{ "--dry-run", "rundir" };
+    try std.testing.expectEqualStrings("rundir", positional(args).?);
+}
+
+test "positional DOES consume the argument after a value-taking flag" {
+    const args: []const [:0]const u8 = &.{ "--runid", "20260101-000000", "rundir" };
+    try std.testing.expectEqualStrings("rundir", positional(args).?);
 }
 
 /// Value of `--name <value>`, or null when absent.
@@ -300,15 +338,19 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     const statuses = readStatuses(arena, io, run_dir) catch &.{};
     const origin = readOrigin(arena, io, run_dir);
 
-    const path = try std.fmt.allocPrint(arena, "{s}/report.json", .{run_dir});
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [64 * 1024]u8 = undefined;
-    var fw: std.Io.File.Writer = .init(file, io, &buf);
+    // Built into memory first, like report.html below, so `assertNoIps` runs
+    // BEFORE anything reaches disk. This used to stream straight to the file —
+    // the only artifact in the whole harness that skipped the check at its own
+    // point of creation; the gap was closed only incidentally, whenever
+    // `copyFile` re-checked it during a Pages publish.
+    var jbuf: std.ArrayList(u8) = .empty;
+    defer jbuf.deinit(gpa);
+    var jw: std.Io.Writer.Allocating = .fromArrayList(gpa, &jbuf);
+    defer jbuf = jw.toArrayList();
 
     try report.writeJson(
         arena,
-        &fw.interface,
+        &jw.writer,
         g,
         meta.runid,
         generated,
@@ -316,6 +358,14 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         prof.ref_rate,
         prof.ref_band,
     );
+    try redact.assertNoIps("report.json", jw.written());
+
+    const path = try std.fmt.allocPrint(arena, "{s}/report.json", .{run_dir});
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fw: std.Io.File.Writer = .init(file, io, &buf);
+    try fw.interface.writeAll(jw.written());
     try fw.interface.flush();
 
     // The HTML draws from the SAME Gathered value the JSON was written from, so

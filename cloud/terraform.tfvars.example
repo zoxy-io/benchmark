@@ -21,7 +21,7 @@ service_account_id = "ajexxxxxxxxxxxxxxxxx"
 bench_bucket       = "zoxy-benchmark"
 
 # bench_profiles = "c1k,c10k"
-# bench_proxies  = "direct,zoxy,haproxy,envoy,traefik,nginx,pingora"
+# bench_proxies  = "direct,zoxy,haproxy,pingora,envoy"  # traefik/nginx were deleted, not parked
 
 # proxy 2c/4g, backend 4c/8g, loadgen 4c/8g by default — see variables.tf
 

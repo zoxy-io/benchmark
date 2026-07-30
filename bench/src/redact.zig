@@ -135,6 +135,62 @@ pub fn assertNoIps(what: []const u8, text: []const u8) !void {
     }
 }
 
+/// Replace every IPv4-shaped substring in `text` with a placeholder, without
+/// needing anything registered in advance.
+///
+/// `scrub` above only redacts addresses THIS process was told about via
+/// `register` — which works for `remote.zig`, which dials the fleet itself,
+/// but not for `bench wait`: it runs on the CI runner, relaying a log object
+/// the LOADGEN wrote on a different machine entirely, and the runner never
+/// learns the fleet's private addresses (PROXY_IP/BACKEND_IP are documented as
+/// VM-side only in CONTRACT.md). This finds anything IP-shaped instead — the
+/// same blunt pattern `assertNoIps` already applies to artifacts, and that
+/// nightly.yml's own `sed` applies to `tofu`'s resource diff. Private or
+/// public, none of it belongs in a log a public Actions run relays.
+pub fn scrubAnyIp(out: []u8, text: []const u8) []const u8 {
+    var len: usize = 0;
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        const boundary = i == 0 or !(std.ascii.isDigit(text[i - 1]) or text[i - 1] == '.');
+        if (boundary and std.ascii.isDigit(text[i])) {
+            if (matchDottedQuad(text[i..])) |match_len| {
+                const rep = "<addr>";
+                if (len + rep.len > out.len) break :outer;
+                @memcpy(out[len..][0..rep.len], rep);
+                len += rep.len;
+                i += match_len;
+                continue :outer;
+            }
+        }
+        if (len == out.len) break;
+        out[len] = text[i];
+        len += 1;
+        i += 1;
+    }
+    return out[0..len];
+}
+
+/// Print `text` a line at a time, each line scrubbed by `scrubAnyIp`.
+///
+/// Line-at-a-time, not the whole blob at once, for the same reason
+/// `remote.zig`'s `printScrubbed` is: `scrubAnyIp` stops at the end of its
+/// output buffer, so handing it an unbounded blob would silently drop
+/// everything past the first ~4KB. Reconstructs `text` exactly, including
+/// whether it ends with a trailing newline.
+pub fn logAnyIp(text: []const u8) void {
+    var scrubbed: [4096]u8 = undefined;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) std.debug.print("\n", .{});
+        first = false;
+        // `scrub` can only grow a line (each address becomes a longer
+        // placeholder), so an over-long one is truncated rather than risked.
+        const safe = line[0..@min(line.len, scrubbed.len / 2)];
+        std.debug.print("{s}", .{scrubAnyIp(&scrubbed, safe)});
+    }
+}
+
 /// Length of a dotted quad at the start of `s`, or null. Each octet is 1-3
 /// digits with a value <= 255, and the match must not be followed by a digit or
 /// a dot (so a five-group version string is not mistaken for an address).
@@ -208,4 +264,28 @@ test "scrub is a no-op when nothing is registered" {
     reset();
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("10.10.0.27", scrub(&buf, "10.10.0.27"));
+}
+
+test "scrubAnyIp catches an address with nothing registered" {
+    // The whole point: unlike `scrub`, this needs no prior `register` call —
+    // it is what `bench wait` uses on the runner, which never learns the
+    // fleet's addresses the way `remote.zig` (dialing them itself) does.
+    reset();
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "connect <addr>:8080 failed",
+        scrubAnyIp(&buf, "connect 10.10.0.27:8080 failed"),
+    );
+    try std.testing.expectEqualStrings(
+        "<addr> and <addr>",
+        scrubAnyIp(&buf, "192.168.1.1 and 8.8.8.8"),
+    );
+}
+
+test "scrubAnyIp leaves version strings and ordinary numbers alone" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "zrk 1.3.1, zio 0.16.0",
+        scrubAnyIp(&buf, "zrk 1.3.1, zio 0.16.0"),
+    );
 }

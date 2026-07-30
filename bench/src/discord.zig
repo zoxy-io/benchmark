@@ -139,6 +139,35 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
     return out.toOwnedSlice(arena);
 }
 
+/// Cut `table` to fit Discord's description limit, if it doesn't already.
+///
+/// A raw `table[0..limits.description]` — the previous behaviour — can land
+/// mid-way through the closing ` ``` ` fence or the `[full report]` link,
+/// leaving an unterminated code block, and can split a multi-byte UTF-8
+/// sequence, which is invalid inside a JSON string. Unreachable at today's
+/// proxy count (~5 rows fits in a few hundred bytes), but silent at the
+/// moment the roster grows past it rather than caught here.
+///
+/// Always drops the tail and rebuilds a clean closing sequence, regardless of
+/// where the cut lands relative to the original fence/link — simpler and
+/// exactly as correct as trying to detect whether the original tail survived
+/// the cut.
+fn truncateTable(arena: Allocator, table: []const u8, url: []const u8) ![]const u8 {
+    if (table.len <= limits.description) return table;
+
+    const suffix = if (url.len > 0)
+        try std.fmt.allocPrint(arena, "\n```\n[full report]({s})", .{url})
+    else
+        "\n```";
+
+    var cut = limits.description -| suffix.len;
+    // Never split a multi-byte UTF-8 sequence — a continuation byte has its
+    // top two bits as 10.
+    while (cut > 0 and (table[cut] & 0xC0) == 0x80) cut -= 1;
+
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ table[0..cut], suffix });
+}
+
 /// Build the `payload_json` part of the multipart body.
 pub fn renderPayload(
     arena: Allocator,
@@ -146,8 +175,13 @@ pub fn renderPayload(
     embeds: []const Embed,
     files: []const Attachment,
 ) ![]const u8 {
-    std.debug.assert(embeds.len <= limits.embeds);
-    std.debug.assert(files.len <= limits.files);
+    // Runtime checks, not `std.debug.assert`: the nightly binary ships
+    // ReleaseFast (see .github/workflows/nightly.yml), where `assert`'s
+    // `unreachable` is undefined behavior rather than a caught panic, for a
+    // condition driven by runtime data (how many profiles/proxies ran) that
+    // can plausibly change, not a fixed internal invariant.
+    if (embeds.len > limits.embeds) return error.TooManyEmbeds;
+    if (files.len > limits.files) return error.TooManyFiles;
 
     var buf: std.ArrayList(u8) = .empty;
     var w: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
@@ -160,8 +194,7 @@ pub fn renderPayload(
     try j.key("embeds");
     try j.beginArray();
     for (embeds) |e| {
-        var table = try renderTable(arena, e);
-        if (table.len > limits.description) table = table[0..limits.description];
+        const table = try truncateTable(arena, try renderTable(arena, e), e.url);
 
         try j.beginObject();
         try j.key("title");
@@ -313,36 +346,29 @@ pub fn post(
         return;
     }
 
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
     const ctype = try std.fmt.allocPrint(arena, "multipart/form-data; boundary={s}", .{boundary});
     const url = try withWait(arena, webhook);
 
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
-        // The response body is of no interest, but a `response_writer` is still
-        // mandatory: without one std.http.Client segfaults in its own discard
-        // path, and only in a ReleaseFast musl build. Discord's 429 body IS read
-        // here rather than discarded — see below.
-        var discard_buf: [1024]u8 = undefined;
-        var discard: std.Io.Writer.Discarding = .init(&discard_buf);
-        const res = try client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
-            .response_writer = &discard.writer,
-            // Ask the server to close after replying. This is what actually
-            // makes a 204 safe: that reply has no body and no `content-length`,
-            // and `std.http.Client` then waits for a body that never comes —
-            // forever, if the connection stays open. `Connection: close` gives
-            // the read an end. Verified against httpbingo.org/status/204, which
-            // hangs without it and returns immediately with it.
-            //
-            // One request per run, so pooling buys nothing anyway.
-            .keep_alive = false,
-        });
+        const outcome = attemptOnce(gpa, arena, io, url, ctype, body) catch |e| {
+            // A transport-level failure — DNS, connection refused/reset, a TLS
+            // handshake failure. This used to be a bare `try` on the fetch,
+            // which skipped this whole loop: the ONLY retried failure mode was
+            // a response that actually arrived with a bad status. For a
+            // one-shot call from an unattended job, a connection that never
+            // completes is the more likely way for this to fail.
+            std.debug.print("bench: Discord POST failed ({s}), attempt {d}/3\n", .{ @errorName(e), attempt + 1 });
+            io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
+            continue;
+        };
+        const res = outcome orelse {
+            std.debug.print("bench: Discord POST timed out after {d}s (attempt {d}/3)\n", .{
+                fetch_deadline_ns / std.time.ns_per_s, attempt + 1,
+            });
+            io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
+            continue;
+        };
         switch (res.status) {
             .ok, .no_content => return,
             .too_many_requests => {
@@ -359,6 +385,95 @@ pub fn post(
         }
     }
     return error.DiscordPostFailed;
+}
+
+/// How long a single attempt gets before it is abandoned as failed.
+///
+/// `std.http.Client.fetch` has no deadline of its own — nothing here bounds a
+/// stalled connect, or a server that accepts the connection and then drips the
+/// response forever. This borrows `remote.zig`'s `Waiter` shape: run the call
+/// on its own thread, poll an atomic flag, give up on the wall clock if it
+/// never flips. A webhook body here is a few KB of JSON with no attachment
+/// (see `renderPayload`'s `files` — always empty on the real call path, see
+/// `commands.zig`), so 30s is generous even on a slow connection.
+const fetch_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+const FetchTask = struct {
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    result: ?(std.http.Client.FetchError!std.http.Client.FetchResult) = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *FetchTask) void {
+        self.result = self.client.fetch(self.options);
+        self.done.store(true, .release);
+    }
+};
+
+/// One attempt: a fresh client, on its own thread, bounded by `fetch_deadline_ns`.
+/// A `null` return means the attempt never came back in time.
+///
+/// The client and its thread are then ABANDONED rather than torn down —
+/// nothing here can force an OS thread blocked in a syscall to unwind, and
+/// calling `client.deinit()` out from under a thread still using it would race
+/// its connection pool. Everything the abandoned thread can still touch is
+/// allocated from `arena` for exactly that reason: never reused, so there is
+/// nothing for it to corrupt. `bench notify` is a short-lived one-shot
+/// process, so the leak is bounded by the process's own remaining lifetime —
+/// the same trade `ProxyWatchdog` makes with the whole process elsewhere in
+/// this codebase.
+fn attemptOnce(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    url: []const u8,
+    ctype: []const u8,
+    body: []const u8,
+) !?std.http.Client.FetchResult {
+    const client = try arena.create(std.http.Client);
+    client.* = .{ .allocator = gpa, .io = io };
+
+    // The response body is of no interest, but a `response_writer` is still
+    // mandatory: without one std.http.Client segfaults in its own discard
+    // path, and only in a ReleaseFast musl build.
+    const discard_buf = try arena.alloc(u8, 1024);
+    const discard = try arena.create(std.Io.Writer.Discarding);
+    discard.* = .init(discard_buf);
+
+    const task = try arena.create(FetchTask);
+    task.* = .{
+        .client = client,
+        .options = .{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
+            .response_writer = &discard.writer,
+            // Ask the server to close after replying. This is what actually
+            // makes a 204 safe: that reply has no body and no `content-length`,
+            // and `std.http.Client` then waits for a body that never comes —
+            // forever, if the connection stays open. `Connection: close` gives
+            // the read an end. Verified against httpbingo.org/status/204, which
+            // hangs without it and returns immediately with it.
+            //
+            // One request per attempt, so pooling buys nothing anyway.
+            .keep_alive = false,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, FetchTask.run, .{task});
+
+    const step_ns: u64 = 100 * std.time.ns_per_ms;
+    var waited: u64 = 0;
+    while (!task.done.load(.acquire) and waited < fetch_deadline_ns) {
+        io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
+        waited += step_ns;
+    }
+    if (!task.done.load(.acquire)) return null; // abandoned; see doc comment above
+
+    thread.join();
+    defer client.deinit(); // safe now: joined, so nothing else touches it
+    return try task.result.?;
 }
 
 test "the table shows a failed proxy as FAILED, never as zeros" {
@@ -464,6 +579,43 @@ test "payload declares one attachment id per file" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"id\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"id\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "report-c10k.html") != null);
+}
+
+test "truncateTable leaves a short table untouched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const table = "```\nshort table\n```\n[full report](https://x/y)";
+    try std.testing.expectEqualStrings(table, try truncateTable(arena_state.allocator(), table, "https://x/y"));
+}
+
+test "truncateTable always re-closes the fence and the link, never mid-cut" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, "```\n");
+    // Comfortably past limits.description so this MUST be cut.
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) try buf.appendSlice(arena, "proxy row of table text\n");
+    try buf.appendSlice(arena, "```\n[full report](https://example/report)");
+
+    const out = try truncateTable(arena, buf.items, "https://example/report");
+    try std.testing.expect(out.len <= limits.description);
+    try std.testing.expect(std.mem.endsWith(u8, out, "```\n[full report](https://example/report)"));
+    // Still valid UTF-8 — the whole input here is ASCII, but the cut logic
+    // itself must never land on a continuation byte.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "renderPayload rejects too many embeds rather than asserting" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var embeds: [limits.embeds + 1]Embed = undefined;
+    for (&embeds) |*e| e.* = .{ .title = "t", .ref_rate = 2000, .rows = &.{} };
+    try std.testing.expectError(error.TooManyEmbeds, renderPayload(arena, "x", &embeds, &.{}));
 }
 
 test "randomBoundary is not a constant" {
