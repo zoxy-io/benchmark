@@ -33,6 +33,10 @@ h1 .rid { color:var(--amber) }
 .card h2 { font-family:var(--font-display); font-size:1.05rem; font-weight:600; letter-spacing:-.01em }
 .card .sub { color:var(--haze-dim); font-size:.8rem; margin:.35rem 0 .95rem; line-height:1.45 }
 .swatch { width:9px; height:9px; border-radius:2px; display:inline-block }
+/* static legend above a chart that has no proxy-cell table to carry one */
+.legend { display:flex; flex-wrap:wrap; gap:6px 16px; margin:0 0 .8rem;
+  font-family:var(--font-mono); font-size:.72rem; color:var(--haze) }
+.lgitem { display:flex; align-items:center; gap:7px }
 svg { width:100%; height:auto; display:block }
 .grid { stroke:var(--line); stroke-width:1 }
 .axis { stroke:var(--line-2); stroke-width:1 }

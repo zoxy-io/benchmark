@@ -15,6 +15,8 @@
 
 const std = @import("std");
 
+const jsonw = @import("jsonw.zig");
+
 const Allocator = std.mem.Allocator;
 
 pub const Point = struct { x: f64, y: f64 };
@@ -312,6 +314,64 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     );
     try out.writeAll("</svg>");
     return true;
+}
+
+/// The JSON blob `report.js`'s hover handler reads for chart `id`: each
+/// series' name and points, the y-value formatter, the plot geometry (so the
+/// browser can invert screen coordinates back to data space) and xmax (so the
+/// crosshair's x maps to an offered rate). `xmax_opt`/the geometry constants
+/// must be computed exactly as `chart` computes them for the SAME `series` and
+/// `id`, or the hover crosshair lands on the wrong point — the two are always
+/// called together for that reason.
+///
+/// Every embedder of a line chart (html.zig's per-run cards, index.zig's
+/// nightly trend) calls this rather than writing its own copy, so the JSON
+/// shape can't drift out of sync between them the way the chart geometry
+/// nearly did once already (see histCard's note on `decades`).
+pub fn writeChartData(out: *std.Io.Writer, id: []const u8, series: []const Series, yfmt: YFormat, xmax_opt: ?f64) !void {
+    try out.print("<script type=\"application/json\" id=\"data-{s}\">", .{id});
+    var j = jsonw.Writer{ .w = out };
+    try j.beginObject();
+    try j.key("series");
+    try j.beginArray();
+    for (series) |s| {
+        if (s.pts.len == 0) continue;
+        try j.beginObject();
+        try j.key("name");
+        try j.string(s.name);
+        try j.key("pts");
+        try j.beginArray();
+        for (s.pts) |p| {
+            try j.beginArray();
+            try j.float(p.x, 4);
+            try j.float(p.y, 4);
+            try j.endArray();
+        }
+        try j.endArray();
+        try j.endObject();
+    }
+    try j.endArray();
+    try j.key("yfmt");
+    try j.string(@tagName(yfmt));
+    try j.key("geom");
+    try j.beginArray();
+    for ([_]f64{ w, h, ml, mr, mt, mb }) |v| try j.int(@intFromFloat(v));
+    try j.endArray();
+
+    var xmax: f64 = xmax_opt orelse blk: {
+        var m: f64 = 0;
+        for (series) |s| for (s.pts) |p| {
+            m = @max(m, p.x);
+        };
+        break :blk @max(m, 1);
+    };
+    if (xmax <= 0) xmax = 1;
+    const ticks = niceTicks(0, xmax, 5);
+    const t = ticks.slice();
+    try j.key("xmax");
+    try j.float(t[t.len - 1], 4);
+    try j.endObject();
+    try out.writeAll("</script>");
 }
 
 const Scale = struct {

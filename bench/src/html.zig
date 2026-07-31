@@ -368,60 +368,22 @@ fn card(
     _ = try svg.chart(out, opts, conv);
     try out.print("<div class=\"tooltip\" id=\"tip-{s}\" hidden></div></div>", .{opts.id});
 
-    // The hover layer reads its data from this blob. The synthetic y=x diagonal
-    // is excluded: its value at any x is just x, already shown in the header.
-    //
-    // Built with jsonw.Writer, like every other JSON artifact in this
-    // codebase, rather than hand-rolled `print`/`writeByte` calls: a proxy
-    // name containing `"` would corrupt this blob for every series, not just
-    // that one, and one containing `</script>` would break out of the
-    // surrounding element into the page itself. Proxy names are allowlisted
-    // upstream today (commands.parseProxies), but this closes the sink
-    // regardless of that, and removes the only hand-rolled JSON left in the
-    // codebase outside jsonw.zig itself.
-    try out.print("<script type=\"application/json\" id=\"data-{s}\">", .{opts.id});
-    var j = jsonw.Writer{ .w = out };
-    try j.beginObject();
-    try j.key("series");
-    try j.beginArray();
+    // The synthetic y=x diagonal is excluded from the hover data: its value at
+    // any x is just x, already shown in the header. `conv` above still carries
+    // it (drawn as the dashed reference line), so filter separately here.
+    var hover_n: usize = 0;
     for (series) |s| {
-        if (s.pts.len == 0 or s.ref) continue;
-        try j.beginObject();
-        try j.key("name");
-        try j.string(s.name);
-        try j.key("pts");
-        try j.beginArray();
-        for (s.pts) |p| {
-            try j.beginArray();
-            try j.float(p.x, 4);
-            try j.float(p.y, 4);
-            try j.endArray();
-        }
-        try j.endArray();
-        try j.endObject();
+        if (!s.ref) hover_n += 1;
     }
-    try j.endArray();
-    try j.key("yfmt");
-    try j.string(@tagName(opts.yfmt));
-    try j.key("geom");
-    try j.beginArray();
-    for ([_]f64{ svg.w, svg.h, svg.ml, svg.mr, svg.mt, svg.mb }) |v| try j.int(@intFromFloat(v));
-    try j.endArray();
-
-    var xmax: f64 = opts.xmax orelse blk: {
-        var m: f64 = 0;
-        for (series) |s| for (s.pts) |p| {
-            m = @max(m, p.x);
-        };
-        break :blk @max(m, 1);
-    };
-    if (xmax <= 0) xmax = 1;
-    const ticks = svg.niceTicks(0, xmax, 5);
-    const t = ticks.slice();
-    try j.key("xmax");
-    try j.float(t[t.len - 1], 4);
-    try j.endObject();
-    try out.writeAll("</script></section>");
+    const hover_series = try arena.alloc(svg.Series, hover_n);
+    var hi: usize = 0;
+    for (conv, series) |c, s| {
+        if (s.ref) continue;
+        hover_series[hi] = c;
+        hi += 1;
+    }
+    try svg.writeChartData(out, opts.id, hover_series, opts.yfmt, opts.xmax);
+    try out.writeAll("</section>");
 }
 
 /// The distribution chart: `svg.histChart` plus the same hover-tooltip
