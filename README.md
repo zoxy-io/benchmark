@@ -1,31 +1,31 @@
 # benchmark
 
-Compares **zoxy** against **HAProxy** and **Pingora**: every proxy gets the
-*identical* linearly-growing **open-loop** load ramp until it stops keeping up,
-and the output is one self-contained HTML report overlaying **latency, CPU,
-memory and achieved req/s against offered load**.
+Compares **zoxy** against **HAProxy**, **Envoy** and **Pingora**: every proxy
+gets the *identical* linearly-growing **open-loop** load ramp until it stops
+keeping up, and the output is one self-contained HTML report overlaying
+**latency, CPU, memory and achieved req/s against offered load**.
 
 It runs **unattended every night** ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)):
 CI creates a throwaway three-VM fleet with no public addresses, the loadgen
 drives the whole suite itself, results come back through Object Storage, the
 fleet is destroyed, and the summary is posted to Discord and published to Pages.
-Envoy, Traefik and nginx were part of an earlier comparison and have been
-removed; `git log` restores any of them exactly, which is a better starting
-point than a config that has sat unexercised.
+Traefik and nginx-as-a-proxy were part of an earlier comparison and were
+removed; Envoy went through that same removal once and came back. `git log`
+restores any of them, which is a better starting point than a config that has
+sat unexercised.
 
-zoxy's phase-1 build adds an **HTTP (L7)** listener, so every proxy runs as an
-**HTTP/1.1 reverse proxy** (`mode http`, `http_connection_manager`, HTTP router,
-nginx `proxy_pass`, and a small Rust binary on Cloudflare's Pingora framework) —
-the same job for everyone: parse each request, forward it to the origin over a
-pooled keep-alive upstream, stream the response back. The generator speaks HTTP
-end-to-end and the origin nginx is the HTTP endpoint, as before — now the
-proxies parse it too instead of tunnelling bytes.
+Every proxy is an **HTTP/1.1 reverse proxy** doing the same job — HAProxy
+`mode http`, Envoy `http_connection_manager`, Pingora's ~90-line Rust binary on
+Cloudflare's framework, zoxy's phase-1 `http` listener: parse each request,
+forward it to the origin over a pooled keep-alive upstream, stream the
+response back. The generator speaks HTTP end-to-end and the origin nginx is
+the HTTP endpoint.
 
 ```
-             0 ──────── linear ramp ────────► MAX_RATE (50k)
+             0 ──────── linear ramp ────────► MAX_RATE (100k)
         zrk ───────► proxy-under-test ───────────► nginx origin
- (open loop, CO-     (pinned core, 512 MiB,        (canned 64B..100k
-  corrected)          ONE at a time)                bodies, 2x cpus)
+ (open loop, CO-     (pinned core, 4 GiB cap,      (canned 64B..100k
+  corrected)          ONE at a time)                bodies, 4x cpus)
       │                       │
       │                       └── cAdvisor :8081 ── sampled at 1Hz
       │                            (cpu + working-set, into the run's
@@ -66,12 +66,15 @@ The nightly runs itself. One-time cloud setup — service accounts, the OIDC
 federation, the results bucket — is in [docs/SETUP.md](docs/SETUP.md); after
 that, use `workflow_dispatch` to trigger a run by hand.
 
-Two ramp profiles run in sequence, both across `direct, zoxy, haproxy, pingora`:
+Ramp profiles are compiled into [`bench/src/profile.zig`](bench/src/profile.zig)
+and run across `direct, zoxy, haproxy, pingora, envoy`. Only `c1k` runs on the
+schedule; pass `profiles: c1k,c10k` on a manual dispatch to run `c10k` too:
 
-| profile | connections | deadline | what it answers |
-|---|---|---|---|
-| `c1k` | 1 000 | — | how fast is each proxy at a healthy concurrency |
-| `c10k` | 10 000 | 1 s | how much of a 10k-connection schedule can each serve *within an SLO* |
+| profile | connections | deadline | runs nightly? | what it answers |
+|---|---|---|---|---|
+| `c100` | 100 | — | manual only | cheap smoke profile, zoxy's shipped defaults |
+| `c1k` | 1 000 | — | yes (default) | how fast is each proxy at a healthy concurrency |
+| `c10k` | 10 000 | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
 
 Locally you can work on everything except the load generation itself:
 
@@ -101,21 +104,20 @@ noticed.
 ## Fairness rules (what makes the numbers comparable)
 
 - **Same job for every proxy**: all are HTTP/1.1 reverse proxies — HAProxy
-  `mode http`, Envoy `http_connection_manager`, Traefik HTTP router, nginx
-  `proxy_pass` (stock official image, no custom build), Pingora (a ~90-line Rust
-  binary on Cloudflare's framework — `proxies/pingora`), zoxy's phase-1 `http`
+  `mode http`, Envoy `http_connection_manager`, Pingora (a ~90-line Rust binary
+  on Cloudflare's framework — `proxies/pingora`), zoxy's phase-1 `http`
   listener. Everyone parses each request and keeps both the client and the
   pooled upstream connection alive — nobody skips HTTP parsing that others pay.
-- **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM` by
-  cgroups, identical per proxy; thread counts hardcoded to 1 (`nbthread 1`,
-  `--concurrency 1`, `GOMAXPROCS=1`, `worker_processes 1`, pingora `threads=1`).
+- **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
+  (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
+  (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).
   **zoxy has no thread knob** — one event loop per process — so it runs a single
-  process. The proxy VM is 2 cores; the container is pinned to core `0` (cloud
-  overlay `cpuset`), leaving core `1` for the OS/monitoring (a saturated
-  all-cores box starved the single-loop proxy).
+  process. The container is pinned to core `0` (cloud overlay `cpuset`); the
+  proxy VM's spare cores go to the OS/dockerd/cAdvisor and to `docker build`
+  (zoxy compiles from source every run), never to the proxy under test.
 - **Same ramp for every proxy**: never compare runs with different `MAX_RATE`,
   `RAMP_SECONDS` or `CONNECTIONS` — the shared offered axis depends on it.
-  Recorded per run in `results/<runid>/meta.json`.
+  Recorded per run in `results/<runid>/<profile>/profile.json`.
 - **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
   engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
   those three syscalls — not `unconfined`. If io_uring init fails zoxy exits at
@@ -125,32 +127,30 @@ noticed.
 - **zoxy does no DNS**: endpoints must be IP literals. The entrypoint resolves
   `backend` once at start (compose DNS locally, `extra_hosts` in cloud) and
   renders the literal into the config.
-- **zoxy caps admitted connections per process**: on the phase-1 L7 path the
-  bound is a configurable `limits.conn_slots` (default 1386, tuned to a ~32 MiB
-  footprint — zoxy prints the exact figure at startup; we don't set this, so it
-  runs on the default) up to a comptime ceiling of 11464 (the io_uring
-  completion-queue c10k budget), plus a shared upstream keep-alive pool of
-  `upstream_slots_max`=11464 — pinned equal to the conn-slot ceiling as of
-  zoxy #108, since an upstream is leased for a whole client exchange (one
-  slot per admitted connection at saturation, not per in-flight request), so
-  a higher conn ceiling than upstream ceiling was admission capacity that
-  couldn't be served. Connections beyond the admission ceiling get a static
-  shed response. `CONNECTIONS` (zrk's in-flight cap) defaults to 500,
-  comfortably under the 1386 default. That's not chased up against zoxy's
-  ceiling — past a proxy's sweet-spot concurrency *every* proxy
-  congestion-collapses (throughput falls as latency climbs), so `CONNECTIONS`
-  is set at the plateau every proxy shares. Every other proxy has no such
-  per-process cap.
-- **Pin the zoxy build**: the Dockerfile caches its `git clone`, so `ZOXY_REF=main`
-  can silently be a stale commit. Pin a SHA for anything version-sensitive.
-- **Origin headroom**: backend gets several times the proxy's cores; `direct`
-  (in `PROXIES`) proves the origin saturates well above the proxies.
+- **zoxy caps admitted connections per process**: on the phase-1 L7 path,
+  concurrency is bounded by `limits.conn_slots` (stock default 1386, ~32 MiB —
+  zoxy prints the exact figure at startup) with a shared upstream keep-alive
+  pool, `limits.upstream_slots` (stock default 1024). An upstream is leased
+  per admitted connection at saturation, not per in-flight request, so a conn
+  ceiling above the upstream ceiling is admission capacity that can't be
+  served — `bench` pins both explicitly per profile (`proxy_env` in
+  `profile.zig`): 1386/1386 for `c1k`, 11464/11464 (the io_uring
+  completion-queue ceiling) for `c10k`. Connections beyond the ceiling get a
+  static shed response. Every other proxy has no such per-process cap.
+- **The zoxy build stays fresh**: `ZOXY_REF` defaults to `main` on purpose —
+  the nightly exists to catch a regression the morning after it lands. The
+  Dockerfile's clone layer is cache-busted on the GitHub commits API response
+  for `$ZOXY_REF`, not on the ref string, so a `main` build always reflects
+  main's current HEAD. Pin a SHA only to reproduce a specific past run.
+- **Origin headroom**: backend gets several times the proxy's cores; the
+  `direct` pseudo-proxy (in `BENCH_PROXIES`/`--proxies`) proves the origin
+  saturates well above the proxies.
 
 ## Layout
 
 ```
 bench/CONTRACT.md         the interfaces terraform, cloud-init and CI code against
-bench/src/profile.zig     c1k and c10k — the ramp parameters, compiled in
+bench/src/profile.zig     c100, c1k, c10k — the ramp parameters, compiled in
 bench/src/suite.zig       the per-proxy loop; the only place an error is caught
 bench/src/ramp.zig        one ramp, embedding zrk's runner.run in-process
 bench/src/cadvisor.zig    1Hz container sampling + the identity witness
