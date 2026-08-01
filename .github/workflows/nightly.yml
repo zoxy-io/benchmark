@@ -41,17 +41,20 @@
 name: nightly
 
 on:
-  # Nightly at 00:00 UTC. GitHub runs scheduled workflows on a best-effort basis
-  # and commonly fires them 5-30 minutes late, which is immaterial here.
+  # Every 6 hours (00:00/06:00/12:00/18:00 UTC). GitHub runs scheduled
+  # workflows on a best-effort basis and commonly fires them 5-30 minutes
+  # late, which is immaterial here. The `concurrency` group below serializes
+  # firings that land while a run is still going — see its comment — so a
+  # slow run just pushes the next one back rather than overlapping it.
   #
   # What makes an unattended cron safe is that teardown does not depend on the
   # run succeeding: `tofu destroy` is `if: always()` with a freshly re-minted IAM
   # token, and `bench sweep` runs both as a backstop after a failed destroy and
   # at the start of the next run — which is the only thing that covers the runner
-  # itself dying. A failed night therefore costs a red run and ~15 minutes of
+  # itself dying. A failed run therefore costs a red run and ~15 minutes of
   # six VMs, not a stranded fleet.
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 */6 * * *'
 
   workflow_dispatch:
     inputs:
