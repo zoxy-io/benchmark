@@ -304,9 +304,13 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         var cbuf: [8192]u8 = undefined;
         var cfw: Io.File.Writer = .init(cf, io, &cbuf);
         for (samples.items) |s| {
+            // cadvisor_ms is cAdvisor's own timestamp for the counter, and the
+            // CPU rate's denominator has to come from it rather than from `t`
+            // — see cadvisor.Sample.cadvisor_ms. Recorded raw, like every other
+            // field here, so the rate stays a report-side concern.
             try cfw.interface.print(
-                "{{\"t\":{d:.3},\"cpu_seconds_total\":{d:.6},\"mem_ws\":{d}}}\n",
-                .{ s.t, s.cpu_seconds_total, s.mem_ws },
+                "{{\"t\":{d:.3},\"cpu_seconds_total\":{d:.6},\"mem_ws\":{d},\"cadvisor_ms\":{d}}}\n",
+                .{ s.t, s.cpu_seconds_total, s.mem_ws, s.cadvisor_ms },
             );
         }
         try cfw.interface.flush();

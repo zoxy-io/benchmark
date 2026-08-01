@@ -15,6 +15,7 @@ const std = @import("std");
 const zrk = @import("zrk");
 
 const analysis = @import("analysis.zig");
+const cadvisor = @import("cadvisor.zig");
 const jsonw = @import("jsonw.zig");
 
 const Allocator = std.mem.Allocator;
@@ -181,10 +182,19 @@ pub fn gather(
         try rps.append(arena, .{ .name = "offered", .pts = diag, .ref = true });
     }
 
-    // --- cpu: median over 7 points; cAdvisor's housekeeping thread stalls under
-    // host load, gapping counter updates 2-4s, and the rate dips spuriously at
-    // the gaps — 1-2 sample spikes the median erases without the systematic lag
-    // a wider rate window would add. `direct` has no container to measure.
+    // --- cpu: median over 7 points, to damp genuine second-to-second jitter
+    // (scheduling, the periodic healthcheck exec, cAdvisor housekeeping stalls
+    // that widen a real interval). `direct` has no container to measure.
+    //
+    // This median used to be load-bearing for a DIFFERENT reason, and that
+    // reason was a bug: the rate was computed against the poll clock, so a poll
+    // that re-read an unchanged counter charted 0 cores and the next one
+    // charted ~2x. The median duly erased the zeros — and kept the inflated
+    // peaks, turning a symmetric sampling artifact into a systematic ~1.44x
+    // overstatement that put a 1-CPU-capped container at ~1.5 cores. The rate
+    // is measured on cAdvisor's own clock now (see cadvisor.Sample.cadvisor_ms),
+    // so what reaches this median is already honest, and the median is back to
+    // being cosmetic. Do not widen it to fix a number that looks wrong.
     var cpu: std.ArrayList(Series) = .empty;
     for (present) |*p| {
         if (isDirect(p.name) or p.cpu.len == 0) continue;
@@ -251,7 +261,7 @@ pub fn loadCadvisor(
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch
         return .{ .cpu = &.{}, .mem = null };
 
-    const Row = struct { t: f64 = 0, cpu_seconds_total: f64 = 0, mem_ws: u64 = 0 };
+    const Row = struct { t: f64 = 0, cpu_seconds_total: f64 = 0, mem_ws: u64 = 0, cadvisor_ms: i64 = 0 };
     var rows: std.ArrayList(Row) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -269,6 +279,12 @@ pub fn loadCadvisor(
 
     // A counter needs two points to become a rate, so the first sample only
     // establishes a baseline.
+    //
+    // The rate's denominator is cAdvisor's own clock, NOT the poll clock — see
+    // cadvisor.Sample.cadvisor_ms for why dividing by the poll interval put
+    // points above the 1-CPU cap on a container that cannot exceed it. The
+    // x position still comes from `r.t`, the ramp's own clock, which is what
+    // makes offered(t) analytic.
     var cpu: std.ArrayList(Point) = .empty;
     if (rows.items.len >= 2) {
         const start: f64 = @floatFromInt(ramp.start_rate orelse 0);
@@ -277,9 +293,11 @@ pub fn loadCadvisor(
 
         for (rows.items[1..], 0..) |r, i| {
             const prev = rows.items[i];
-            const dt = r.t - prev.t;
-            if (dt <= 0) continue;
-            const cores = (r.cpu_seconds_total - prev.cpu_seconds_total) / dt;
+            const span = cadvisor.rateSpanSeconds(
+                .{ .t = prev.t, .cpu_seconds_total = prev.cpu_seconds_total, .mem_ws = prev.mem_ws, .cadvisor_ms = prev.cadvisor_ms },
+                .{ .t = r.t, .cpu_seconds_total = r.cpu_seconds_total, .mem_ws = r.mem_ws, .cadvisor_ms = r.cadvisor_ms },
+            ) orelse continue;
+            const cores = (r.cpu_seconds_total - prev.cpu_seconds_total) / span;
             const frac = if (total > 0) std.math.clamp(r.t / total, 0, 1) else 0;
             try cpu.append(arena, .{ .x = start + (end - start) * frac, .y = cores });
         }
@@ -598,4 +616,35 @@ test "artifactPath resolves both the tagged and untagged spellings" {
         "run/zoxy.lg1.ndjson",
         try artifactPath(arena, "run", "zoxy", "lg1", "ndjson"),
     );
+}
+
+test "the charted cpu curve never exceeds a capped container's cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The rate math and the 7-point median TOGETHER are what charted a 1-CPU
+    // container at ~1.5 cores: the poll-clock rate alternated 0 / ~2x, and the
+    // median then dropped the zeros and kept the peaks. Testing the two in
+    // isolation misses that interaction, so this exercises the same pair the
+    // report runs — smoothMedian over the rates rateSpanSeconds produces.
+    //
+    // Load: a container pegged at exactly 1.0 core, sampled the way the fleet
+    // samples it — see cadvisor.peggedSamples.
+    const samples = try cadvisor.peggedSamples(arena, 1.0, 300);
+    var pts: std.ArrayList(analysis.Point) = .empty;
+    for (samples[1..], 0..) |s, i| {
+        const p = samples[i];
+        const span = cadvisor.rateSpanSeconds(p, s) orelse continue;
+        try pts.append(arena, .{
+            .x = s.t,
+            .y = (s.cpu_seconds_total - p.cpu_seconds_total) / span,
+        });
+    }
+
+    const smoothed = try analysis.smoothMedian(arena, pts.items, 7);
+    try std.testing.expect(smoothed.len > 100);
+    for (smoothed) |p| {
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), p.y, 1e-9);
+    }
 }

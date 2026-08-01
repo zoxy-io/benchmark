@@ -9,8 +9,11 @@
 //! with the ramp. Here `t` shares the ramp's own t0, so offered(t) is analytic.
 //!
 //! Raw counters are recorded, never rates. Turning `cpu_seconds_total` into
-//! cores and smoothing it is a report concern (analysis/report), so the sampling
-//! policy and the presentation policy stay independently reviewable.
+//! cores is a report concern (analysis/report), so the sampling policy and the
+//! presentation policy stay independently reviewable. What the poller MUST
+//! record for that to be possible is cAdvisor's own timestamp alongside the
+//! counter — the counter advances on cAdvisor's housekeeping tick, not on the
+//! poll, so the poll clock cannot express the rate. See `Sample.cadvisor_ms`.
 //!
 //! The poller has a second job: it is an INDEPENDENT WITNESS of which container
 //! is actually serving. The old harness could record a ramp under the wrong
@@ -33,6 +36,26 @@ pub const Sample = struct {
     t: f64,
     cpu_seconds_total: f64,
     mem_ws: u64,
+    /// cAdvisor's OWN timestamp for this counter value (ms since the epoch, as
+    /// the exposition carries it), or 0 if it did not send one.
+    ///
+    /// This is the denominator the CPU rate has to use, and it is why the
+    /// exposition's optional trailing timestamp is recorded rather than
+    /// discarded. `t` is when the POLLER asked; the counter only advances on
+    /// cAdvisor's own housekeeping tick, so the two clocks disagree, and
+    /// dividing a housekeeping-quantized numerator by a poll-clock denominator
+    /// does not measure a rate at all. At the harness's cadence — 1s
+    /// housekeeping, ~1.045s effective poll period — roughly a third of polls
+    /// re-read an unchanged counter (rate 0) and the poll after each of those
+    /// covers two housekeeping intervals in one poll interval, reporting ~2x
+    /// the true rate. That is what put points above the 1-CPU cap on a
+    /// container that cannot physically exceed it (cpuset "0"): a 0.66-core
+    /// haproxy charted spikes to 1.40.
+    ///
+    /// With cAdvisor's timestamp the numerator and denominator describe the
+    /// SAME span, so the rate is exact and a stale re-read is simply a
+    /// duplicate (zero span) to skip rather than a zero to plot.
+    cadvisor_ms: i64 = 0,
 };
 
 pub const Error = error{
@@ -55,6 +78,8 @@ pub const Observation = struct {
     intruder: ?[]const u8 = null,
     cpu_seconds_total: f64 = 0,
     mem_ws: u64 = 0,
+    /// cAdvisor's timestamp on the CPU series — see `Sample.cadvisor_ms`.
+    cadvisor_ms: i64 = 0,
 };
 
 /// One scrape: GET /metrics and pick out the two series we need.
@@ -118,6 +143,7 @@ pub fn scrape(
                     // cAdvisor emits one series per cgroup hierarchy level; the
                     // named one is the container itself.
                     obs.cpu_seconds_total += m.value;
+                    if (m.timestamp_ms) |ms| obs.cadvisor_ms = @max(obs.cadvisor_ms, ms);
                     seen_expected += 1;
                 } else if (matchKnownProxy(n)) |static_name| {
                     obs.intruder = static_name;
@@ -160,9 +186,14 @@ fn matchKnownProxy(name: []const u8) ?[]const u8 {
     return null;
 }
 
-const Metric = struct { labels: []const u8, value: f64 };
+const Metric = struct { labels: []const u8, value: f64, timestamp_ms: ?i64 = null };
 
-/// Match `<name>{<labels>} <value>` and return the label set and value.
+/// Match `<name>{<labels>} <value> [<timestamp_ms>]` and return the label set,
+/// the value, and the exposition's optional trailing timestamp.
+///
+/// That timestamp is not decoration: cAdvisor stamps every series with the
+/// housekeeping instant the value belongs to, which is the only clock on which
+/// the CPU counter's rate is well defined. See `Sample.cadvisor_ms`.
 fn parseMetric(line: []const u8, name: []const u8) ?Metric {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, name)) return null;
@@ -173,10 +204,14 @@ fn parseMetric(line: []const u8, name: []const u8) ?Metric {
 
     var rest = std.mem.trim(u8, trimmed[close + 1 ..], " \t");
     // Prometheus text format allows an optional trailing timestamp.
-    if (std.mem.indexOfScalar(u8, rest, ' ')) |sp| rest = rest[0..sp];
+    var ts: ?i64 = null;
+    if (std.mem.indexOfScalar(u8, rest, ' ')) |sp| {
+        ts = std.fmt.parseInt(i64, std.mem.trim(u8, rest[sp + 1 ..], " \t"), 10) catch null;
+        rest = rest[0..sp];
+    }
     const value = std.fmt.parseFloat(f64, rest) catch return null;
 
-    return .{ .labels = labels, .value = value };
+    return .{ .labels = labels, .value = value, .timestamp_ms = ts };
 }
 
 /// Extract `name="..."` from a Prometheus label set.
@@ -296,6 +331,7 @@ pub const Poller = struct {
                             .t = t,
                             .cpu_seconds_total = obs.cpu_seconds_total,
                             .mem_ws = obs.mem_ws,
+                            .cadvisor_ms = obs.cadvisor_ms,
                         }) catch {};
                     }
                 }
@@ -310,21 +346,97 @@ pub const Poller = struct {
 
 pub const CorePoint = struct { t: f64, cores: f64 };
 
+/// Seconds between two samples ON THE CLOCK THE COUNTER ADVANCES ON, or null if
+/// the pair spans no time at all and therefore yields no rate.
+///
+/// cAdvisor's own timestamp when it sent one (the normal case, and the only one
+/// that gives an exact rate — see `Sample.cadvisor_ms`); the poller's ramp clock
+/// otherwise, which is what artifacts recorded before `cadvisor_ms` existed
+/// carry. A stale re-read is a duplicate on the cAdvisor clock, so it lands here
+/// as a zero span and is skipped rather than plotted as a zero.
+pub fn rateSpanSeconds(prev: Sample, s: Sample) ?f64 {
+    if (prev.cadvisor_ms > 0 and s.cadvisor_ms > 0) {
+        const ms = s.cadvisor_ms - prev.cadvisor_ms;
+        return if (ms > 0) @as(f64, @floatFromInt(ms)) / 1000.0 else null;
+    }
+    const dt = s.t - prev.t;
+    return if (dt > 0) dt else null;
+}
+
+/// The poller's effective period: a 1s sleep plus the scrape it just did.
+/// Measured against the fleet, not chosen — it is what makes the poll clock
+/// beat against cAdvisor's housekeeping.
+pub const poll_period_s = 1.045;
+
+/// Housekeeping intervals (ms) captured from a real cAdvisor v0.52.1 running
+/// the harness's own flags (`--housekeeping_interval=1s
+/// --allow_dynamic_housekeeping=false`).
+///
+/// The point of keeping the MEASURED values rather than a clean 1000ms is that
+/// they are not clean: the interval jitters well past its nominal 1s. That is
+/// what made the old poll-clock rate biased UPWARD rather than merely noisy —
+/// each counter delta covers ~1.4s of housekeeping on average but was divided
+/// by one ~1.045s poll, so the whole curve was scaled by about 1.4x.
+pub const observed_housekeeping_ms = [_]i64{ 1220, 1379, 1994, 1044, 1289, 1761, 1605, 1329 };
+
+/// Test support: what the poller records for a container pinned at exactly
+/// `cores`, sampled the way the fleet samples it — cAdvisor advancing the
+/// counter only on the (irregular) housekeeping ticks above, polled every
+/// `poll_period_s`. Roughly a third of the polls re-read an unchanged counter.
+///
+/// A container capped at 1 CPU cannot exceed 1.0 cores, so any pipeline fed
+/// `cores = 1.0` here must never report more.
+pub fn peggedSamples(gpa: Allocator, cores: f64, polls: usize) ![]Sample {
+    const epoch_ms: i64 = 1_785_556_727_497;
+
+    var out: std.ArrayList(Sample) = .empty;
+    errdefer out.deinit(gpa);
+
+    var tick_ms = epoch_ms;
+    var next_tick_ms = epoch_ms;
+    var k: usize = 0;
+
+    for (0..polls) |i| {
+        const poll_t = poll_period_s * @as(f64, @floatFromInt(i));
+        const poll_ms = epoch_ms + @as(i64, @intFromFloat(poll_t * 1000.0));
+        // Advance cAdvisor's housekeeping up to (not past) this poll.
+        while (next_tick_ms <= poll_ms) {
+            tick_ms = next_tick_ms;
+            next_tick_ms += observed_housekeeping_ms[k % observed_housekeeping_ms.len];
+            k += 1;
+        }
+        const elapsed_s = @as(f64, @floatFromInt(tick_ms - epoch_ms)) / 1000.0;
+        try out.append(gpa, .{
+            .t = poll_t,
+            .cpu_seconds_total = cores * elapsed_s,
+            .mem_ws = 0,
+            .cadvisor_ms = tick_ms,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// Convert raw counter samples into (elapsed, cores). The report maps elapsed
-/// onto the offered axis analytically, and applies its own smoothing.
+/// onto the offered axis analytically.
+///
+/// `t` stays the poller's ramp clock — that is the run's own time base and what
+/// the offered axis is derived from — while the rate's denominator comes from
+/// `rateSpanSeconds`. Mixing the two is deliberate: WHEN a sample happened and
+/// WHAT SPAN its counter delta covers are different questions.
 pub fn toCores(gpa: Allocator, samples: []const Sample) ![]CorePoint {
     const Pt = CorePoint;
     if (samples.len < 2) return &.{};
-    const out = try gpa.alloc(Pt, samples.len - 1);
+    var out: std.ArrayList(Pt) = .empty;
+    errdefer out.deinit(gpa);
     for (samples[1..], 0..) |s, i| {
         const prev = samples[i];
-        const dt = s.t - prev.t;
-        out[i] = .{
+        const span = rateSpanSeconds(prev, s) orelse continue;
+        try out.append(gpa, .{
             .t = s.t,
-            .cores = if (dt > 0) (s.cpu_seconds_total - prev.cpu_seconds_total) / dt else 0,
-        };
+            .cores = (s.cpu_seconds_total - prev.cpu_seconds_total) / span,
+        });
     }
-    return out;
+    return out.toOwnedSlice(gpa);
 }
 
 test "parseMetric pulls the value out of a cAdvisor line" {
@@ -332,15 +444,31 @@ test "parseMetric pulls the value out of a cAdvisor line" {
     const m = parseMetric(line, "container_cpu_usage_seconds_total").?;
     try std.testing.expectApproxEqAbs(@as(f64, 9.73142), m.value, 1e-9);
     try std.testing.expectEqualStrings("zoxy", nameLabel(m.labels).?);
+    // No trailing timestamp on this line, and none must be invented.
+    try std.testing.expect(m.timestamp_ms == null);
 }
 
-test "parseMetric tolerates a trailing timestamp and rejects other metrics" {
+test "parseMetric captures the trailing timestamp and rejects other metrics" {
     const line = "container_memory_working_set_bytes{name=\"haproxy\"} 41893888 1753699200000\n";
     const m = parseMetric(line, "container_memory_working_set_bytes").?;
     try std.testing.expectApproxEqAbs(@as(f64, 41893888), m.value, 1e-6);
+    // The timestamp is the CPU rate's only correct denominator, so it has to
+    // survive parsing rather than be stripped and dropped.
+    try std.testing.expectEqual(@as(i64, 1753699200000), m.timestamp_ms.?);
     try std.testing.expect(parseMetric(line, "container_cpu_usage_seconds_total") == null);
     // A HELP/TYPE comment must not parse as a sample.
     try std.testing.expect(parseMetric("# TYPE container_cpu_usage_seconds_total counter", "container_cpu_usage_seconds_total") == null);
+}
+
+test "scrape reads the counter and cAdvisor's timestamp off a real exposition line" {
+    // Verbatim from cAdvisor v0.52.1 with the harness's own flags (percpu
+    // disabled, so exactly ONE cpu="total" series per container — the `+=` in
+    // scrape is a single-series sum, not an accidental fan-in).
+    const line = "container_cpu_usage_seconds_total{cpu=\"total\",id=\"/system.slice/docker-5e369d.scope\",image=\"gcr.io/cadvisor/cadvisor:v0.52.1\",name=\"zoxy\"} 0.153726 1785556717668\n";
+    const m = parseMetric(line, "container_cpu_usage_seconds_total").?;
+    try std.testing.expectEqualStrings("zoxy", nameLabel(m.labels).?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.153726), m.value, 1e-9);
+    try std.testing.expectEqual(@as(i64, 1785556717668), m.timestamp_ms.?);
 }
 
 test "matchKnownProxy returns the static entry, not the caller's slice" {
@@ -371,6 +499,8 @@ test "nameLabel is not fooled by a label whose name is a suffix of 'name'" {
 
 test "toCores differentiates the counter and drops the first sample" {
     const gpa = std.testing.allocator;
+    // No cadvisor_ms: pre-fix artifacts, which must still render off the poll
+    // clock rather than losing their CPU curve entirely.
     const samples = [_]Sample{
         .{ .t = 1, .cpu_seconds_total = 10, .mem_ws = 100 },
         .{ .t = 2, .cpu_seconds_total = 10.5, .mem_ws = 100 },
@@ -382,6 +512,85 @@ test "toCores differentiates the counter and drops the first sample" {
     try std.testing.expectEqual(@as(usize, 2), pts.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), pts[0].cores, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), pts[1].cores, 1e-9);
+}
+
+test "toCores rates a stale re-read on cAdvisor's clock, not the poll clock" {
+    const gpa = std.testing.allocator;
+    // The exact shape that put a 1-CPU-capped container above its cap. Real
+    // numbers from results/repro-2 (haproxy, c1k): the poller runs at ~1.045s
+    // while cAdvisor housekeeps at 1s, so poll 2 re-reads poll 1's counter and
+    // poll 3 then carries TWO housekeeping intervals of CPU.
+    //
+    // Dividing that by one poll interval reported 0.0 cores then 0.851 —
+    // the true rate across the pair is half of the latter.
+    const samples = [_]Sample{
+        .{ .t = 103.447, .cpu_seconds_total = 0.504315, .mem_ws = 100, .cadvisor_ms = 1785556730096 },
+        .{ .t = 104.489, .cpu_seconds_total = 0.504315, .mem_ws = 100, .cadvisor_ms = 1785556730096 },
+        .{ .t = 105.531, .cpu_seconds_total = 0.593284, .mem_ws = 100, .cadvisor_ms = 1785556732090 },
+    };
+    const pts = try toCores(gpa, &samples);
+    defer gpa.free(pts);
+
+    // The duplicate contributes no point at all — it is zero span, not 0 cores.
+    try std.testing.expectEqual(@as(usize, 1), pts.len);
+    // 0.088969 CPU-seconds over cAdvisor's own 1.994s span.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.04462), pts[0].cores, 1e-5);
+    // The bug this replaces divided the same delta by ONE 1.042s poll interval,
+    // inflating it by the ~1.9x that pushed capped containers over 1.0.
+    const buggy = 0.088969 / 1.042;
+    try std.testing.expect(buggy / pts[0].cores > 1.85);
+    // `t` stays the ramp clock, so the offered-axis mapping is unaffected.
+    try std.testing.expectApproxEqAbs(@as(f64, 105.531), pts[0].t, 1e-9);
+}
+
+test "toCores never charts a capped container above its cap" {
+    const gpa = std.testing.allocator;
+    // The cloud fleet's own situation: cpuset "0" makes anything above 1.0
+    // physically impossible, so a reading above it is by definition the
+    // instrument lying.
+    const samples = try peggedSamples(gpa, 1.0, 200);
+    defer gpa.free(samples);
+
+    const pts = try toCores(gpa, samples);
+    defer gpa.free(pts);
+
+    try std.testing.expect(pts.len > 100);
+    for (pts) |p| {
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), p.cores, 1e-9);
+    }
+}
+
+test "the old poll-clock rate really did break on this same input" {
+    // Guards the guard: if `peggedSamples` ever stopped reproducing the beat
+    // between the poll period and cAdvisor's housekeeping, the tests above would
+    // keep passing while testing nothing. So assert the OLD arithmetic — divide
+    // the counter delta by the poll interval — still fails on it, both by
+    // exceeding the cap and by the ~1.4x mean overstatement seen in production.
+    const gpa = std.testing.allocator;
+    const samples = try peggedSamples(gpa, 1.0, 200);
+    defer gpa.free(samples);
+
+    var n: usize = 0;
+    var over: usize = 0;
+    var sum: f64 = 0;
+    var max: f64 = 0;
+    for (samples[1..], 0..) |s, i| {
+        const prev = samples[i];
+        const dt = s.t - prev.t;
+        if (dt <= 0) continue;
+        const cores = (s.cpu_seconds_total - prev.cpu_seconds_total) / dt;
+        n += 1;
+        sum += cores;
+        max = @max(max, cores);
+        if (cores > 1.0) over += 1;
+    }
+
+    try std.testing.expect(n > 100);
+    try std.testing.expect(over > 0); // charted a 1-CPU container above 1 CPU
+    try std.testing.expect(max > 1.5);
+    // Zeros from the stale re-reads drag the raw mean down; it is the median
+    // filter downstream that drops those and leaves only the inflated side.
+    try std.testing.expect(sum / @as(f64, @floatFromInt(n)) > 0.9);
 }
 
 test "waitUntilFound gives up after its bound against an address nothing answers on" {

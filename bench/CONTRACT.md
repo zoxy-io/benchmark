@@ -94,7 +94,7 @@ Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
     profile.json                     per-proxy status + ramp params (replaces meta.json)
     <proxy>.ndjson                   zrk timeseries, byte-identical to the CLI's
     <proxy>.hgrm                     whole-run percentile distribution
-    <proxy>.cadvisor.ndjson          {"t":..,"cpu_seconds_total":..,"mem_ws":..} @1Hz
+    <proxy>.cadvisor.ndjson          {"t":..,"cpu_seconds_total":..,"mem_ws":..,"cadvisor_ms":..} @1Hz
   c10k/ ...
 ```
 
