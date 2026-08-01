@@ -55,8 +55,9 @@ jobs:
     timeout-minutes: 20
 
     # `actions: read` is what lets download-artifact reach ANOTHER run's
-    # artifact — the re-publish case. `id-token: write` is needed twice over,
-    # by the Yandex OIDC exchange and by deploy-pages' own authentication.
+    # artifact — the re-publish case. `id-token: write` is deploy-pages' own
+    # authentication, and nothing else: see the Discord step on why this job
+    # mints no cloud token.
     permissions:
       contents: read
       actions: read
@@ -70,9 +71,9 @@ jobs:
     env:
       # Absolute, and NOT `./bench` — that path is the source directory.
       BENCH: ${{ github.workspace }}/bin/bench
-      BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
-      YC_CI_SA_ID: ${{ vars.YC_CI_SA_ID }}
-      # Read by `bench notify`. Never passed to a VM, never echoed.
+      # The only secret this job holds, and the only cloud-ish config it needs:
+      # no bucket, no service account, no IAM token. Read by `bench notify`.
+      # Never passed to a VM, never echoed.
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
@@ -144,11 +145,11 @@ jobs:
 
       # --------------------------------------------------------- the render --
 
-      # `--base-url` is what makes a proxy's ".hgrm" download link resolve from
-      # EVERY place report.html ends up. Without it the link is bare, which
-      # only resolves on Pages — the copy Discord links to is uploaded to
-      # Object Storage standalone, with no .hgrm siblings, so that copy's links
-      # 404. Pointing every copy at the same stable Pages URL fixes both.
+      # `--base-url` makes a proxy's ".hgrm" download link absolute rather than
+      # relative to wherever the page is opened from. Pages is now the only
+      # place report.html is served, so a bare link would resolve there too —
+      # but an absolute one also survives the file being saved or re-hosted,
+      # and it is the same URL `bench notify` puts in the Discord embed.
       - name: Render the per-profile reports
         id: report
         env:
@@ -219,28 +220,17 @@ jobs:
       # night's post already went out and a second one reporting the same
       # numbers reads as a second run.
       #
-      # Needs a Yandex IAM token of its own — `bench notify` uploads
-      # report.html to Object Storage and links it, rather than attaching it
-      # (a Discord HTML attachment cannot be previewed). Minted here by the
-      # same OIDC federation the nightly uses; there is no static cloud key.
-      - name: Exchange the GitHub OIDC token for a Yandex IAM token
-        id: iam
-        if: inputs.notify
-        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
-        with:
-          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
-
-      - name: Export the IAM token
-        if: inputs.notify
-        env:
-          TOKEN: ${{ steps.iam.outputs.token }}
-        run: |
-          set -euo pipefail
-          # The action masks its own output; do it again rather than depend on
-          # that. `::add-mask::` does not print the value it is given.
-          echo "::add-mask::$TOKEN"
-          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
+      # No cloud credential here, deliberately. This job never touches Yandex:
+      # the results arrive as an Actions artifact and the report it links is the
+      # copy deployed to Pages a few steps up. It briefly did mint an IAM token
+      # — `bench notify` used to upload report.html public-read to Object
+      # Storage for a per-run immutable link — and that broke the moment the
+      # job gained `environment: github-pages`, because the environment rewrites
+      # the OIDC `sub` claim to `repo:<owner>/<repo>:environment:github-pages`
+      # and the federated credential is bound to the `ref:refs/heads/main`
+      # subject. The fix was to delete the dependency rather than bind a second
+      # subject: an immutable link is not worth a cloud credential in a job that
+      # otherwise handles nothing but files already on this runner.
       - name: Notify Discord
         if: inputs.notify
         continue-on-error: true

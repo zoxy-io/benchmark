@@ -15,7 +15,7 @@ independently.
 | `bench suite --profile <name> [--proxies a,b,c]` | loadgen | Run every proxy's ramp for one profile (calls the ramp in-process; there is no separate `ramp` subcommand) |
 | `bench report <dir> --profile <name>` | runner | `<dir>` → `report.json` + `report.html` |
 | `bench index <rundir> --out _site` | runner | Both profiles + trend chart → Pages site |
-| `bench notify <rundir> [--dry-run]` | runner | Discord embed + `report.html` attachments |
+| `bench notify <rundir> [--dry-run]` | runner | Discord embed per profile, linking the published `report.html` under `--base-url` |
 
 Exit codes: `0` ok, `2` usage error, `3` the operation completed but the run had
 failures worth failing CI over, `1` unexpected error.

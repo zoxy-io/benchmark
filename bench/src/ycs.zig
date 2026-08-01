@@ -142,17 +142,11 @@ pub const Client = struct {
 
     pub const PutOptions = struct {
         content_type: ?[]const u8 = null,
-        /// Make this one object world-readable, so it can be linked from a
-        /// Discord post. Applied per object rather than to the bucket: the run
-        /// data stays private and only the rendered report is exposed.
-        public: bool = false,
     };
 
-    /// PUT an object with a content type and optional public-read ACL.
-    ///
-    /// The content type matters for a linked report — without `text/html` a
-    /// browser downloads the file instead of rendering it, which defeats the
-    /// point of linking rather than attaching.
+    /// PUT an object. Every object this bucket holds is private run data; there
+    /// is deliberately no public-read path (the Discord post links the GitHub
+    /// Pages copy of the report instead of a world-readable object here).
     pub fn putObject(
         self: *Client,
         bucket: []const u8,
@@ -175,9 +169,6 @@ pub const Client = struct {
         if (opts.content_type) |ct| {
             try extra.append(self.gpa, .{ .name = "content-type", .value = ct });
         }
-        if (opts.public) {
-            try extra.append(self.gpa, .{ .name = "x-amz-acl", .value = "public-read" });
-        }
 
         const discard = try newSink(self.gpa);
         const res = try fetchBounded(self.gpa, self.io, .{
@@ -197,12 +188,6 @@ pub const Client = struct {
             std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
             return error.ObjectPutFailed;
         }
-    }
-
-    /// Public URL of an object. Only resolves for one uploaded with
-    /// `public = true`.
-    pub fn publicUrl(arena: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "https://{s}/{s}/{s}", .{ storage_host, bucket, key });
     }
 
     /// GET an object, or null if it does not exist yet. A 404 is an expected,
@@ -412,13 +397,6 @@ pub const Keys = struct {
     pub fn bootOk(self: Keys, arena: Allocator, role: []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "runs/{s}/boot-ok.{s}", .{ self.runid, role });
     }
-
-    /// The rendered report, uploaded public-read so Discord can link it. Under
-    /// the run prefix, so it ages out with the rest of the run rather than
-    /// accumulating forever.
-    pub fn report(self: Keys, arena: Allocator, prof: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "runs/{s}/{s}/report.html", .{ self.runid, prof });
-    }
 };
 
 test "Keys namespaces every object under the run" {
@@ -430,19 +408,4 @@ test "Keys namespaces every object under the run" {
     try std.testing.expectEqualStrings("runs/20260728-000102/payload.tar", try k.payload(arena));
     try std.testing.expectEqualStrings("runs/20260728-000102/DONE", try k.done(arena));
     try std.testing.expectEqualStrings("runs/20260728-000102/boot-ok.loadgen", try k.bootOk(arena, "loadgen"));
-}
-
-test "Keys.report is namespaced under the run, so it ages out with it" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const k: Keys = .{ .runid = "20260729-000112" };
-    try std.testing.expectEqualStrings(
-        "runs/20260729-000112/c1k/report.html",
-        try k.report(arena, "c1k"),
-    );
-    try std.testing.expectEqualStrings(
-        "https://storage.yandexcloud.net/b/runs/x/c1k/report.html",
-        try Client.publicUrl(arena, "b", "runs/x/c1k/report.html"),
-    );
 }

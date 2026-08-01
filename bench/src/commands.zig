@@ -519,17 +519,19 @@ pub fn notify(
     var embeds: std.ArrayList(discord.Embed) = .empty;
     var any_failed = false;
 
-    // The report is UPLOADED and LINKED rather than attached. A Discord HTML
-    // attachment cannot be previewed — it has to be downloaded and opened from
-    // disk, which nobody does — so the artifact that took the whole night to
-    // produce goes unread. A link opens in a browser. The object is uploaded
-    // public-read under the run prefix, so it ages out with the run instead of
-    // accumulating, and only the rendered report is exposed; the raw data stays
-    // private.
-    var client = ycs.Client.init(gpa, io, env.token);
-    defer client.deinit();
-    const keys: ycs.Keys = .{ .runid = runid };
-
+    // The report is LINKED rather than attached. A Discord HTML attachment
+    // cannot be previewed — it has to be downloaded and opened from disk, which
+    // nobody does — so the artifact that took the whole night to produce goes
+    // unread. A link opens in a browser.
+    //
+    // The link points at the GitHub Pages copy, which the same publish workflow
+    // deploys from the very same HTML. It used to point at a public-read copy
+    // uploaded to Object Storage, which bought per-run immutable links at the
+    // price of a cloud credential in a job that otherwise touches no cloud at
+    // all — `notify` runs on artifacts already on the runner's disk. Not worth
+    // it: Pages holds only the LATEST run, so an old post's link now shows
+    // tonight's numbers, but the embed names its own run id and the trend chart
+    // carries the history, so nothing is actually lost.
     for (profile.all) |p| {
         const view = (try readProfile(arena, io, dir, p.name)) orelse continue;
         if (view.failed > 0) any_failed = true;
@@ -538,22 +540,10 @@ pub fn notify(
             r.delta = index.delta(r.sustained, index.previousSustained(history, p.name, r.name, runid));
         }
 
-        // Upload the report and link it. A failure here costs the link, not the
-        // post — the table is the part that has to arrive.
+        // A profile with no rendered report has nothing to link; the table is
+        // the part that has to arrive either way.
         var link: []const u8 = "";
-        if (view.html.len > 0 and env.token.len > 0 and env.bucket.len > 0) {
-            const key = try keys.report(arena, p.name);
-            if (client.putObject(env.bucket, key, view.html, .{
-                .content_type = "text/html; charset=utf-8",
-                .public = true,
-            })) |_| {
-                link = try ycs.Client.publicUrl(arena, env.bucket, key);
-            } else |e| {
-                std.debug.print("bench notify: could not upload {s}'s report ({s})\n", .{ p.name, @errorName(e) });
-            }
-        }
-        if (link.len == 0 and base_url.len > 0) {
-            // Fall back to the Pages copy, which only ever holds the latest run.
+        if (view.html.len > 0 and base_url.len > 0) {
             link = try std.fmt.allocPrint(arena, "{s}{s}/", .{ base_url, p.name });
         }
 
