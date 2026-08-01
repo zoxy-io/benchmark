@@ -145,7 +145,7 @@ jobs:
       results: ${{ steps.fetch.outcome }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@v2
@@ -153,7 +153,7 @@ jobs:
           version: 0.16.0
 
       - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@v2
         with:
           # Matches the devenv pin, which is what cloud/.terraform.lock.hcl was
           # generated with. cloud/versions.tf only requires >= 1.6, but a
@@ -489,7 +489,7 @@ jobs:
       - name: Upload the run artifact
         id: artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-${{ steps.meta.outputs.runid }}
           path: results/
