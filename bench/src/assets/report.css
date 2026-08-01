@@ -70,10 +70,14 @@ th:first-child,td:first-child { text-align:left }
 .proxycell { display:flex; align-items:center; gap:8px }
 .proxycell .swatch { flex:none }
 /* build provenance under the proxy name — which build produced these numbers.
-   Secondary to the name and wrapping freely: a version string can be long
-   (envoy's is a git sha, a version, a build type and a TLS backend). */
+   Secondary to the name, and hard-capped: html.zig shortens what it renders,
+   but an unrecognised version format falls through to raw text and must not be
+   able to stretch this column and skew every number beside it. Ellipsis rather
+   than wrap so the row stays exactly one line tall, matching its neighbours;
+   the full string is the element's title. */
 .prov { display:block; color:var(--haze-dim); font-size:.68rem; line-height:1.5;
-  margin-left:17px; overflow-wrap:anywhere }
+  margin-left:17px; max-width:22ch; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap }
 /* a recorded caveat about a row — build parity, a stale build, a saturated
    histogram. Left-aligned against the right-aligned status column it sits in,
    because these are sentences, not values. */

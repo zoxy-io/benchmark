@@ -124,7 +124,7 @@ pub fn render(
         } else {
             try out.print("<span class=\"proxycell\"><span class=\"swatch s-{s}\"></span>{s}</span>", .{ p.name, p.name });
         }
-        try writeVersion(out, st);
+        try writeVersion(out, p.name, st);
         try out.writeAll("</td>");
 
         if (!usable) {
@@ -260,19 +260,99 @@ fn writeLatencyCellP99(out: *Writer, p: *const report.ProxyData, st: ?artifact.P
 /// read compose.yaml to find out which haproxy. zoxy additionally gets its
 /// commit, short-form, since its version alone (`zoxy 0.0.5`) does not identify
 /// a nightly build of a moving `main`.
-fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
-    const r = st orelse return;
-    var buf: [512]u8 = undefined;
+fn writeVersion(out: *Writer, name: []const u8, st: ?artifact.ProxyRecord) !void {
+    var vbuf: [128]u8 = undefined;
+    var ebuf: [512]u8 = undefined;
 
-    if (r.version) |v| {
-        try out.print("<span class=\"prov\">{s}</span>", .{escapeHtml(&buf, v)});
+    const version: ?[]const u8 = if (st) |r| r.version else null;
+    const commit: ?[]const u8 = if (st) |r| r.zoxy_commit else null;
+
+    // ALWAYS one line, on every row. Two reasons, both about the table reading
+    // straight: a row that is two lines tall beside rows that are one looks
+    // broken, and `direct` — the origin baseline, which has no container and so
+    // no version — would otherwise be the short row in every report.
+    //
+    // The full string as recorded goes in `title`, so shortening costs a reader
+    // nothing: it is a hover away here and verbatim in profile.json.
+    try out.writeAll("<span class=\"prov\"");
+    if (version) |v| try out.print(" title=\"{s}\"", .{escapeHtml(&ebuf, v)});
+    try out.writeAll(">");
+
+    if (version == null and commit == null) {
+        // Said, not left blank. For `direct` this is the point of the row —
+        // there is no proxy on the path — and for anything else it means the
+        // probe could not read one, which is worth seeing.
+        try out.writeAll(if (std.mem.eql(u8, name, "direct")) "no proxy" else "—");
+        try out.writeAll("</span>");
+        return;
     }
-    if (r.zoxy_commit) |c| {
+
+    var wrote = false;
+    if (version) |v| {
+        try out.print("{s}", .{escapeHtml(&ebuf, shortVersion(&vbuf, v))});
+        wrote = true;
+    }
+    if (commit) |c| {
         // Short sha: the full 40 is in profile.json for anyone bisecting, and
         // the table has to stay readable.
         const short = if (c.len > 9) c[0..9] else c;
-        try out.print("<span class=\"prov\">@{s}</span>", .{escapeHtml(&buf, short)});
+        if (wrote) try out.writeAll(" ");
+        try out.print("@{s}", .{escapeHtml(&ebuf, short)});
     }
+    try out.writeAll("</span>");
+}
+
+/// The version number out of whatever the proxy printed.
+///
+/// What these report is banner text, not a version — haproxy adds a build sha,
+/// a date and a URL; envoy a commit, a build type and its TLS backend; the
+/// image-reference fallback carries a whole repository path. Rendered verbatim
+/// they run to 67 and 88 characters and stretch the summary table's first
+/// column until the numbers beside it stop lining up.
+///
+/// The rule: split on the separators these formats use, and take the first
+/// token that is a dotted version number. That is enough for every shape the
+/// harness actually sees, and each one is pinned by a test:
+///
+///   HAProxy version 3.0.25-eb573a937 2026/07/03 - ...  -> 3.0.25
+///   envoy  version: 14197ab.../1.33.14/Clean/RELEASE/.. -> 1.33.14
+///   zoxy 0.0.5                                          -> 0.0.5
+///   zoxy-bench/pingora-http:0.8                         -> 0.8
+///
+/// A string with no such token (an unrecognised format, or a proxy added later
+/// that prints something else) falls back to the raw text, truncated. Losing
+/// the shortening is a cosmetic problem; dropping the version is not.
+fn shortVersion(buf: []u8, raw: []const u8) []const u8 {
+    var it = std.mem.tokenizeAny(u8, raw, " \t/:");
+    while (it.next()) |tok| {
+        if (versionToken(tok)) |v| return v;
+    }
+    const max = @min(raw.len, @min(buf.len, 24));
+    return raw[0..max];
+}
+
+/// `tok` as a dotted version number, or null.
+///
+/// Requires a leading digit and at least one dot, which is what separates a
+/// version from the other digit-bearing tokens in these banners — envoy's
+/// 40-character commit sha (no dots) and haproxy's `2026/07/03` date, split
+/// into `2026`, `07`, `03` by the same separators.
+///
+/// A `-suffix` is a build tag (haproxy's `3.0.25-eb573a937`) and is dropped:
+/// the release is the part a reader compares.
+fn versionToken(tok: []const u8) ?[]const u8 {
+    if (tok.len == 0 or !std.ascii.isDigit(tok[0])) return null;
+    var dots: usize = 0;
+    for (tok, 0..) |c, i| {
+        if (c == '.') {
+            dots += 1;
+        } else if (c == '-' or c == '+') {
+            return if (dots >= 1) tok[0..i] else null;
+        } else if (!std.ascii.isDigit(c)) {
+            return null;
+        }
+    }
+    return if (dots >= 1) tok else null;
 }
 
 fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
@@ -317,6 +397,11 @@ fn escapeHtml(buf: []u8, text: []const u8) []const u8 {
             '&' => "&amp;",
             '<' => "&lt;",
             '>' => "&gt;",
+            // Also escaped because this now feeds an ATTRIBUTE value (the
+            // version `title=`), where a bare quote ends the attribute and
+            // everything after it becomes markup. Harmless in text content,
+            // which is the only place it went before.
+            '"' => "&quot;",
             else => {
                 if (len == buf.len) break;
                 buf[len] = c;
@@ -736,4 +821,159 @@ test "an ok proxy's notes are rendered too, not only a degraded one's" {
         .deadline_ms = 0,
     });
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "generic x86-64") != null);
+}
+
+test "a version banner is shortened to the version" {
+    var buf: [128]u8 = undefined;
+    // Every one of these is real output, captured from the images compose.yaml
+    // pins. Rendered verbatim they are 67 and 88 characters wide.
+    try std.testing.expectEqualStrings(
+        "3.0.25",
+        shortVersion(&buf, "HAProxy version 3.0.25-eb573a937 2026/07/03 - https://haproxy.org/"),
+    );
+    try std.testing.expectEqualStrings(
+        "1.33.14",
+        shortVersion(&buf, "envoy  version: 14197ab296e1a276facff37b918d62794f0cf48c/1.33.14/Clean/RELEASE/BoringSSL"),
+    );
+    try std.testing.expectEqualStrings("0.0.5", shortVersion(&buf, "zoxy 0.0.5"));
+    try std.testing.expectEqualStrings("1.27.5", shortVersion(&buf, "nginx version: nginx/1.27.5"));
+    // The image-reference fallback, for a proxy with no version CLI.
+    try std.testing.expectEqualStrings("0.8", shortVersion(&buf, "zoxy-bench/pingora-http:0.8"));
+}
+
+test "version shortening does not mistake a sha or a date for a version" {
+    // The two digit-bearing decoys that sit next to the real version in these
+    // banners. envoy's leading sha has no dots; haproxy's date is split into
+    // 2026 / 07 / 03 by the same separators and none of those has dots either.
+    try std.testing.expect(versionToken("14197ab296e1a276facff37b918d62794f0cf48c") == null);
+    try std.testing.expect(versionToken("2026") == null);
+    try std.testing.expect(versionToken("07") == null);
+    try std.testing.expect(versionToken("haproxy.org") == null);
+    try std.testing.expect(versionToken("") == null);
+
+    try std.testing.expectEqualStrings("1.33.14", versionToken("1.33.14").?);
+    // A build tag is dropped — the release is what a reader compares.
+    try std.testing.expectEqualStrings("3.0.25", versionToken("3.0.25-eb573a937").?);
+}
+
+test "an unrecognised version format is truncated, never dropped" {
+    var buf: [128]u8 = undefined;
+    // A proxy added later that prints something with no dotted version in it.
+    // Losing the shortening is cosmetic; losing the version is not.
+    const raw = "some-proxy built from an unusual banner with no version number";
+    const got = shortVersion(&buf, raw);
+    try std.testing.expect(got.len > 0);
+    try std.testing.expect(got.len <= 24);
+    try std.testing.expect(std.mem.startsWith(u8, raw, got));
+}
+
+test "the full version survives as a hover title, and cannot break out of it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var present = [_]report.ProxyData{.{
+        .name = "haproxy",
+        .rows = &.{},
+        .sustained = 21000,
+        .hist = null,
+        .dist_hist = null,
+        .hgrm_file = "",
+        .mem = null,
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed_raw = &.{},
+    }};
+    const statuses = [_]artifact.ProxyRecord{.{
+        .name = "haproxy",
+        .status = .ok,
+        .version = "HAProxy version 3.0.25-eb573a937 \"quoted\" - https://haproxy.org/",
+    }};
+
+    var buf: [128 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try render(arena, &out, .{
+        .present = &present,
+        .rps = &.{},
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed = &.{},
+    }, &statuses, .{
+        .runid = "r",
+        .profile_name = "c1k",
+        .ref_rate = 2000,
+        .connections = 1000,
+        .deadline_ms = 0,
+    });
+    const s = out.buffered();
+
+    // Short in the cell, full in the title — nothing is lost to the shortening.
+    try std.testing.expect(std.mem.indexOf(u8, s, ">3.0.25<") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "title=\"HAProxy version") != null);
+    // The quote inside the version must not be able to close the attribute.
+    try std.testing.expect(std.mem.indexOf(u8, s, "&quot;quoted&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"quoted\"") == null);
+}
+
+test "every row carries a provenance line, so none is shorter than its neighbours" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The mix that made the table uneven: `direct` has no container and so no
+    // version, while the proxy beside it has one. Without a line on both, one
+    // row is a line shorter than the other.
+    var present = [_]report.ProxyData{
+        .{
+            .name = "haproxy",
+            .rows = &.{},
+            .sustained = 21000,
+            .hist = null,
+            .dist_hist = null,
+            .hgrm_file = "",
+            .mem = null,
+            .cpu = &.{},
+            .p99 = &.{},
+            .shed_raw = &.{},
+        },
+        .{
+            .name = "direct",
+            .rows = &.{},
+            .sustained = 67000,
+            .hist = null,
+            .dist_hist = null,
+            .hgrm_file = "",
+            .mem = null,
+            .cpu = &.{},
+            .p99 = &.{},
+            .shed_raw = &.{},
+        },
+    };
+    const statuses = [_]artifact.ProxyRecord{
+        .{ .name = "haproxy", .status = .ok, .version = "HAProxy version 3.0.25-eb573a937 2026/07/03" },
+        .{ .name = "direct", .status = .ok },
+    };
+
+    var buf: [128 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try render(arena, &out, .{
+        .present = &present,
+        .rps = &.{},
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed = &.{},
+    }, &statuses, .{
+        .runid = "r",
+        .profile_name = "c1k",
+        .ref_rate = 2000,
+        .connections = 1000,
+        .deadline_ms = 0,
+    });
+    const s = out.buffered();
+
+    // One `.prov` per data row — two rows, two lines.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "class=\"prov\""));
+    // And direct's says why it has no version rather than sitting blank.
+    try std.testing.expect(std.mem.indexOf(u8, s, "no proxy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ">3.0.25<") != null);
 }
