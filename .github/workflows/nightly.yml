@@ -2,9 +2,15 @@
 #
 # Build the harness, mint a short-lived cloud token from GitHub's OIDC
 # identity, drop the payload in Object Storage, create three VMs with no public
-# address, watch the run through the bucket, publish the report, and destroy the
+# address, watch the run through the bucket, upload the raw data, and destroy the
 # fleet. Nothing long-lived is stored anywhere: no cloud key in the repo, no
 # remote terraform state, no VM that outlives the job.
+#
+# This workflow MEASURES. Everything downstream of the numbers — rendering the
+# reports, building and deploying the Pages site, posting to Discord — lives in
+# publish.yml, which this calls with the artifact it just uploaded. That split
+# is what lets a past run be re-published with fixed rendering code, against the
+# same implementation the nightly uses rather than a second copy of it.
 #
 # Three invariants this file exists to hold:
 #
@@ -60,10 +66,12 @@ on:
         type: string
         default: direct,zoxy,haproxy,pingora,envoy
 
-# `id-token: write` is needed TWICE over: once by the Yandex OIDC exchange in the
-# bench job, and once by actions/deploy-pages, which authenticates the deployment
-# with an OIDC token of its own. Job-level `permissions:` REPLACES this block
-# rather than merging with it, so every job below restates exactly what it needs.
+# `id-token: write` is needed by the Yandex OIDC exchange in the bench job, and
+# again — along with `pages: write` — by the publish job it hands off to, whose
+# deploy-pages step authenticates with an OIDC token of its own. Job-level
+# `permissions:` REPLACES this block rather than merging with it, so every job
+# below restates exactly what it needs; for the job that CALLS a reusable
+# workflow, that restatement is also the ceiling on what the callee may ask for.
 permissions:
   contents: read
   id-token: write
@@ -90,8 +98,8 @@ jobs:
     # cancellation.
     timeout-minutes: 150
 
-    # No `pages:` here — this job never touches Pages, it only uploads an
-    # artifact for the deploy job to publish.
+    # No `pages:` here — this job never touches Pages, it only uploads the raw
+    # artifact that the publish job renders and deploys.
     permissions:
       contents: read
       id-token: write
@@ -123,9 +131,9 @@ jobs:
 
     outputs:
       runid: ${{ steps.meta.outputs.runid }}
-      # 'success' only when a Pages artifact was actually uploaded. The deploy
-      # job keys off this so it cannot fail on a night that produced no site.
-      site: ${{ steps.pages.outcome }}
+      # 'success' only when the raw artifact was actually uploaded. The publish
+      # job keys off this so it cannot run on a night that produced no data.
+      artifact: ${{ steps.artifact.outcome }}
 
     steps:
       - uses: actions/checkout@v4
@@ -460,100 +468,17 @@ jobs:
 
       # ------------------------------------------------------------- publish --
 
-      # Computed once, early, and reused by both the report render below (for
-      # .hgrm download links) and "Fetch the published history"/"Notify
-      # Discord" — a single source rather than three copies of the same two
-      # lines drifting apart.
-      - name: Compute the Pages base URL
-        id: base
-        if: always() && steps.fetch.outcome == 'success'
-        run: |
-          set -euo pipefail
-          owner="$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
-          repo="${GITHUB_REPOSITORY#*/}"
-          echo "base=https://${owner}.github.io/${repo}/" >> "$GITHUB_OUTPUT"
-
-      # `--base-url` is what makes a proxy's ".hgrm" download link resolve
-      # from EVERY place report.html ends up, not just alongside its own
-      # siblings. Without it the link is bare ("zoxy.hgrm"), which only
-      # resolves on Pages (where `bench index` copies the .hgrm files
-      # alongside it) — the copy Discord links to is uploaded to Object
-      # Storage STANDALONE (see commands.notify's own comment on why it's
-      # linked rather than attached), with no .hgrm siblings anywhere near it,
-      # so that copy's links 404. Pointing every copy at the same stable Pages
-      # URL means the link resolves regardless of which copy of report.html
-      # someone is actually looking at.
-      - name: Render the per-profile reports
-        id: report
-        if: always() && steps.base.outcome == 'success'
-        env:
-          RUNID: ${{ steps.meta.outputs.runid }}
-          BASE: ${{ steps.base.outputs.base }}
-        run: |
-          set -euo pipefail
-          IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
-          # Render what the run actually produced, not what it was asked to.
-          #
-          # A profile that never finished has no directory, and rendering it
-          # used to abort the whole step under `set -e` — so a run cut short
-          # during c10k threw away the c1k report that had rendered perfectly
-          # well, which is exactly what uploading results per-profile exists to
-          # prevent. Run #9 lost a clean c1k that way.
-          rendered=0
-          for p in "${profiles[@]}"; do
-            if [ ! -f "results/$RUNID/$p/profile.json" ]; then
-              echo "no artifacts for $p — skipping (the run did not get that far)"
-              continue
-            fi
-            "$BENCH" report "results/$RUNID/$p" --profile "$p" --base-url "${BASE}${p}/"
-            rendered=$((rendered + 1))
-          done
-          # Nothing at all is still a failure: there is no report to publish and
-          # the downstream steps would build an empty site.
-          if [ "$rendered" -eq 0 ]; then
-            echo "::error::no profile produced artifacts — nothing to publish"
-            exit 1
-          fi
-          echo "rendered $rendered of ${#profiles[@]} profile(s)"
-
-      # deploy-pages replaces the site wholesale, so the trend chart's history
-      # lives IN the published site and has to be carried forward by hand:
-      # download the currently-published history.ndjson, hand it to `bench
-      # index`, which re-emits it with tonight's rows appended. Skip this and
-      # every night's trend chart shows exactly one night.
-      #
-      # Best-effort by design — the first ever run has no site to read, and a
-      # 404 must not be a failure.
-      - name: Fetch the published history
-        id: history
-        if: always() && steps.report.outcome == 'success'
-        env:
-          BASE: ${{ steps.base.outputs.base }}
-        run: |
-          set -euo pipefail
-          # A custom Pages domain would make this the wrong URL; the trend just
-          # restarts, nothing else breaks. --max-time so a hanging CDN cannot
-          # eat the budget.
-          if curl -fsS --max-time 60 -o history.ndjson "${BASE}history.ndjson"; then
-            echo "carried forward $(wc -l < history.ndjson) history row(s)"
-          else
-            echo "no published history yet (first run, or Pages not live) — starting fresh"
-            : > history.ndjson
-          fi
-
-      - name: Build the Pages site
-        id: index
-        if: always() && steps.report.outcome == 'success'
-        env:
-          RUNID: ${{ steps.meta.outputs.runid }}
-        run: |
-          set -euo pipefail
-          "$BENCH" index "results/$RUNID" --out _site --history history.ndjson
-
       # results/ is gitignored, so THIS is the durable store for a night's raw
       # data — 90 days of NDJSON, histograms and cAdvisor samples. Everything
-      # else (Pages, Discord) is a rendering of it.
+      # else (Pages, Discord) is a rendering of it, and every one of those
+      # renderings now happens in publish.yml, downstream of this artifact.
+      #
+      # That is the whole measure/publish split: this job produces numbers, and
+      # knows nothing about how they are presented. It is also what makes
+      # re-publishing possible — publish.yml can be pointed at any past run's
+      # artifact to re-render it with fixed code, without a fleet.
       - name: Upload the run artifact
+        id: artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -561,36 +486,6 @@ jobs:
           path: results/
           retention-days: 90
           if-no-files-found: warn
-
-      - name: Upload the Pages artifact
-        id: pages
-        if: always() && steps.index.outcome == 'success'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-
-      # --history gives each row its change against the previous night;
-      # --base-url makes each embed link at the published profile page.
-      - name: Notify Discord
-        if: always() && steps.report.outcome == 'success'
-        continue-on-error: true
-        env:
-          RUNID: ${{ steps.meta.outputs.runid }}
-          BASE_URL: ${{ steps.base.outputs.base }}
-        run: |
-          set -euo pipefail
-          # No webhook configured (a fork, or a first run) — render and validate
-          # the post without sending it, rather than failing the night.
-          dry=()
-          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
-            echo "DISCORD_WEBHOOK is unset — dry run"
-            dry=(--dry-run)
-          fi
-          "$BENCH" notify "results/$RUNID" \
-            --history history.ndjson \
-            --base-url "$BASE_URL" \
-            "${dry[@]}"
-
       # ---------------------------------------------------------- the verdict --
 
       # Everything above is `continue-on-error` so that teardown and publishing
@@ -614,8 +509,7 @@ jobs:
           for pair in \
             "wait:$wait_outcome" \
             "fetch:${{ steps.fetch.outcome }}" \
-            "report:${{ steps.report.outcome }}" \
-            "index:${{ steps.index.outcome }}" \
+            "artifact:${{ steps.artifact.outcome }}" \
             "destroy:${{ steps.destroy.outcome }}"
           do
             name="${pair%%:*}"; outcome="${pair#*:}"
@@ -630,48 +524,62 @@ jobs:
             exit 1
           fi
 
-  # A separate job because actions/deploy-pages needs `pages: write` plus its own
-  # `id-token: write`, and because Pages must not be able to fail the benchmark:
-  # `continue-on-error` at the JOB level keeps a Pages outage off the workflow's
-  # result, and the `needs.bench.outputs.site` gate keeps it from even trying on
-  # a night that produced no site.
-  deploy:
+  # Everything downstream of the measurement lives in publish.yml, which this
+  # calls rather than re-implements — see that file's header. The same workflow
+  # is dispatchable on its own to re-render any past run, so a rendering fix
+  # reaches the site without spending a fleet run on new numbers.
+  #
+  # `source-run` is THIS run: the bench job's artifact is what gets published.
+  #
+  # NOTE a behaviour change. The old deploy job was `continue-on-error` so a
+  # Pages outage could not redden the night. A job that calls a reusable
+  # workflow cannot set that key, and it is no longer the right trade anyway:
+  # the bench job's own Verdict decides whether the MEASUREMENT succeeded, the
+  # raw data is safe in the artifact either way, and a publish failure now has
+  # a one-click fix (dispatch publish.yml) that it did not have before. Better
+  # seen than swallowed.
+  publish:
     needs: bench
-    if: always() && needs.bench.outputs.site == 'success'
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 10
-
-    # Restated in full: job-level permissions REPLACE the workflow block, they do
-    # not merge with it. `id-token: write` is deploy-pages' own requirement.
+    if: always() && needs.bench.outputs.artifact == 'success'
+    uses: ./.github/workflows/publish.yml
+    with:
+      source-run: ${{ github.run_id }}
+      notify: true
+    # Job-level permissions REPLACE the workflow block rather than merging, and
+    # for a called workflow they also CAP what it can ask for. Restated in full:
+    # `actions: read` to read the artifact, `id-token: write` twice over (the
+    # Yandex OIDC exchange and deploy-pages' own auth), `pages: write` to deploy.
     permissions:
       contents: read
+      actions: read
       id-token: write
       pages: write
+    secrets: inherit
 
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  # Tells the landing site to pull tonight's numbers in, now that they're
+  # actually live at the URL it fetches from — precise timing instead of a
+  # guessed cron over there, which would either race a slow run or sit idle
+  # after a fast one. Best-effort: a missed dispatch just leaves the site's
+  # numbers one night stale.
+  #
+  # Nightly-only, which is why it stayed here rather than moving into
+  # publish.yml: a re-publish emits the same numbers the site already has, so
+  # there is nothing for it to refresh.
+  dispatch:
+    needs: publish
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 5
+    permissions:
+      contents: read
 
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      # Tells the landing site to pull tonight's numbers in, now that they're
-      # actually live at the URL it fetches from — precise timing instead of a
-      # guessed cron over there, which would either race a slow run (this job
-      # times out at 150 minutes) or sit idle after a fast one. Best-effort: a
-      # missed dispatch just leaves the site's numbers one night stale, not a
-      # failed deploy here.
-      #
       # ZOXY_IO_DISPATCH_TOKEN is a fine-grained PAT scoped to Contents: read
       # and write on zoxy-io/site ONLY — nothing on this repo, nothing broader.
-      # Same secret-handling rule as DISCORD_WEBHOOK above: only ever through
-      # `env:`, never interpolated into a command line.
+      # Same secret-handling rule as DISCORD_WEBHOOK: only ever through `env:`,
+      # never interpolated into a command line.
       - name: Notify zoxy-io to refresh benchmark numbers
-        if: always() && steps.deployment.outcome == 'success'
-        continue-on-error: true
         env:
           TOKEN: ${{ secrets.ZOXY_IO_DISPATCH_TOKEN }}
         run: |

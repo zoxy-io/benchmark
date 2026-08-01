@@ -682,14 +682,16 @@ pub fn buildIndex(
     // `full` (prior + tonight) is also what the trend chart below renders from
     // — using `prior` alone there would leave the trend a night stale, missing
     // the very run this page was just built for.
-    var full: std.ArrayList(index.HistoryRow) = .empty;
-    try full.appendSlice(arena, prior);
-    try full.appendSlice(arena, tonight.items);
+    // Merged, not concatenated: `bench index` also runs when RE-publishing a
+    // run whose rows are already in the fetched history, and appending would
+    // give that run two rows per proxy (and the trend two points at the same
+    // x). See index.mergeHistory.
+    const full = try index.mergeHistory(arena, prior, tonight.items);
 
     {
         var buf: std.ArrayList(u8) = .empty;
         var hw: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
-        try index.writeHistory(&hw.writer, full.items);
+        try index.writeHistory(&hw.writer, full);
         try redact.assertNoIps("history.ndjson", hw.written());
 
         const path = try std.fmt.allocPrint(arena, "{s}/history.ndjson", .{out_dir});
@@ -704,7 +706,7 @@ pub fn buildIndex(
     {
         var page: std.ArrayList(u8) = .empty;
         var pw: std.Io.Writer.Allocating = .fromArrayList(arena, &page);
-        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, full.items);
+        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, full);
         try redact.assertNoIps("index.html", pw.written());
 
         const path = try std.fmt.allocPrint(arena, "{s}/index.html", .{out_dir});

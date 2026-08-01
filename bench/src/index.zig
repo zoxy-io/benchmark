@@ -121,6 +121,38 @@ pub fn previousSustained(
     return if (best) |b| b.sustained else null;
 }
 
+/// `prior` with any row `fresh` supersedes removed, then `fresh` appended.
+///
+/// A row is identified by (runid, profile, proxy) — one proxy's result in one
+/// profile on one night. Appending blindly is right for a new night, whose rows
+/// cannot already be there, and wrong for RE-publishing a run that is already in
+/// the published history: that run's rows would appear twice, and the trend
+/// would plot two points at the same x for the same proxy. Re-publishing exists
+/// precisely so a rendering fix can reach the site without a new fleet run, so
+/// it must be idempotent.
+pub fn mergeHistory(
+    arena: Allocator,
+    prior: []const HistoryRow,
+    fresh: []const HistoryRow,
+) ![]HistoryRow {
+    var out: std.ArrayList(HistoryRow) = .empty;
+    for (prior) |p| {
+        var superseded = false;
+        for (fresh) |f| {
+            if (std.mem.eql(u8, p.runid, f.runid) and
+                std.mem.eql(u8, p.profile, f.profile) and
+                std.mem.eql(u8, p.proxy, f.proxy))
+            {
+                superseded = true;
+                break;
+            }
+        }
+        if (!superseded) try out.append(arena, p);
+    }
+    try out.appendSlice(arena, fresh);
+    return out.toOwnedSlice(arena);
+}
+
 /// Whether a history row's status means it carries numbers worth drawing.
 ///
 /// The same rule `artifact.Status.usable` states — ok or degraded — applied to
@@ -489,4 +521,68 @@ test "plottable matches artifact.Status.usable, and distrusts what it cannot par
     // A status written by some other build: not guessed at.
     try std.testing.expect(!plottable("weird"));
     try std.testing.expect(!plottable(""));
+}
+
+test "re-publishing a run replaces its history rows rather than doubling them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // What the live site already carries.
+    const prior = [_]HistoryRow{
+        .{ .runid = "20260731-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 41000 },
+        .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
+        .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "haproxy", .status = "ok", .sustained = 21000 },
+    };
+    // Re-publishing that same run — the rendering changed, the numbers did not.
+    const fresh = [_]HistoryRow{
+        .{ .runid = "20260801-000100", .ts = "t2", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
+        .{ .runid = "20260801-000100", .ts = "t2", .profile = "c1k", .proxy = "haproxy", .status = "ok", .sustained = 21000 },
+    };
+
+    const merged = try mergeHistory(arena, &prior, &fresh);
+
+    // Three rows, not five: the older night survives, the re-published one is
+    // replaced in place.
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("20260731-000100", merged[0].runid);
+    // And the fresh copy won, not the stale one.
+    try std.testing.expectEqualStrings("t2", merged[1].ts);
+    try std.testing.expectEqualStrings("t2", merged[2].ts);
+
+    // The trend must therefore never see two points at the same x for one
+    // proxy — which is what a doubled row would produce, and the actual visible
+    // symptom of getting this wrong.
+    const series = (try trendSeries(arena, merged, "c1k")).series;
+    try std.testing.expect(series.len > 0);
+    for (series) |s| {
+        for (s.pts, 0..) |a, i| {
+            for (s.pts[i + 1 ..]) |b| {
+                try std.testing.expect(a.x != b.x);
+            }
+        }
+    }
+    // zoxy ran both nights; haproxy only the re-published one.
+    for (series) |s| {
+        const want: usize = if (std.mem.eql(u8, s.name, "zoxy")) 2 else 1;
+        try std.testing.expectEqual(want, s.pts.len);
+    }
+}
+
+test "a genuinely new night is appended, not merged away" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prior = [_]HistoryRow{
+        .{ .runid = "20260731-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 41000 },
+    };
+    const fresh = [_]HistoryRow{
+        .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
+        // Same night, same proxy, DIFFERENT profile — not the same row.
+        .{ .runid = "20260801-000100", .ts = "t", .profile = "c10k", .proxy = "zoxy", .status = "ok", .sustained = 20000 },
+    };
+
+    const merged = try mergeHistory(arena, &prior, &fresh);
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
 }
