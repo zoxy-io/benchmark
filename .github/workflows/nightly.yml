@@ -131,9 +131,18 @@ jobs:
 
     outputs:
       runid: ${{ steps.meta.outputs.runid }}
-      # 'success' only when the raw artifact was actually uploaded. The publish
-      # job keys off this so it cannot run on a night that produced no data.
-      artifact: ${{ steps.artifact.outcome }}
+      # Whether the run produced RESULTS worth publishing.
+      #
+      # `fetch` is the step that pulls the run's output out of the bucket, so
+      # its success is the honest "there is something to render" signal. NOT the
+      # artifact upload, which is deliberately `if: always()` — it uploads the
+      # raw data on a failed or cancelled night too, precisely so that night is
+      # still diagnosable, which makes it useless as a gate.
+      #
+      # Deliberately not `needs.bench.result`: a teardown failure fails this job
+      # but must not cost a perfectly good report, which is what the old deploy
+      # gate got right and is worth keeping.
+      results: ${{ steps.fetch.outcome }}
 
     steps:
       - uses: actions/checkout@v4
@@ -540,7 +549,15 @@ jobs:
   # seen than swallowed.
   publish:
     needs: bench
-    if: always() && needs.bench.outputs.artifact == 'success'
+    # `!cancelled()`, NOT `always()`. `always()` runs the job even when the run
+    # was CANCELLED, and run #36 duly published a half-finished bench after
+    # someone stopped it — the numbers on the site then described a night that
+    # was deliberately abandoned. A cancelled run has nothing to say.
+    #
+    # Still not `success()`: a teardown failure fails the bench job, and that
+    # must not cost an otherwise good report. `needs.bench.outputs.results` is
+    # the gate that means there is something to render.
+    if: ${{ !cancelled() && needs.bench.outputs.results == 'success' }}
     uses: ./.github/workflows/publish.yml
     with:
       source-run: ${{ github.run_id }}
@@ -567,7 +584,12 @@ jobs:
   # there is nothing for it to refresh.
   dispatch:
     needs: publish
-    if: always() && needs.publish.result == 'success'
+    # `!cancelled()` for the same reason as the publish job above. A skipped
+    # publish already fails the result check, so this only closes the narrow
+    # window where the run is cancelled after publish succeeded — and the cost
+    # of skipping then is the site's numbers being one night stale, which this
+    # step is explicitly best-effort about anyway.
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 5
