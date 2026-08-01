@@ -147,6 +147,7 @@ pub fn render(
         try out.writeAll("</td></tr>");
     }
     try out.writeAll("</table></div>");
+    try writeNotes(out, ranked, statuses);
 
     // --- charts
     try out.writeAll("<div class=\"grid2\">");
@@ -370,16 +371,39 @@ fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
         },
         .skipped => try out.writeAll("<span class=\"badge\">skipped</span>"),
     }
+}
 
-    // EVERY note, on every status — not just the first, and not only when
-    // degraded. Both limits used to hide things that were recorded precisely
-    // because a reader needs them: an `ok` zoxy's build-parity note (SIMD
-    // against haproxy's generic x86-64 image) reached no reader at all, and a
-    // degraded proxy showed one note while silently dropping the rest.
-    for (r.notes) |n| {
-        var nbuf: [1024]u8 = undefined;
-        try out.print("<div class=\"note\">{s}</div>", .{escapeHtml(&nbuf, n)});
+/// Every recorded caveat, as a list UNDER the table.
+///
+/// Not in the status cell, which is where these first landed: a note is a
+/// sentence, and one row carrying five lines of it beside rows carrying a
+/// one-line badge tears the table's row heights apart. A cell is for a value.
+///
+/// Every note on every status, though — not just the first, and not only when
+/// degraded. Both of those limits used to hide things recorded precisely
+/// because a reader needs them: an `ok` zoxy's build-parity note (SIMD against
+/// haproxy's generic x86-64 image) reached no reader at all, and a degraded
+/// proxy showed one note while silently dropping the rest.
+fn writeNotes(out: *Writer, ranked: []const *report.ProxyData, statuses: []const artifact.ProxyRecord) !void {
+    var any = false;
+    for (ranked) |p| {
+        const st = statusOf(statuses, p.name) orelse continue;
+        if (st.notes.len > 0) any = true;
     }
+    if (!any) return;
+
+    try out.writeAll("<ul class=\"notes\">");
+    for (ranked) |p| {
+        const st = statusOf(statuses, p.name) orelse continue;
+        for (st.notes) |n| {
+            var nbuf: [1024]u8 = undefined;
+            try out.print(
+                "<li><span class=\"swatch s-{s}\"></span><b>{s}</b> {s}</li>",
+                .{ p.name, p.name, escapeHtml(&nbuf, n) },
+            );
+        }
+    }
+    try out.writeAll("</ul>");
 }
 
 /// Escape `text` for HTML text content.
@@ -495,7 +519,7 @@ fn card(
         hover_series[hi] = c;
         hi += 1;
     }
-    try svg.writeChartData(out, opts.id, hover_series, opts.yfmt, opts.xmax);
+    try svg.writeChartData(out, opts.id, hover_series, opts.yfmt, opts.xmax, .{});
     try out.writeAll("</section>");
 }
 

@@ -121,6 +121,20 @@ pub fn previousSustained(
     return if (best) |b| b.sustained else null;
 }
 
+/// Whether a history row's status means it carries numbers worth drawing.
+///
+/// The same rule `artifact.Status.usable` states — ok or degraded — applied to
+/// the status as history.ndjson spells it. An unrecognised status is treated as
+/// not plottable: a row this build does not understand is not one to guess at.
+///
+/// Deliberately NOT used by `previousSustained`: excluding degraded nights from
+/// the delta BASELINE is correct for the reason documented there, and that is a
+/// different question from whether the night appears on the trend at all.
+fn plottable(status: []const u8) bool {
+    const s = std.meta.stringToEnum(artifact.Status, status) orelse return false;
+    return s.usable();
+}
+
 pub fn delta(now: f64, before: ?f64) ?f64 {
     const prev = before orelse return null;
     if (prev == 0) return null;
@@ -186,12 +200,13 @@ pub fn renderIndex(
     // next with no visible separation at all.
     var any_trend = false;
     for (profiles) |p| {
-        if ((try trendSeries(arena, history, p.name)).len > 0) any_trend = true;
+        if ((try trendSeries(arena, history, p.name)).series.len > 0) any_trend = true;
     }
     if (any_trend) {
         try out.writeAll("<div class=\"grid2\">");
         for (profiles) |p| {
-            const series = try trendSeries(arena, history, p.name);
+            const trend = try trendSeries(arena, history, p.name);
+            const series = trend.series;
             if (series.len == 0) continue;
 
             const id = try std.fmt.allocPrint(arena, "trend-{s}", .{p.name});
@@ -217,9 +232,21 @@ pub fn renderIndex(
                 .yfmt = .si,
                 .y_unit = "req/s",
                 .x_label = "run",
+                // One point per night, so the nights have to be visible as
+                // points. Without this a profile with a single night of
+                // history drew an empty chart — a one-point `<polyline>` has
+                // no segment to stroke — and the newest run was simply absent
+                // from the overview.
+                .markers = true,
             }, series);
             try out.print("<div class=\"tooltip\" id=\"tip-{s}\" hidden></div></div>", .{id});
-            try svg.writeChartData(out, id, series, .si, null);
+            // x is a run INDEX here, not a rate — pass the run ids so hovering a
+            // night names it, instead of the tooltip claiming an offered req/s
+            // this chart has no axis for.
+            try svg.writeChartData(out, id, series, .si, null, .{
+                .name = "run",
+                .labels = trend.runids,
+            });
             try out.writeAll("</section>");
         }
         try out.writeAll("</div>");
@@ -235,7 +262,14 @@ pub fn renderIndex(
 /// The x axis is an index rather than a date because runs are not evenly spaced
 /// — a night can be skipped — and plotting an index keeps every point visible
 /// instead of bunching them.
-fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []const u8) ![]svg.Series {
+const Trend = struct {
+    series: []svg.Series,
+    /// The run id at each x position, so the hover tooltip can name the night
+    /// instead of reporting a bare ordinal ("run 3" answers nothing).
+    runids: [][]const u8,
+};
+
+fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []const u8) !Trend {
     var runids: std.ArrayList([]const u8) = .empty;
     for (history) |r| {
         if (!std.mem.eql(u8, r.profile, profile_name)) continue;
@@ -245,7 +279,7 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
         }
         if (!seen) try runids.append(arena, r.runid);
     }
-    if (runids.items.len == 0) return &.{};
+    if (runids.items.len == 0) return .{ .series = &.{}, .runids = &.{} };
     std.mem.sort([]const u8, runids.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -262,7 +296,18 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
                 if (!std.mem.eql(u8, r.runid, rid)) continue;
                 // A failed night leaves a GAP rather than a zero, so the line
                 // does not dive to the floor and read as a collapse.
-                if (!std.mem.eql(u8, r.status, "ok")) continue;
+                //
+                // GAP means failed or skipped — a night with no numbers. It
+                // does NOT mean degraded: that status is defined as "usable but
+                // incomplete", the run report ranks and charts it, and
+                // history.ndjson records it. Testing `status == "ok"` here (as
+                // this did) silently dropped those nights from the trend while
+                // still writing them to history, so the newest run could be
+                // absent from the overview for the whole night — and every
+                // reason a run gets marked degraded (a short ramp, absent
+                // cAdvisor samples, a stale zoxy build) is a reason someone
+                // would then go looking for it on exactly this chart.
+                if (!plottable(r.status)) continue;
                 try pts.append(arena, .{ .x = @floatFromInt(i), .y = r.sustained });
             }
         }
@@ -273,7 +318,7 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
             .dashed = std.mem.eql(u8, proxy, "direct"),
         });
     }
-    return out.toOwnedSlice(arena);
+    return .{ .series = try out.toOwnedSlice(arena), .runids = try runids.toOwnedSlice(arena) };
 }
 
 test "parseHistory round-trips and skips a malformed line" {
@@ -351,7 +396,7 @@ test "the trend leaves a gap for a failed night rather than plotting zero" {
         .{ .runid = "20260727-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "failed", .sustained = 0 },
         .{ .runid = "20260728-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 41000 },
     };
-    const series = try trendSeries(arena, &rows, "c1k");
+    const series = (try trendSeries(arena, &rows, "c1k")).series;
     try std.testing.expectEqual(@as(usize, 1), series.len);
     // Three runs, two plotted points: the failed night is absent, not a zero
     // that would read as a collapse.
@@ -409,4 +454,39 @@ test "the landing page is IP-clean and names each profile's result" {
     try std.testing.expect(std.mem.indexOf(u8, s, "3/4 ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "1000ms") != null);
     try redact.assertNoIps("index.html", s);
+}
+
+test "the trend plots a degraded night — it is usable data, not a gap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The bug this covers: the newest run was written to history.ndjson and
+    // then dropped from the trend, so the overview showed nothing for it. The
+    // filter tested `status == "ok"`, which also excluded `degraded` — and
+    // degraded is exactly the state a run lands in for a short ramp, absent
+    // cAdvisor samples, or a stale zoxy build, each of which is a reason to go
+    // looking for that night on this chart.
+    const rows = [_]HistoryRow{
+        .{ .runid = "20260730-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 40000 },
+        .{ .runid = "20260731-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "degraded", .sustained = 41000 },
+        .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "degraded", .sustained = 42000 },
+    };
+    const series = (try trendSeries(arena, &rows, "c1k")).series;
+    try std.testing.expectEqual(@as(usize, 1), series.len);
+    try std.testing.expectEqual(@as(usize, 3), series[0].pts.len);
+    // Including the newest, at the right-hand end.
+    try std.testing.expectApproxEqAbs(@as(f64, 2), series[0].pts[2].x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 42000), series[0].pts[2].y, 1e-9);
+}
+
+test "plottable matches artifact.Status.usable, and distrusts what it cannot parse" {
+    try std.testing.expect(plottable("ok"));
+    try std.testing.expect(plottable("degraded"));
+    // No numbers to draw.
+    try std.testing.expect(!plottable("failed"));
+    try std.testing.expect(!plottable("skipped"));
+    // A status written by some other build: not guessed at.
+    try std.testing.expect(!plottable("weird"));
+    try std.testing.expect(!plottable(""));
 }

@@ -34,7 +34,15 @@ document.querySelectorAll('.hover-capture[data-chart]').forEach(cap => {
       rows += `<div class="trow"><span class="tname"><span class="swatch s-${s.name}"></span>${s.name}</span>` +
               `<span class="tval">${fmt(best, data.yfmt)}</span></div>`;
     }
-    tip.innerHTML = `<div class="trow"><span class="tname">offered</span><span class="tval">${fmt(x)} req/s</span></div>` + rows;
+    // What x IS depends on the chart, so the blob says rather than the script
+    // assuming: offered load on the run report, a run on the nightly trend.
+    // `labels` means x is an ordinal position — show the label (the run id),
+    // not a formatted number with a unit that chart has no axis for.
+    const xa = data.x || {name: 'offered', unit: 'req/s', labels: []};
+    const head = (xa.labels && xa.labels.length)
+      ? (xa.labels[Math.min(Math.max(Math.round(x), 0), xa.labels.length - 1)] || '')
+      : `${fmt(x)} ${xa.unit}`.trim();
+    tip.innerHTML = `<div class="trow"><span class="tname">${xa.name}</span><span class="tval">${head}</span></div>` + rows;
     tip.hidden = false;
     const wr = wrap.getBoundingClientRect();
     let lx = e.clientX - wr.left + 14;

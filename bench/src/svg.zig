@@ -28,6 +28,12 @@ pub const mr: f64 = 16;
 pub const mt: f64 = 22;
 pub const mb: f64 = 40;
 
+/// Marker geometry for `Options.markers`. r=4 is the 8px minimum a data point
+/// needs to read as a point; the 2px ring in the surface colour (`.dot` in the
+/// stylesheet) is what keeps it legible where two series cross.
+const dot_r: f64 = 4;
+const dot_ring: f64 = 2;
+
 pub const YFormat = enum { si, ms, pct, bytes };
 
 pub const Series = struct {
@@ -45,6 +51,20 @@ pub const Options = struct {
     /// up. Lines running past it are clipped at the plot edge.
     xmax: ?f64 = null,
     x_label: []const u8 = "offered load (req/s)",
+    /// Draw a dot on every data point as well as the line.
+    ///
+    /// For a chart whose points are DISCRETE OBSERVATIONS rather than a dense
+    /// sampled curve — the nightly trend is one point per night. Two reasons it
+    /// is not optional there:
+    ///
+    /// * a `<polyline>` with a single point draws NOTHING, so a profile with
+    ///   one night of history rendered a completely empty chart;
+    /// * with several nights the line is visible but the nights are not, and
+    ///   "which run was that" is the only question the trend is asked.
+    ///
+    /// Left off for the run report's charts, where each series is hundreds of
+    /// samples of a continuous ramp and a dot per sample is just ink.
+    markers: bool = false,
 };
 
 /// A small fixed-capacity tick list. 24 is far more than a readable axis ever
@@ -279,9 +299,15 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     };
 
     try writeSvgOpen(out);
+    // The clip crops lines that run past the axis. With markers on it has to be
+    // let out by a marker's radius plus its ring, or the points ON the axis get
+    // sliced in half — and on the trend those are the first night and, worse,
+    // the LATEST one, which is the point the chart exists to show. A 6px
+    // overhang is invisible for the cropping the clip is actually for.
+    const pad: f64 = if (opts.markers) dot_r + dot_ring else 0;
     try out.print(
         "<clipPath id=\"clip-{s}\"><rect x=\"{d:.0}\" y=\"{d:.0}\" width=\"{d:.0}\" height=\"{d:.0}\"/></clipPath>",
-        .{ opts.id, ml, mt, w - ml - mr, h - mt - mb },
+        .{ opts.id, ml - pad, mt - pad, w - ml - mr + 2 * pad, h - mt - mb + 2 * pad },
     );
 
     var buf: [128]u8 = undefined;
@@ -306,6 +332,19 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
         if (s.dashed) try out.writeAll(" stroke-dasharray=\"6 4\"");
         try out.writeAll("/>");
     }
+    if (opts.markers) {
+        // After every line, so a dot is never buried under a later series'
+        // stroke. r=4 (8px) with a 2px surface-coloured ring, which is what
+        // keeps dots legible where two proxies cross.
+        for (series) |s| {
+            for (s.pts) |p| {
+                try out.print(
+                    "<circle class=\"dot s-{s}\" cx=\"{d:.1}\" cy=\"{d:.1}\" r=\"4\"/>",
+                    .{ s.name, ctx.x(p.x), ctx.y(p.y) },
+                );
+            }
+        }
+    }
     try out.writeAll("</g>");
 
     try out.print(
@@ -328,7 +367,31 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
 /// nightly trend) calls this rather than writing its own copy, so the JSON
 /// shape can't drift out of sync between them the way the chart geometry
 /// nearly did once already (see histCard's note on `decades`).
-pub fn writeChartData(out: *std.Io.Writer, id: []const u8, series: []const Series, yfmt: YFormat, xmax_opt: ?f64) !void {
+/// What the hover tooltip should call the x value, and how to render it.
+///
+/// Carried in the data blob rather than assumed by the script, which used to
+/// hardcode "offered … req/s" for every chart. That is right for the run
+/// report, where x IS offered load, and wrong for the nightly trend, where x is
+/// a run index and the tooltip claimed a request rate that no axis on the page
+/// showed.
+pub const XAxis = struct {
+    name: []const u8 = "offered",
+    unit: []const u8 = "req/s",
+    /// Labels indexed by x, for a chart whose x is an ordinal position rather
+    /// than a measured quantity. When set, the tooltip shows `labels[x]` and
+    /// the unit is not used — the trend passes its run ids, so hovering a night
+    /// names the run instead of reporting "run 3".
+    labels: []const []const u8 = &.{},
+};
+
+pub fn writeChartData(
+    out: *std.Io.Writer,
+    id: []const u8,
+    series: []const Series,
+    yfmt: YFormat,
+    xmax_opt: ?f64,
+    x: XAxis,
+) !void {
     try out.print("<script type=\"application/json\" id=\"data-{s}\">", .{id});
     var j = jsonw.Writer{ .w = out };
     try j.beginObject();
@@ -370,6 +433,19 @@ pub fn writeChartData(out: *std.Io.Writer, id: []const u8, series: []const Serie
     const t = ticks.slice();
     try j.key("xmax");
     try j.float(t[t.len - 1], 4);
+
+    try j.key("x");
+    try j.beginObject();
+    try j.key("name");
+    try j.string(x.name);
+    try j.key("unit");
+    try j.string(x.unit);
+    try j.key("labels");
+    try j.beginArray();
+    for (x.labels) |l| try j.string(l);
+    try j.endArray();
+    try j.endObject();
+
     try j.endObject();
     try out.writeAll("</script>");
 }
@@ -559,4 +635,75 @@ test "histChart draws percentile decades" {
     // `data-chart` — the two charts' x-scales are not interchangeable.
     try std.testing.expect(std.mem.indexOf(u8, s, "data-hist=\"zoxy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "data-chart=") == null);
+}
+
+test "the hover blob says what x is, so the tooltip stops assuming offered load" {
+    var buf: [4096]u8 = undefined;
+    const pts = [_]Point{ .{ .x = 0, .y = 40000 }, .{ .x = 1, .y = 43000 } };
+    const series = [_]Series{.{ .name = "zoxy", .pts = &pts }};
+
+    // Run report: x IS offered load, which is what the script used to hardcode
+    // for every chart.
+    {
+        var out: std.Io.Writer = .fixed(&buf);
+        try writeChartData(&out, "rps", &series, .si, null, .{});
+        const s = out.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"name\":\"offered\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"unit\":\"req/s\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"labels\":[]") != null);
+    }
+
+    // Nightly trend: x is a run index. Reporting it as a req/s figure was
+    // inventing a quantity the chart has no axis for; the run ids let the
+    // tooltip name the night instead.
+    {
+        var out: std.Io.Writer = .fixed(&buf);
+        const runids = [_][]const u8{ "20260731-000100", "20260801-000100" };
+        try writeChartData(&out, "trend-c1k", &series, .si, null, .{
+            .name = "run",
+            .labels = &runids,
+        });
+        const s = out.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"name\":\"run\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"20260801-000100\"") != null);
+    }
+}
+
+test "markers are drawn for discrete observations, and let out of the clip" {
+    var buf: [8192]u8 = undefined;
+
+    // A single point: a `<polyline>` with one vertex has no segment and paints
+    // NOTHING, which is how a profile with one night of history rendered a
+    // completely empty trend.
+    {
+        var out: std.Io.Writer = .fixed(&buf);
+        const one = [_]Point{.{ .x = 0, .y = 43000 }};
+        _ = try chart(&out, .{ .id = "t", .markers = true }, &.{.{ .name = "zoxy", .pts = &one }});
+        const s = out.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, s, "<circle class=\"dot s-zoxy\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "r=\"4\"") != null);
+    }
+
+    // The clip has to be let out by the marker radius, or the points sitting ON
+    // the axis — the first night and, worse, the newest — render as half dots.
+    {
+        var out: std.Io.Writer = .fixed(&buf);
+        const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 2, .y = 2 } };
+        _ = try chart(&out, .{ .id = "t", .markers = true }, &.{.{ .name = "zoxy", .pts = &pts }});
+        const s = out.buffered();
+        // ml=62, mr=16, pad=6 -> x=56, width = 720-62-16+12 = 654
+        try std.testing.expect(std.mem.indexOf(u8, s, "<rect x=\"56\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "width=\"654\"") != null);
+    }
+
+    // Off by default: the run report's series are hundreds of samples of a
+    // continuous ramp, where a dot per sample is just ink.
+    {
+        var out: std.Io.Writer = .fixed(&buf);
+        const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 2, .y = 2 } };
+        _ = try chart(&out, .{ .id = "rps" }, &.{.{ .name = "zoxy", .pts = &pts }});
+        const s = out.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, s, "<circle") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "<rect x=\"62\"") != null);
+    }
 }
