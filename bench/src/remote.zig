@@ -347,9 +347,31 @@ pub fn check(
         var buf: [64]u8 = undefined;
         redact.log("bench: {s} failed ({s})", .{ what, res.describe(&buf) });
         if (res.stderr.len > 0) {
-            var scrubbed: [4096]u8 = undefined;
-            const tail = res.stderr[res.stderr.len -| 1024 ..];
-            std.debug.print("  {s}\n", .{redact.scrub(&scrubbed, tail)});
+            // 16 KiB, not 1 KiB. BuildKit prints the real error FIRST and then
+            // its own epilogue — a Dockerfile source frame plus a `failed to
+            // solve: process "/bin/sh -c ..."` line echoing the whole RUN
+            // command — and that boilerplate alone runs well past 1 KiB. So on
+            // a `docker compose build` failure, which is the single most
+            // common thing this function has to explain, a 1 KiB tail was
+            // GUARANTEED to be pure epilogue with the compiler's output cut
+            // off the front.
+            //
+            // Run 30693210951 is the case in point: zoxy failed to build on
+            // the proxy VM and the entire diagnostic was the frame, opening
+            // mid-word at "uilding". The cause is not recoverable from that
+            // log, only from the next occurrence.
+            //
+            // `exec` already keeps the first 1 MiB of stderr (max_output), so
+            // this only ever widened what gets PRINTED — the data was there.
+            const keep = 16 * 1024;
+            const tail = res.stderr[res.stderr.len -| keep ..];
+            // Heap, not a stack array: `scrub` silently stops at the end of its
+            // output buffer, so a buffer smaller than the slice would trade the
+            // truncation above for the same truncation one layer down. Every
+            // registered address is longer than the `<addr>` it becomes, so the
+            // result cannot outgrow its input.
+            const scrubbed = try arena.alloc(u8, tail.len);
+            std.debug.print("  {s}\n", .{redact.scrub(scrubbed, tail)});
         }
         return error.RemoteCommandFailed;
     }
