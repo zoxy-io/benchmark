@@ -364,14 +364,36 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     try out.print("<g clip-path=\"url(#clip-{s})\">", .{opts.id});
     for (series) |s| {
         if (s.pts.len == 0) continue;
-        try out.print("<polyline class=\"line s-{s}\" points=\"", .{s.name});
-        for (s.pts, 0..) |p, i| {
-            if (i > 0) try out.writeByte(' ');
-            try out.print("{d:.1},{d:.1}", .{ ctx.x(p.x), ctx.y(p.y) });
+        // A missing observation has to READ as missing.
+        //
+        // `trendSeries` omits a night a proxy failed, on the stated grounds
+        // that "a failed night leaves a GAP rather than a zero" — but ONE
+        // polyline over the surviving points draws a straight segment across
+        // the hole, which invents a value for that night instead. That is
+        // worse than the zero the gap exists to avoid: a zero at least looks
+        // wrong, where an interpolated segment looks like data. haproxy failed
+        // run 3 of 8 and its line ran through it unbroken.
+        //
+        // So the line is cut into contiguous stretches, one polyline each.
+        // A stretch of a single point draws nothing on its own — the marker is
+        // what makes an isolated night visible, which is the other reason
+        // `markers` is not optional on this chart.
+        var start: usize = 0;
+        while (start < s.pts.len) {
+            var end = start + 1;
+            while (end < s.pts.len) : (end += 1) {
+                if (opts.x_ordinal and s.pts[end].x - s.pts[end - 1].x > 1.5) break;
+            }
+            try out.print("<polyline class=\"line s-{s}\" points=\"", .{s.name});
+            for (s.pts[start..end], 0..) |p, i| {
+                if (i > 0) try out.writeByte(' ');
+                try out.print("{d:.1},{d:.1}", .{ ctx.x(p.x), ctx.y(p.y) });
+            }
+            try out.writeAll("\" fill=\"none\" stroke-width=\"2\"");
+            if (s.dashed) try out.writeAll(" stroke-dasharray=\"6 4\"");
+            try out.writeAll("/>");
+            start = end;
         }
-        try out.writeAll("\" fill=\"none\" stroke-width=\"2\"");
-        if (s.dashed) try out.writeAll(" stroke-dasharray=\"6 4\"");
-        try out.writeAll("/>");
     }
     if (opts.markers) {
         // After every line, so a dot is never buried under a later series'
@@ -815,4 +837,47 @@ test "ordinalTicks stays whole-numbered and always marks the last run" {
     try std.testing.expectApproxEqAbs(@as(f64, 30), t[t.len - 1], 1e-9);
     // Whole runs only; `niceTicks` would happily label run 0.5.
     for (t) |v| try std.testing.expectApproxEqAbs(v, @round(v), 1e-9);
+}
+
+test "a night with no data breaks the line instead of being drawn through" {
+    var buf: [8192]u8 = undefined;
+
+    // Five nights; the proxy failed on the third, so trendSeries omits it.
+    // One polyline over the survivors would run a straight segment from night
+    // 2 to night 4, straight across the night that has no data — which is what
+    // the live chart did for haproxy.
+    const pts = [_]Point{
+        .{ .x = 0, .y = 20000 },
+        .{ .x = 1, .y = 21000 },
+        // x = 2 absent
+        .{ .x = 3, .y = 22000 },
+        .{ .x = 4, .y = 23000 },
+    };
+    const series = [_]Series{.{ .name = "haproxy", .pts = &pts }};
+
+    var out: std.Io.Writer = .fixed(&buf);
+    _ = try chart(&out, .{ .id = "t", .markers = true, .x_ordinal = true }, &series);
+    const s = out.buffered();
+
+    // Two stretches, not one line bridging the hole.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "<polyline class=\"line s-haproxy\""));
+    // Four nights of data, four dots — the gap has none.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, s, "<circle class=\"dot s-haproxy\""));
+
+    // A continuous series is still ONE polyline — the split only happens at a
+    // real gap.
+    const whole = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 3 } };
+    var out2: std.Io.Writer = .fixed(&buf);
+    _ = try chart(&out2, .{ .id = "t", .markers = true, .x_ordinal = true }, &.{.{ .name = "zoxy", .pts = &whole }});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out2.buffered(), "<polyline class=\"line s-zoxy\""));
+}
+
+test "gap-splitting is ordinal-only — a sampled ramp is never cut" {
+    // The run report's x is offered load: consecutive samples are hundreds of
+    // req/s apart, and every one of those is a legitimate step, not a gap.
+    var buf: [8192]u8 = undefined;
+    const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 900, .y = 2 }, .{ .x = 1800, .y = 3 } };
+    var out: std.Io.Writer = .fixed(&buf);
+    _ = try chart(&out, .{ .id = "rps" }, &.{.{ .name = "zoxy", .pts = &pts }});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), "<polyline class=\"line s-zoxy\""));
 }
