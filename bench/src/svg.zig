@@ -109,14 +109,14 @@ pub fn fmtSi(out: []u8, v: f64) []const u8 {
     return std.fmt.bufPrint(out, "{s}", .{sigFigs(&scratch, v, 2)}) catch "?";
 }
 
-/// Python's `%g`: shortest form, trailing zeros and a trailing point stripped.
+/// Python's `%g` with its default precision: round to 6 SIGNIFICANT figures,
+/// then strip trailing zeros and a trailing point. `v` here is real measured
+/// data (e.g. a windowed achieved rate), not a clean decimal, so printing it
+/// via `{d}` (shortest round-tripping repr) instead of rounding first used to
+/// surface float noise as long digit runs like "43.11999999999999" — this
+/// rounds first, matching what `%g` does.
 fn trimG(buf: []u8, v: f64) []const u8 {
-    var s = std.fmt.bufPrint(buf, "{d}", .{v}) catch return "?";
-    if (std.mem.indexOfScalar(u8, s, '.') != null) {
-        while (s.len > 1 and s[s.len - 1] == '0') s = s[0 .. s.len - 1];
-        if (s.len > 0 and s[s.len - 1] == '.') s = s[0 .. s.len - 1];
-    }
-    return s;
+    return sigFigs(buf, v, 6);
 }
 
 /// Python's `%.<n>g` for the 0 < v < 10 range: round to `n` significant
@@ -492,6 +492,17 @@ test "fmtSi reproduces report/charts.py's fmt_si" {
     try std.testing.expectEqualStrings("1.5", fmtSi(&buf, 1.5));
     try std.testing.expectEqualStrings("10", fmtSi(&buf, 9.999));
     try std.testing.expectEqualStrings("0.0004", fmtSi(&buf, 0.0004));
+}
+
+test "fmtSi rounds float noise instead of printing it" {
+    // Real measured throughput (a windowed division) rarely lands on a clean
+    // decimal — 43120 achieved over a slightly-off window comes back as
+    // something like 43119.999999999993. `{d}`'s shortest round-tripping repr
+    // would print that noise verbatim; fmtSi must round it away like Python's
+    // `%g` does.
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("43.12k", fmtSi(&buf, 43119.999999999993));
+    try std.testing.expectEqualStrings("3M", fmtSi(&buf, 2_999_999.999999999));
 }
 
 test "fmtBytes uses binary units" {

@@ -666,11 +666,18 @@ pub fn buildIndex(
     // longest-lived artifact of any this harness produces, since it carries
     // forward every prior night's rows rather than aging out with its own run,
     // so a leak here would be the worst case of any artifact in the system.
+    //
+    // `full` (prior + tonight) is also what the trend chart below renders from
+    // — using `prior` alone there would leave the trend a night stale, missing
+    // the very run this page was just built for.
+    var full: std.ArrayList(index.HistoryRow) = .empty;
+    try full.appendSlice(arena, prior);
+    try full.appendSlice(arena, tonight.items);
+
     {
         var buf: std.ArrayList(u8) = .empty;
         var hw: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
-        try index.writeHistory(&hw.writer, prior);
-        try index.writeHistory(&hw.writer, tonight.items);
+        try index.writeHistory(&hw.writer, full.items);
         try redact.assertNoIps("history.ndjson", hw.written());
 
         const path = try std.fmt.allocPrint(arena, "{s}/history.ndjson", .{out_dir});
@@ -685,7 +692,7 @@ pub fn buildIndex(
     {
         var page: std.ArrayList(u8) = .empty;
         var pw: std.Io.Writer.Allocating = .fromArrayList(arena, &page);
-        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, prior);
+        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, full.items);
         try redact.assertNoIps("index.html", pw.written());
 
         const path = try std.fmt.allocPrint(arena, "{s}/index.html", .{out_dir});
