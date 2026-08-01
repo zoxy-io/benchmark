@@ -357,6 +357,7 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         meta.ramp,
         prof.ref_rate,
         prof.ref_band,
+        statuses,
     );
     try redact.assertNoIps("report.json", jw.written());
 

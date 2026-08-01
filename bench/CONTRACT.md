@@ -121,3 +121,14 @@ compose.yaml:
 record `degraded` with a `STALE BUILD` note. Either side being null means the
 check could not run (GitHub unreachable), which is not the same as stale and is
 not reported as such.
+
+`version` is repeated on each `report.json` proxy record, verbatim. profile.json
+is this harness's own run record; report.json is what other things read, and a
+consumer labelling a number with the build behind it should not have to fetch a
+second artifact or hand-type the version and hope it is still true. The string
+is the probe's output unchanged (`HAProxy version 3.0.7-1~bpo12+1 ...`), not a
+shortened label: shortening is a presentation choice, and anything that wants
+`3.0` can take it from the front of that, while nothing can recover the rest
+once dropped. `null` where the probe failed or the run predates it — a legacy
+run dir with no profile.json reports every version as null rather than failing.
+The field is additive, so `schema` stays at 1.

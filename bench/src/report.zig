@@ -15,6 +15,7 @@ const std = @import("std");
 const zrk = @import("zrk");
 
 const analysis = @import("analysis.zig");
+const artifact = @import("artifact.zig");
 const cadvisor = @import("cadvisor.zig");
 const jsonw = @import("jsonw.zig");
 
@@ -376,6 +377,20 @@ pub fn orderPresent(arena: Allocator, names: []const []const u8) ![]const []cons
     return out.toOwnedSlice(arena);
 }
 
+/// The build a row's numbers came from, looked up by proxy name.
+///
+/// profile.json has carried this since the version probe landed, but that file
+/// is this harness's own run record. report.json is the contract other things
+/// read, and a consumer wanting to label a number with the build behind it had
+/// to parse a second artifact or hand-type the version and hope — zoxy.io was
+/// doing the latter, which is the kind of claim that goes stale unnoticed.
+fn versionOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const u8 {
+    for (statuses) |s| {
+        if (std.mem.eql(u8, s.name, name)) return s.version;
+    }
+    return null;
+}
+
 /// Write report.json. Key order and number formatting are chosen to match
 /// report.py's `json.dumps(..., separators=(",", ":"))` exactly — see jsonw.zig.
 pub fn writeJson(
@@ -387,6 +402,10 @@ pub fn writeJson(
     ramp: Ramp,
     ref_rate: f64,
     ref_band: f64,
+    /// Per-proxy records out of profile.json, for the version each row ran.
+    /// Empty for a legacy run dir that has no profile.json — that reports null
+    /// versions rather than failing, the same way its missing statuses do.
+    statuses: []const artifact.ProxyRecord,
 ) !void {
     var j = jsonw.Writer{ .w = w };
 
@@ -476,6 +495,15 @@ pub fn writeJson(
         try j.boolean(std.mem.eql(u8, p.name, "zoxy"));
         try j.key("baseline");
         try j.boolean(isDirect(p.name));
+
+        // Verbatim, as the container answered — the same string profile.json
+        // and the HTML table carry. Shortening it to a marketing-sized label
+        // is a presentation choice, and this file is the record, not the
+        // presentation; a consumer that wants "3.0" can take it from "HAProxy
+        // version 3.0.7-...", but nothing can recover the rest once dropped.
+        try j.key("version");
+        if (versionOf(statuses, p.name)) |v| try j.string(v) else try j.nullValue();
+
         try j.key("sustained");
         try j.int(jsonw.pyRoundToInt(p.sustained));
         try j.key("mem");
