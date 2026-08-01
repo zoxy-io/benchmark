@@ -1,0 +1,36 @@
+# Automatic retry for a failed nightly run.
+#
+# GitHub Actions has no "retry this job N times" primitive, so this is the
+# documented workaround: a second workflow, triggered by `workflow_run` once
+# nightly.yml finishes, that re-runs ONLY its failed jobs. If `bench` failed,
+# that reruns the whole fleet lifecycle from scratch (a fresh IAM token, a
+# fresh apply, `tofu destroy` still `if: always()`) — a full retry, not a
+# resume, which is the right shape here since nothing about the fleet
+# survives a failed run anyway. If only `publish` failed, this reruns just
+# that — no need to spend a second fleet on a rendering hiccup.
+#
+# `run_attempt` is GitHub's own counter for this: it starts at 1 and
+# increments by one on every rerun, however triggered. Capping this job at
+# `< 3` means the ORIGINAL run plus two retries — three attempts total —
+# before a failed night is left red.
+name: nightly retry
+
+on:
+  workflow_run:
+    workflows: [nightly]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Re-run the failed jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run rerun ${{ github.event.workflow_run.id }} --failed --repo ${{ github.repository }}
