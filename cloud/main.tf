@@ -1,4 +1,5 @@
-# Three stock Ubuntu 24.04 hosts, one zone, one subnet, NO public addresses.
+# Six stock Ubuntu 24.04 hosts — loadgen, proxy, and a four-node backend pool —
+# in one zone, one subnet, with NO public addresses.
 #
 # The fleet is ephemeral and self-driving: CI creates it, the loadgen runs the
 # whole suite itself and ships the results out through Object Storage, CI
@@ -91,8 +92,8 @@ resource "tls_private_key" "fleet" {
 # One ssh HOST key for the whole fleet, injected via cloud-init so the loadgen
 # can carry a known_hosts that is correct before the peers have even booted —
 # StrictHostKeyChecking against a known key instead of trust-on-first-use.
-# Per-host keys would be stricter, but the three VMs are created and destroyed
-# by one apply and share one trust domain, so there is nothing left to separate.
+# Per-host keys would be stricter, but the fleet is created and destroyed by one
+# apply and shares one trust domain, so there is nothing left to separate.
 resource "tls_private_key" "host" {
   algorithm = "ED25519"
 }
@@ -110,19 +111,45 @@ locals {
   # compute pressure, so the extra cores didn't buy anything measurable.)
   #
   # Addresses are PINNED, not allocated. The loadgen's cloud-init has to carry
-  # PROXY_IP/BACKEND_IP and a known_hosts keyed by address, and it cannot read
+  # PROXY_IP/BACKEND_IPS and a known_hosts keyed by address, and it cannot read
   # those off its own for_each siblings — that is a self-reference, and
   # terraform rejects it. Yandex reserves the first four addresses of a subnet,
   # so the fleet starts at .11. Each run gets its own network, so fixed
   # addresses cannot collide across concurrent runs.
-  hosts = {
-    loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory, ip = "10.10.0.11" }
-    proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, ip = "10.10.0.12" }
-    backend = { cores = var.backend_cores, memory = var.backend_memory, ip = "10.10.0.13" }
+  #
+  # FOUR backends, not one. A production proxy fronts a POOL and spends real
+  # work choosing a member per request; one origin measured only the forwarding
+  # path. Each is deliberately SMALLER than the old single box (2 cores, was 4)
+  # while the pool is larger in total (8 cores, was 4), so no proxy is ever
+  # waiting on the origin — see the `direct` note in variables.tf for the
+  # calibration that proves it rather than assumes it.
+  #
+  # The count is 4 in three places that cannot read each other: here, the
+  # `backend0..backend3` services in compose.yaml, and the endpoint lists in
+  # proxies/*/. Changing it means changing all three — bench/src/suite.zig
+  # iterates whatever it is handed, so it is the one place that does not care.
+  backend_names = ["backend0", "backend1", "backend2", "backend3"]
+
+  backends = {
+    for i, name in local.backend_names : name => {
+      cores  = var.backend_cores
+      memory = var.backend_memory
+      ip     = cidrhost(local.subnet_cidr, 13 + i)
+    }
   }
 
+  hosts = merge({
+    loadgen = { cores = var.loadgen_cores, memory = var.loadgen_memory, ip = "10.10.0.11" }
+    proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, ip = "10.10.0.12" }
+  }, local.backends)
+
+  # Ordered, so BACKEND_IPS[0] is backend0 everywhere — `direct` calibrates
+  # against that one specifically, and a map's iteration order must not decide
+  # which host that is.
+  backend_ips = [for name in local.backend_names : local.backends[name].ip]
+
   known_hosts = join("\n", [
-    for h in ["proxy", "backend"] :
+    for h in concat(["proxy"], local.backend_names) :
     "${local.hosts[h].ip} ${trimspace(tls_private_key.host.public_key_openssh)}"
   ])
 }
@@ -195,7 +222,7 @@ resource "yandex_compute_instance" "host" {
   metadata = {
     ssh-keys = "ubuntu:${trimspace(tls_private_key.fleet.public_key_openssh)}"
 
-    # One template for three roles — see the header comment in the template for
+    # One template for every role — see the header comment in the template for
     # why. The two secrets are passed only to the role that may hold them, so
     # the private key is absent from the peers' rendered user-data, not merely
     # unused by it.
@@ -213,7 +240,7 @@ resource "yandex_compute_instance" "host" {
       bench_profiles       = var.bench_profiles
       bench_proxies        = var.bench_proxies
       proxy_ip             = local.hosts["proxy"].ip
-      backend_ip           = local.hosts["backend"].ip
+      backend_ips          = join(",", local.backend_ips)
     })
 
     # With no public address and no inbound rule, the serial console is the only

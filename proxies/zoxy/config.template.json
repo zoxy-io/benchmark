@@ -1,7 +1,7 @@
 {
   "listeners": [{ "bind": "0.0.0.0:@PORT@", "cluster": "origin", "protocol": "http" }],
   "clusters": {
-    "origin": { "endpoints": ["@BACKEND_ADDR@"] }
+    "origin": { "endpoints": [@BACKEND_ADDRS@], "pick": "rr" }
   },
   "admin": { "bind": "0.0.0.0:9101" },
   "timeouts": {

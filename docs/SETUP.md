@@ -37,12 +37,16 @@ and destroys every night is only the fleet itself (`cloud/main.tf`).
 * The GitHub repo `zoxy-io/benchmark`, with Actions enabled.
 * Enough quota in the folder for one fleet:
 
-  | | cores | memory | disk |
-  |---|---|---|---|
-  | loadgen | 4 | 8 GB | 30 GB network-ssd |
-  | proxy | 2 | 4 GB | 30 GB network-ssd |
-  | backend | 4 | 8 GB | 30 GB network-ssd |
-  | **total** | **10** (at `core_fraction = 100`) | **20 GB** | **90 GB** |
+  | | count | cores each | memory each | disk each |
+  |---|---|---|---|---|
+  | loadgen | 1 | 4 | 8 GB | 30 GB network-ssd |
+  | proxy | 1 | 4 | 8 GB | 30 GB network-ssd |
+  | backend0..backend3 | 4 | 2 | 4 GB | 30 GB network-ssd |
+  | **total** | **6 VMs** | **16** (at `core_fraction = 100`) | **32 GB** | **180 GB** |
+
+  The origin is a four-node pool rather than one box, so this is 6 VMs / 16
+  cores where an earlier fleet was 3 / 12. Check the folder's *instance* quota
+  as well as its core quota — six is past several defaults.
 
   Plus, per run, one VPC network, one subnet, one route table, one NAT
   (shared-egress) gateway and one security group. An orphaned fleet holds all of
@@ -459,7 +463,8 @@ Check, in this order:
    ```sh
    yc storage s3api list-objects --bucket "$BENCH_BUCKET" --prefix "runs/" # [verify]
    ```
-   Expect `payload.tar`, `boot-ok.loadgen`, `boot-ok.proxy`, `boot-ok.backend`,
+   Expect `payload.tar`, `boot-ok.loadgen`, `boot-ok.proxy`, `boot-ok.backend0`
+   through `boot-ok.backend3`,
    then `log`, `results.tar`, `DONE`. A missing `boot-ok.<role>` names the host
    that failed to boot; the serial console (`serial-port-enable`) is the only
    other way in.
@@ -510,7 +515,7 @@ out from under you.
 **The IAM token expires before a long run does.** Federated tokens are
 short-lived and the job is allowed 150 minutes. The workflow re-mints the token
 immediately before `tofu destroy` for exactly this reason. If you restructure the
-teardown, keep that step — a teardown that 401s leaves three VMs running until
+teardown, keep that step — a teardown that 401s leaves six VMs running until
 someone notices.
 
 **Cancelling a run is not free.** `concurrency.cancel-in-progress` is `false` on

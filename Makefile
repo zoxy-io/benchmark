@@ -9,7 +9,7 @@
 #   make test        bench unit tests
 #   make local       run the benchmark on THIS machine (see the caveat below)
 #   make report      render results/latest -> report.json + report.html
-#   make up / down   local: start/stop the backend origin
+#   make up / down   local: start/stop the backend origin pool (all four)
 #
 # Ramp parameters are NOT knobs any more — they are compiled into
 # bench/src/profile.zig as the c1k and c10k profiles, because eleven env vars

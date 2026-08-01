@@ -1,9 +1,15 @@
 # L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
 # build — every proxy now parses HTTP/1.1 and reverse-proxies requests). Worker
 # count is hardcoded to 1 via --concurrency in the compose command (1 CPU).
-# STRICT_DNS because the upstream is a hostname (compose service locally,
-# extra_hosts entry in cloud). No access log. Envoy keeps both the downstream
+# STRICT_DNS because the upstreams are hostnames (compose services locally,
+# extra_hosts entries in cloud). No access log. Envoy keeps both the downstream
 # and the pooled upstream connections alive by default.
+#
+# The upstream is a four-node POOL (backend0..backend3) and the pick policy is
+# pinned to ROUND_ROBIN, matching every other proxy in the comparison. Envoy's
+# own default happens to be round-robin too, so this is a statement of intent
+# rather than a change — but it now decides something, so it is not left
+# implicit.
 #
 # @PORT@ is rendered by compose.yaml's `command` (a sed pass before envoy
 # starts) rather than left at a fixed 8080 — see x-proxy-common there for why
@@ -59,10 +65,23 @@ static_resources:
             max_pending_requests: 200000
             max_requests: 200000
             max_retries: 200000
+      # Four origins in ONE locality, so ROUND_ROBIN spreads evenly across all
+      # of them. Splitting them into separate `endpoints` entries would make
+      # them separate localities, and envoy weights localities before it
+      # round-robins within one — a different policy than the other proxies run.
       load_assignment:
         cluster_name: origin
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: backend, port_value: 9000 }
+                    socket_address: { address: backend0, port_value: 9000 }
+              - endpoint:
+                  address:
+                    socket_address: { address: backend1, port_value: 9000 }
+              - endpoint:
+                  address:
+                    socket_address: { address: backend2, port_value: 9000 }
+              - endpoint:
+                  address:
+                    socket_address: { address: backend3, port_value: 9000 }

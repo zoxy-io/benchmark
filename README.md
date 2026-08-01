@@ -6,7 +6,7 @@ keeping up, and the output is one self-contained HTML report overlaying
 **latency, CPU, memory and achieved req/s against offered load**.
 
 It runs **unattended every night** ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)):
-CI creates a throwaway three-VM fleet with no public addresses, the loadgen
+CI creates a throwaway six-VM fleet with no public addresses, the loadgen
 drives the whole suite itself, results come back through Object Storage, the
 fleet is destroyed, and the summary is posted to Discord and published to Pages.
 Traefik and nginx-as-a-proxy were part of an earlier comparison and were
@@ -17,16 +17,22 @@ sat unexercised.
 Every proxy is an **HTTP/1.1 reverse proxy** doing the same job — HAProxy
 `mode http`, Envoy `http_connection_manager`, Pingora's ~90-line Rust binary on
 Cloudflare's framework, zoxy's phase-1 `http` listener: parse each request,
-forward it to the origin over a pooled keep-alive upstream, stream the
-response back. The generator speaks HTTP end-to-end and the origin nginx is
-the HTTP endpoint.
+**pick an origin from a four-node pool**, forward it over a pooled keep-alive
+upstream, stream the response back. The generator speaks HTTP end-to-end and
+the origins are nginx.
+
+The pool is what makes the job the one a production proxy actually does: a
+single origin measures forwarding, and forwarding alone. Balancing across a set
+is the other half, and it is the half where proxies differ.
 
 ```
              0 ──────── linear ramp ────────► MAX_RATE (100k)
-        zrk ───────► proxy-under-test ───────────► nginx origin
- (open loop, CO-     (pinned core, 4 GiB cap,      (canned 64B..100k
-  corrected)          ONE at a time)                bodies, 4x cpus)
-      │                       │
+                                                  ┌─► backend0 ─┐
+        zrk ───────► proxy-under-test ────────────┼─► backend1  │  nginx origin
+ (open loop, CO-     (pinned core, 4 GiB cap,     ├─► backend2  │  pool: canned
+  corrected)          ONE at a time)              └─► backend3 ─┘  64B..100k
+      │                       │                    round-robin     bodies, 2
+      │                       │                                    cpus each
       │                       └── cAdvisor :8081 ── sampled at 1Hz
       │                            (cpu + working-set, into the run's
       └── per-1s NDJSON             own artifacts — no Prometheus)
@@ -35,7 +41,7 @@ the HTTP endpoint.
              └─► bench report ── report.json + report.html
 ```
 
-All of that happens **inside the VPC**. The three VMs have no public IPs; the
+All of that happens **inside the VPC**. The six VMs have no public IPs; the
 only things that cross the boundary are the payload going in and the results
 coming out, both through Object Storage.
 
@@ -44,7 +50,7 @@ coming out, both through Object Storage.
 **Containers are the deploy spec.** Each proxy is a compose service with a
 static config and the *same* enforced cpu/memory limits (service-level `cpus` /
 `mem_limit` — compose applies these without swarm); locally the whole stack is
-one compose project, in the cloud the very same `compose.yaml` runs across three
+one compose project, in the cloud the very same `compose.yaml` runs across six
 VMs with a small overlay (`compose.cloud.yaml`: host networking, cpuset, peer
 IPs). **The measurement is one deterministic open-loop ramp** —
 `bench` (wrk2-lineage, HdrHistogram, calling zrk's `runner.run` in-process) offers `START_RATE → MAX_RATE`
@@ -57,7 +63,7 @@ there is no second loadgen and no VU/goroutine-heavy generator. **Runs are
 guarded**: `CONNECTIONS` caps in-flight concurrency (zrk keeps one request in
 flight per connection — too high and past saturation it piles connections and
 collapses the path), and a `direct` pseudo-proxy calibrates that the origin
-itself saturates above the proxies. **Local = plumbing, cloud = numbers**: quote the 3-VM cloud
+itself saturates above the proxies. **Local = plumbing, cloud = numbers**: quote the 6-VM cloud
 runs.
 
 ## Running it
@@ -83,7 +89,7 @@ make build     # the bench binary (static musl)
 make test      # unit tests
 make local     # a whole run on THIS machine — see the caveat below
 make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
-make up/down   # the backend origin, for poking at a proxy by hand
+make up/down   # the backend origin pool, for poking at a proxy by hand
 ```
 
 `make local` drives the same suite against your own docker daemon, with no
@@ -125,8 +131,8 @@ noticed.
   vendored OpenSSL, so zoxy builds and runs on ARM natively — io_uring just
   can't be *emulated*.)
 - **zoxy does no DNS**: endpoints must be IP literals. The entrypoint resolves
-  `backend` once at start (compose DNS locally, `extra_hosts` in cloud) and
-  renders the literal into the config.
+  all four pool members once at start (compose DNS locally, `extra_hosts` in
+  cloud) and renders the literals into the config.
 - **zoxy caps admitted connections per process**: on the phase-1 L7 path,
   concurrency is bounded by `limits.conn_slots` (stock default 1386, ~32 MiB —
   zoxy prints the exact figure at startup) with a shared upstream keep-alive
@@ -134,17 +140,39 @@ noticed.
   per admitted connection at saturation, not per in-flight request, so a conn
   ceiling above the upstream ceiling is admission capacity that can't be
   served — `bench` pins both explicitly per profile (`proxy_env` in
-  `profile.zig`): 1386/1386 for `c1k`, 11464/11464 (the io_uring
-  completion-queue ceiling) for `c10k`. Connections beyond the ceiling get a
-  static shed response. Every other proxy has no such per-process cap.
+  `profile.zig`): 1386 conn / **5544 upstream** for `c1k`, 11464/11464 (the
+  io_uring completion-queue ceiling) for `c10k`. The upstream pool is 4x
+  conn_slots at `c1k` because zoxy parks a keep-alive upstream **per endpoint**
+  and round-robin rotates one downstream connection through all four backends;
+  pinned equal, as it was with a single origin, zoxy would shed on
+  `zoxy_l7_shed_upstream_slots` and the number would measure the pool. `c10k`
+  cannot do the same — it is already at the ceiling — so it redials instead,
+  which is a real and acknowledged handicap at that profile. Connections beyond
+  the ceiling get a static shed response. Every other proxy has no such
+  per-process cap.
 - **The zoxy build stays fresh**: `ZOXY_REF` defaults to `main` on purpose —
   the nightly exists to catch a regression the morning after it lands. The
   Dockerfile's clone layer is cache-busted on the GitHub commits API response
   for `$ZOXY_REF`, not on the ref string, so a `main` build always reflects
   main's current HEAD. Pin a SHA only to reproduce a specific past run.
-- **Origin headroom**: backend gets several times the proxy's cores; the
-  `direct` pseudo-proxy (in `BENCH_PROXIES`/`--proxies`) proves the origin
-  saturates well above the proxies.
+- **Same balancing policy for every proxy**: the origin is a four-node pool and
+  every proxy is pinned to **strict round-robin** — haproxy `balance
+  roundrobin`, envoy `lb_policy: ROUND_ROBIN`, pingora an atomic counter, zoxy
+  `"pick": "rr"`. Round-robin is not everyone's default (zoxy's is p2c, which
+  would very likely serve it better), and that is the point: an unpinned policy
+  makes the chart a comparison of endpoint-pick algorithms wearing proxy names.
+  Nobody active-health-checks either — haproxy and envoy ship it, pingora as
+  written does not, and every backend is up for the whole run, so a member that
+  did fail should surface as errors rather than be silently routed around by
+  some proxies and not others.
+- **Origin headroom**: the pool has 8 cores against the proxy's 1, and each
+  member takes ~1/4 of the offered load. The `direct` pseudo-proxy (in
+  `BENCH_PROXIES`/`--proxies`) is what proves that rather than asserting it —
+  zrk resolves one address, so `direct` puts **100% of the load on backend0
+  alone**, four times what that host sees in a proxied run. A direct row above
+  the fastest proxy therefore proves the whole pool has 4x+ headroom. If direct
+  ever drops *below* a proxy, the baseline has stopped bounding anything and
+  every number above it is suspect — raise `backend_cores`.
 
 ## Layout
 
@@ -159,9 +187,9 @@ bench/src/{svg,html}.zig  inline-SVG charts -> a self-contained report.html
 bench/src/{ycs,commands}  Object Storage, the compute sweep, the CLI
 compose.yaml              every service, proxies behind profiles, limits enforced
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
-proxies/<p>/              one static config per proxy (upstream is always `backend`)
-backend/                  nginx origin, canned bodies generated at start
-cloud/                    terraform: VPC + 3 ephemeral VMs, no public IPs
+proxies/<p>/              one static config per proxy (upstream is the backend0..3 pool)
+backend/                  nginx origin, canned bodies generated at start (x4)
+cloud/                    terraform: VPC + 6 ephemeral VMs, no public IPs
 docs/SETUP.md             the one-time cloud setup CI cannot do for you
 .github/workflows/        the nightly
 ```

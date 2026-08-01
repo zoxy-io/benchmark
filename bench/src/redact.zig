@@ -142,7 +142,7 @@ pub fn assertNoIps(what: []const u8, text: []const u8) !void {
 /// `register` — which works for `remote.zig`, which dials the fleet itself,
 /// but not for `bench wait`: it runs on the CI runner, relaying a log object
 /// the LOADGEN wrote on a different machine entirely, and the runner never
-/// learns the fleet's private addresses (PROXY_IP/BACKEND_IP are documented as
+/// learns the fleet's private addresses (PROXY_IP/BACKEND_IPS are documented as
 /// VM-side only in CONTRACT.md). This finds anything IP-shaped instead — the
 /// same blunt pattern `assertNoIps` already applies to artifacts, and that
 /// nightly.yml's own `sed` applies to `tofu`'s resource diff. Private or

@@ -1,7 +1,8 @@
 # zoxy-benchmark v2 — containers ARE the deploy spec.
 #
 # One file describes every role; compose profiles pick what runs where:
-#   backend     nginx origin                    (local: always; cloud: backend VM)
+#   backend     the four-node nginx origin POOL (local: all four containers on
+#               this host; cloud: one container per backend VM, profile backendN)
 #   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|pingora|envoy)
 # The comparison is direct/zoxy/haproxy/pingora/envoy. traefik and nginx were
 # removed rather than parked: an unexercised proxy config rots — its TLS/ALPN
@@ -45,10 +46,23 @@ x-proxy-common: &proxy-common
       soft: 1048576
       hard: 1048576
   restart: "no"
+  # All four members, because a proxy that starts against a half-ready pool
+  # round-robins a share of its requests into a refused connection. `required:
+  # false` is what makes the same block correct in cloud, where every backend
+  # runs on its own VM and none of these services exists on the proxy host.
   depends_on:
-    backend:
+    backend0:
       condition: service_healthy
-      required: false # cloud: backend runs on another VM, service absent there
+      required: false # cloud: backends run on other VMs, services absent there
+    backend1:
+      condition: service_healthy
+      required: false
+    backend2:
+      condition: service_healthy
+      required: false
+    backend3:
+      condition: service_healthy
+      required: false
 
 # PROXY_PORT: the actual fix for the run #25/#26 start failures. `bench`
 # gives every (profile, proxy) TURN its own host port (see
@@ -67,7 +81,7 @@ x-proxy-common: &proxy-common
 # startup, from the container env below; envoy has no such mechanism, so
 # its `command` runs `sed` over the template BEFORE compose parsing ever
 # matters, baking the same parse-time value in as a literal. zoxy's
-# entrypoint.sh already renders a template this same way for @BACKEND_ADDR@,
+# entrypoint.sh already renders a template this same way for @BACKEND_ADDRS@,
 # so @PORT@ just rides along.
 #
 # Local mode never sets this (see runOne's `isLocal` branch) — bridge
@@ -116,37 +130,81 @@ x-healthcheck-bash: &healthcheck-bash
     - -c
     - 'exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT:-8080} && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
 
+# --------------------------------------------------------------- the origin --
+# FOUR backends, not one, because a production proxy fronts a pool: choosing a
+# member per request is part of the job being measured, and a single origin
+# skipped it entirely. Every proxy round-robins across backend0..backend3 (see
+# proxies/*/ — the policy is pinned to round-robin everywhere so the comparison
+# stays proxy-vs-proxy rather than LB-algorithm-vs-LB-algorithm).
+#
+# The four definitions are identical bar the name, which is what the anchor is
+# for — four origins that drifted apart would make a proxy's throughput depend
+# on which member each request drew.
+#
+# TWO profiles each, and the reason is the cloud/local split:
+#
+#   * `backend` starts all four at once. That is the LOCAL shape — one docker
+#     host, four containers, bridge DNS resolving backend0..backend3.
+#   * `backendN` starts exactly one. That is the CLOUD shape — four VMs under
+#     host networking, each running its own container bound to :9000 on its own
+#     address. Bringing up the `backend` profile there would try to bind :9000
+#     four times on one host and fail three of them.
+#
+# Only backend0 publishes a host port: it is what `direct` measures locally, and
+# the other three are reached by the proxies over the compose network, which
+# needs no mapping. In cloud, `ports:` is reset by the overlay anyway.
+x-backend: &backend
+  image: nginx:1.27-alpine
+  # 2, matching cloud/variables.tf's backend_cores — it becomes nginx's
+  # worker_processes, so a mismatch means the origin is running more or fewer
+  # workers than the box has cores.
+  cpus: ${BACKEND_CPUS:-2}
+  mem_limit: ${BACKEND_MEM:-1g}
+  environment:
+    # the image's envsubst hook renders the template into /etc/nginx at
+    # start; BACKEND_CPUS must be an integer (it becomes worker_processes)
+    BACKEND_CPUS: ${BACKEND_CPUS:-2}
+    NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+  volumes:
+    - ./backend/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
+  tmpfs:
+    - /srv/bodies # canned 64B/1k/10k/100k responses live in RAM
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/64"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
 services:
   # ---------------------------------------------------------------- origin --
-  backend:
-    image: nginx:1.27-alpine
-    container_name: backend
-    profiles: [backend]
-    cpus: ${BACKEND_CPUS:-4}
-    mem_limit: ${BACKEND_MEM:-1g}
-    environment:
-      # the image's envsubst hook renders the template into /etc/nginx at
-      # start; BACKEND_CPUS must be an integer (it becomes worker_processes)
-      BACKEND_CPUS: ${BACKEND_CPUS:-4}
-      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
-    volumes:
-      - ./backend/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
-      - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
-    tmpfs:
-      - /srv/bodies # canned 64B/1k/10k/100k responses live in RAM
+  backend0:
+    <<: *backend
+    container_name: backend0
+    profiles: [backend, backend0]
     ports:
       - "9000:9000"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/64"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
+
+  backend1:
+    <<: *backend
+    container_name: backend1
+    profiles: [backend, backend1]
+
+  backend2:
+    <<: *backend
+    container_name: backend2
+    profiles: [backend, backend2]
+
+  backend3:
+    <<: *backend
+    container_name: backend3
+    profiles: [backend, backend3]
 
   # ------------------------------------------------------- proxies under test --
   # All six: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
   # an `http` listener, so EVERY proxy now parses requests and reverse-proxies
-  # them), upstream = backend:9000, keep-alive both legs, no access logs. The
-  # generator speaks h1 end-to-end; the backend nginx is the HTTP origin.
+  # them), upstream = the backend0..backend3 pool, keep-alive both legs, no
+  # access logs. The generator speaks h1 end-to-end; the origin is nginx.
   # container_name == service name == the `name` label cAdvisor exports, which
   # is how the report joins CPU/mem to a proxy.
   zoxy:
@@ -197,9 +255,11 @@ services:
     # capacity that couldn't be served). Past the admission ceiling zoxy sheds
     # with a static error. Every other proxy has no such cap.
     # It also does no DNS — endpoints must be IP literals, so the entrypoint
-    # resolves `backend` (env below) once at start and renders the template.
+    # resolves each name in BACKENDS (below) once at start and renders the
+    # template. `pick` is pinned to round-robin in config.template.json; zoxy's
+    # own default is p2c.
     environment:
-      BACKEND: backend:9000
+      BACKENDS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
       ZOXY_WORKERS: 1
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
       ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
@@ -218,11 +278,17 @@ services:
     container_name: haproxy
     profiles: [haproxy]
     environment:
-      # hostname locally (bridge DNS + runtime resolver); the cloud overlay
-      # replaces it with an IP literal because 127.0.0.11 doesn't exist there
-      BACKEND_ADDR: backend:9000
+      # hostnames locally (bridge DNS + runtime resolver); the cloud overlay
+      # replaces each with an IP literal because 127.0.0.11 doesn't exist there.
+      # One variable per pool member rather than a list: haproxy.cfg needs a
+      # `server` line per backend anyway, and its native env expansion has no
+      # way to split a delimited string.
+      BACKEND0_ADDR: backend0:9000
+      BACKEND1_ADDR: backend1:9000
+      BACKEND2_ADDR: backend2:9000
+      BACKEND3_ADDR: backend3:9000
       # haproxy.cfg's `bind` reads this via its OWN native env-var expansion
-      # (same mechanism BACKEND_ADDR already uses) — haproxy.cfg is a static
+      # (same mechanism BACKENDn_ADDR already uses) — haproxy.cfg is a static
       # mounted file, so compose's `${}` interpolation never reaches it.
       PROXY_PORT: ${PROXY_PORT:-8080}
     volumes:
@@ -265,7 +331,8 @@ services:
     <<: *proxy-common
     # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a
     # tiny L7 HTTP reverse-proxy binary on it (src/main.rs), hardcoded to 1
-    # worker thread; UPSTREAM is resolved once at startup and pooled/kept alive.
+    # worker thread; each UPSTREAMS member is resolved once at startup, pooled
+    # and kept alive, and picked round-robin per request.
     build:
       context: ./proxies/pingora
       args:
@@ -279,7 +346,9 @@ services:
       # reads LISTEN once at its own startup, so the resolved literal is all it
       # ever needs. See x-proxy-common for why the port varies per turn.
       LISTEN: 0.0.0.0:${PROXY_PORT:-8080}
-      UPSTREAM: backend:9000
+      # Comma-separated pool; main.rs resolves each once at startup and
+      # round-robins across them with an atomic counter.
+      UPSTREAMS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
     ports:
       - "8080:8080"
     healthcheck: *healthcheck-bash

@@ -28,7 +28,13 @@ const Allocator = std.mem.Allocator;
 
 pub const Fleet = struct {
     proxy_ip: []const u8,
-    backend_ip: []const u8,
+    /// The origin POOL, in the order terraform pinned it: index 0 is backend0.
+    /// A slice rather than a count, so growing or shrinking the pool is a
+    /// terraform + compose + proxy-config change and touches nothing here.
+    ///
+    /// Order is load-bearing in exactly one place: `direct` measures
+    /// `backend_ips[0]`. Everything else treats the pool as a set.
+    backend_ips: []const []const u8,
     /// null selects LOCAL mode: compose runs against this machine's docker
     /// daemon and both peers are loopback. The numbers a local run produces are
     /// NOT comparable to a fleet run — the generator shares CPU, cache and
@@ -55,8 +61,19 @@ pub const Fleet = struct {
         return self.host(self.proxy_ip);
     }
 
-    pub fn backendHost(self: Fleet) remote.Host {
-        return self.host(self.backend_ip);
+    pub fn backendHost(self: Fleet, i: usize) remote.Host {
+        return self.host(self.backend_ips[i]);
+    }
+
+    /// The compose profile that starts the single backend belonging to member
+    /// `i` — `backend0`..`backend3`. Locally the whole pool comes up under the
+    /// `backend` profile instead; in cloud each VM must start exactly its own,
+    /// or four containers race for :9000 on one host.
+    pub fn backendProfile(self: Fleet, arena: Allocator, i: usize) ![]const u8 {
+        return if (self.isLocal())
+            "backend"
+        else
+            std.fmt.allocPrint(arena, "backend{d}", .{i});
     }
 
     /// Locally the base compose file IS the local configuration — bridge
@@ -89,6 +106,10 @@ pub const Options = struct {
 
 /// Deadlines. Every one of these was unbounded in the bash driver.
 const deadline = struct {
+    /// PER POOL MEMBER, and they are started in sequence, so the pre-measurement
+    /// phase is bounded by this times the pool size. Not folded into `turn`
+    /// below: this runs once, before any proxy's turn, and a failure here aborts
+    /// the whole profile rather than costing one proxy its slot.
     const backend_up: u64 = 180 * std.time.ns_per_s;
     const build: u64 = 900 * std.time.ns_per_s;
     const start: u64 = 120 * std.time.ns_per_s;
@@ -492,35 +513,47 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         redact.log("bench: cAdvisor did not start ({s}); CPU and memory will be absent", .{@errorName(e)});
     };
 
-    // --- backend: the origin every proxy forwards to.
+    // --- the origin pool every proxy forwards to.
     //
     // The bash driver tolerated a backend failure with `|| true` and then died
     // 25s later on the first proxy's warm probe, because `curl -sf` fails on the
     // 502 a proxy returns with a dead origin. That bought nothing except moving
     // the diagnosis away from the cause.
-    _ = remote.check(
-        gpa,
-        arena,
-        io,
-        opts.fleet.backendHost(),
-        "backend up",
-        try std.fmt.allocPrint(arena, "cd {s} && {s} --profile backend up -d --wait", .{
-            opts.fleet.remote_dir, opts.fleet.composeCmd(),
-        }),
-        deadline.backend_up,
-    ) catch |e| {
-        redact.log("bench: backend never came up: {s}", .{@errorName(e)});
-        for (opts.proxies) |name| {
-            try records.append(arena, .{
-                .name = name,
-                .status = .skipped,
-                .stage = .start,
-                .err = "backend origin never came up",
-            });
-        }
-        try flush.write();
-        return .{ .records = try records.toOwnedSlice(arena), .aborted = true };
-    };
+    //
+    // ALL-OR-NOTHING across the pool, for a sharper version of the same reason:
+    // a missing member does not fail anything, it just makes every proxy
+    // round-robin a quarter of its requests into a refused connection. That
+    // produces a complete set of plausible-looking numbers describing a fleet
+    // that was never whole. Locally the first iteration starts the entire pool
+    // (one `backend` profile) and the rest are no-ops against the same daemon.
+    for (opts.fleet.backend_ips, 0..) |_, i| {
+        _ = remote.check(
+            gpa,
+            arena,
+            io,
+            opts.fleet.backendHost(i),
+            try std.fmt.allocPrint(arena, "backend {d} up", .{i}),
+            try std.fmt.allocPrint(arena, "cd {s} && {s} --profile {s} up -d --wait", .{
+                opts.fleet.remote_dir,
+                opts.fleet.composeCmd(),
+                try opts.fleet.backendProfile(arena, i),
+            }),
+            deadline.backend_up,
+        ) catch |e| {
+            redact.log("bench: backend {d} never came up: {s}", .{ i, @errorName(e) });
+            for (opts.proxies) |name| {
+                try records.append(arena, .{
+                    .name = name,
+                    .status = .skipped,
+                    .stage = .start,
+                    .err = "an origin in the backend pool never came up",
+                });
+            }
+            try flush.write();
+            return .{ .records = try records.toOwnedSlice(arena), .aborted = true };
+        };
+        if (opts.fleet.isLocal()) break;
+    }
 
     // --- build every proxy BEFORE any measurement.
     //
@@ -832,8 +865,15 @@ fn runOne(
     // some other commit than the one the report will name.
     var stale_build = false;
 
+    // `direct` measures backend0 ALONE, taking 100% of the offered load. zrk
+    // resolves exactly one address, so it cannot fan out across the pool — and
+    // the single member is the more useful baseline anyway: in a proxied run
+    // that same host sees roughly a quarter of the load, so a direct row that
+    // clears the fastest proxy proves the pool has 4x+ headroom. A direct row
+    // that does NOT clear it means the baseline has stopped bounding anything
+    // and the proxy numbers above it are suspect (cloud/variables.tf).
     const target = if (direct)
-        try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ip, p.req_path })
+        try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ips[0], p.req_path })
     else
         try std.fmt.allocPrint(arena, "http://{s}:{d}{s}", .{ opts.fleet.proxy_ip, port, p.req_path });
 
@@ -1372,12 +1412,13 @@ fn teardownProxy(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: [
 
 /// Environment prefix for a remote `docker compose` invocation.
 ///
-/// Carries BACKEND_IP as well as the profile's proxy tuning. compose.cloud.yaml
-/// interpolates it into every proxy's `extra_hosts` (zoxy does no DNS, so the
-/// origin must be an address literal) and into pingora's BACKEND_ADDR. Omitting
-/// it does not fail loudly — compose substitutes an empty string and each proxy
-/// starts with `extra_hosts: "backend:"`, so the failure surfaces much later as
-/// a warm probe that never gets a 200.
+/// Carries the backend pool's addresses as well as the profile's proxy tuning.
+/// compose.cloud.yaml interpolates them into every proxy's `extra_hosts` (zoxy
+/// does no DNS, so the origin must be an address literal) and into haproxy's
+/// BACKENDn_ADDR. Omitting one does not fail loudly — compose substitutes an
+/// empty string and the proxy starts with `extra_hosts: "backend2:"`, so the
+/// failure surfaces much later as a warm probe that never gets a 200, or worse,
+/// as a proxy that serves three quarters of its requests and looks merely slow.
 /// Base of the per-turn port pool used for the CLOUD proxy listener, so a
 /// proxy's Nth start on this host never has to reuse the exact host port its
 /// (N-1)th start used.
@@ -1422,9 +1463,16 @@ fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
 
 fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, port: ?u16) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
-    // Only the cloud overlay interpolates BACKEND_IP; locally the proxies reach
-    // the origin by its compose service name over docker DNS.
-    if (!fleet.isLocal()) try buf.print(arena, "BACKEND_IP={s} ", .{fleet.backend_ip});
+    // Only the cloud overlay interpolates BACKENDn_IP; locally the proxies reach
+    // the pool by compose service name over docker DNS. One variable per member
+    // because `extra_hosts` is a static YAML list — compose has no way to expand
+    // a delimited string into entries, so the count is fixed in the compose
+    // files and this just has to agree with it.
+    if (!fleet.isLocal()) {
+        for (fleet.backend_ips, 0..) |ip, i| {
+            try buf.print(arena, "BACKEND{d}_IP={s} ", .{ i, ip });
+        }
+    }
     // Without this, compose falls back to `${ZOXY_REF:-main}` and builds a
     // floating main rather than the pinned commit — see profile.zig's note.
     try buf.print(arena, "ZOXY_REF={s} ", .{profile.zoxy_ref});
@@ -1537,24 +1585,44 @@ test "isKnownProxy excludes direct, which has no container" {
     try std.testing.expect(!isKnownProxy("direct"));
 }
 
-test "envPrefix carries BACKEND_IP as well as the profile's tuning" {
+const test_fleet: Fleet = .{
+    .proxy_ip = "10.10.0.12",
+    .backend_ips = &.{ "10.10.0.13", "10.10.0.14", "10.10.0.15", "10.10.0.16" },
+    .ssh = .{ .key_path = "k", .known_hosts = "kh" },
+};
+
+test "envPrefix carries EVERY backend address as well as the profile's tuning" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const fleet: Fleet = .{
-        .proxy_ip = "10.10.0.12",
-        .backend_ip = "10.10.0.13",
-        .ssh = .{ .key_path = "k", .known_hosts = "kh" },
-    };
-    const s = try envPrefix(arena, profile.c10k, fleet, 18096);
+    const s = try envPrefix(arena, profile.c10k, test_fleet, 18096);
 
-    // Without this every proxy starts with extra_hosts "backend:" and fails its
-    // warm probe much later, with a symptom that does not name the cause.
-    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND_IP=10.10.0.13") != null);
+    // Miss one and that proxy starts with extra_hosts "backendN:" — which does
+    // not fail its warm probe, because the other three still answer. It just
+    // round-robins a quarter of its requests into a refused connection and
+    // reports a number that looks like a slow proxy.
+    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND0_IP=10.10.0.13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND1_IP=10.10.0.14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND2_IP=10.10.0.15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND3_IP=10.10.0.16") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT=18096") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11464") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11464") != null);
+}
+
+test "c1k widens zoxy's upstream pool to cover every endpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // zoxy parks a keep-alive upstream PER ENDPOINT, and round-robin makes one
+    // downstream connection rotate through all four — so the upstream pool has
+    // to be a multiple of conn_slots, not equal to it. Equal is what shipped
+    // before the origin became a pool, and it would shed here.
+    const s = try envPrefix(arena, profile.c1k, test_fleet, null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=1386") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=5544") != null);
 }
 
 test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
@@ -1562,13 +1630,23 @@ test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const fleet: Fleet = .{
-        .proxy_ip = "10.10.0.12",
-        .backend_ip = "10.10.0.13",
-        .ssh = .{ .key_path = "k", .known_hosts = "kh" },
-    };
-    const s = try envPrefix(arena, profile.c1k, fleet, null);
+    const s = try envPrefix(arena, profile.c1k, test_fleet, null);
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT") == null);
+}
+
+test "backendProfile starts one member per VM in cloud, the whole pool locally" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // In cloud each backend VM must start ONLY its own container: the overlay
+    // is host-networked, so bringing up the shared `backend` profile there
+    // would have four containers race for :9000 on one host.
+    try std.testing.expectEqualStrings("backend0", try test_fleet.backendProfile(arena, 0));
+    try std.testing.expectEqualStrings("backend3", try test_fleet.backendProfile(arena, 3));
+
+    const local: Fleet = .{ .proxy_ip = "127.0.0.1", .backend_ips = &.{"127.0.0.1"}, .ssh = null };
+    try std.testing.expectEqualStrings("backend", try local.backendProfile(arena, 0));
 }
 
 test "proxyPort never repeats within one suite dispatch, including a proxy's own repeat turn across profiles" {

@@ -5,52 +5,69 @@
 #     (ports/networks !reset because they conflict with host networking).
 #  2. cpuset pinning — proxy gets dedicated cores; on a dedicated VM this also
 #     makes thread autodetection agree with the cpu limit.
-#  3. peer addressing via env: proxy configs always dial the hostname
-#     `backend`; here extra_hosts maps it to the backend VM's private IP
-#     (`bench suite` passes BACKEND_IP to each remote compose invocation).
-#     zoxy itself does no DNS — its entrypoint resolves `backend` (via this
-#     same extra_hosts entry) and renders the IP literal into its config.
+#  3. peer addressing via env: proxy configs always dial the hostnames
+#     `backend0`..`backend3`; here extra_hosts maps each to the matching backend
+#     VM's private IP (`bench suite` passes BACKEND0_IP..BACKEND3_IP to each
+#     remote compose invocation). zoxy itself does no DNS — its entrypoint
+#     resolves all four (via these same extra_hosts entries) and renders IP
+#     literals into its config.
+#
+# Each backend VM runs ONE container, brought up by its own `backendN` profile,
+# bound to :9000 on its own address. The four service overrides below are
+# therefore not four containers on one host — they are the same override applied
+# on four different hosts, of which exactly one matches each time.
 
 x-host-net: &host-net
   network_mode: host
   ports: !reset []
 
+# Every proxy dials the same four names. Anchored so a fifth backend cannot be
+# added to three proxies and forgotten in the fourth — which would not fail, it
+# would just quietly measure that proxy against a smaller pool.
+x-backend-hosts: &backend-hosts
+  - "backend0:${BACKEND0_IP}"
+  - "backend1:${BACKEND1_IP}"
+  - "backend2:${BACKEND2_IP}"
+  - "backend3:${BACKEND3_IP}"
+
 services:
-  backend:
+  backend0:
+    <<: *host-net
+  backend1:
+    <<: *host-net
+  backend2:
+    <<: *host-net
+  backend3:
     <<: *host-net
 
   zoxy:
     <<: *host-net
     cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
+    extra_hosts: *backend-hosts
 
   haproxy:
     <<: *host-net
     cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
+    extra_hosts: *backend-hosts
     environment:
-      # IP literal: haproxy skips runtime DNS for numeric addresses, keeping
+      # IP literals: haproxy skips runtime DNS for numeric addresses, keeping
       # the (bridge-only) 127.0.0.11 resolvers section inert under host net
-      BACKEND_ADDR: ${BACKEND_IP}:9000
-
-
-
+      BACKEND0_ADDR: ${BACKEND0_IP}:9000
+      BACKEND1_ADDR: ${BACKEND1_IP}:9000
+      BACKEND2_ADDR: ${BACKEND2_IP}:9000
+      BACKEND3_ADDR: ${BACKEND3_IP}:9000
 
   envoy:
     <<: *host-net
     cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
+    extra_hosts: *backend-hosts
 
   pingora:
     <<: *host-net
     cpuset: "0"
-    extra_hosts:
-      - "backend:${BACKEND_IP}"
-    # pingora resolves `backend` at startup via getaddrinfo, which reads this
-    # extra_hosts /etc/hosts entry — no runtime resolver needed (unlike haproxy)
+    extra_hosts: *backend-hosts
+    # pingora resolves each name at startup via getaddrinfo, which reads these
+    # extra_hosts /etc/hosts entries — no runtime resolver needed (unlike haproxy)
 
   cadvisor:
     <<: *host-net

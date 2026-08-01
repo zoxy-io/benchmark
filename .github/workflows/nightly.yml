@@ -1,7 +1,7 @@
 # Nightly benchmark — an ephemeral, self-driving fleet.
 #
 # Build the harness, mint a short-lived cloud token from GitHub's OIDC
-# identity, drop the payload in Object Storage, create three VMs with no public
+# identity, drop the payload in Object Storage, create six VMs with no public
 # address, watch the run through the bucket, upload the raw data, and destroy the
 # fleet. Nothing long-lived is stored anywhere: no cloud key in the repo, no
 # remote terraform state, no VM that outlives the job.
@@ -49,7 +49,7 @@ on:
   # token, and `bench sweep` runs both as a backstop after a failed destroy and
   # at the start of the next run — which is the only thing that covers the runner
   # itself dying. A failed night therefore costs a red run and ~15 minutes of
-  # three VMs, not a stranded fleet.
+  # six VMs, not a stranded fleet.
   schedule:
     - cron: '0 0 * * *'
 

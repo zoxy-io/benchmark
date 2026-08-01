@@ -30,7 +30,7 @@ variable "runid" {
   EOT
 
   validation {
-    # Length caps at 40 so the longest derived name ("backend-<runid>") stays
+    # Length caps at 40 so the longest derived name ("backend0-<runid>") stays
     # inside Yandex's 63-character limit with room to spare.
     condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", var.runid))
     error_message = "runid must be 1-40 characters of [a-z0-9-], starting and ending alphanumeric."
@@ -65,7 +65,7 @@ variable "bench_profiles" {
 }
 
 variable "bench_proxies" {
-  type        = string
+  type = string
   # Matches nightly.yml's own default. traefik/nginx were deleted rather than
   # parked (commands.zig's parseProxies rejects them outright); envoy came
   # back after being temporarily out of the comparison.
@@ -76,7 +76,12 @@ variable "bench_proxies" {
 variable "zone" {
   type        = string
   default     = "ru-central1-a"
-  description = "Single zone for all three hosts — cross-zone RTT would be a hidden variable."
+  description = <<-EOT
+    Single zone for every host — cross-zone RTT would be a hidden variable, and
+    with a backend POOL it would be a per-member one: the proxy would be
+    round-robining across origins at different distances, so its throughput
+    would depend on which member each request happened to draw.
+  EOT
 }
 
 variable "platform_id" {
@@ -137,13 +142,32 @@ variable "proxy_memory" {
   type    = number
   default = 8
 }
+# PER BACKEND, and there are four of them (local.backend_names in main.tf) — so
+# the pool is 8 cores against the 4 a single origin used to have, while each
+# member is deliberately half the size. Both halves of that matter:
+#
+#   * Smaller members make the pool a real pool. Four origins that each dwarf
+#     the 1-CPU proxy would be four ways of measuring the same thing; at 2 cores
+#     a member is small enough that spreading load across them is load
+#     BALANCING and not just fan-out.
+#   * A bigger pool keeps the origin off the critical path. In a proxied run
+#     each member takes ~1/4 of the offered load, so the pool has to be wrong by
+#     4x before it can bottleneck anything.
+#
+# `direct` is what turns that second claim from arithmetic into a measurement.
+# zrk resolves exactly one address, so it cannot fan out across the pool — it
+# hits backend0 with 100% of the offered load, four times what that host sees in
+# a proxied run. If the direct row clears the fastest proxy, the pool provably
+# has 4x+ headroom. If it does NOT, that is the signal to raise backend_cores:
+# the direct row has stopped proving anything, and every proxy number above it
+# is suspect.
 variable "backend_cores" {
   type    = number
-  default = 4
+  default = 2
 }
 variable "backend_memory" {
   type    = number
-  default = 8
+  default = 4
 }
 variable "loadgen_cores" {
   type    = number

@@ -47,8 +47,9 @@ Read on the **VM** (set by cloud-init from instance metadata):
 | `BENCH_RUNID` | Run id; the object prefix is `runs/<runid>/`. |
 | `BENCH_PROFILES` | Comma-separated profiles to run, in order. |
 | `BENCH_PROXIES` | Comma-separated proxy names. |
-| `PROXY_IP`, `BACKEND_IP` | Private addresses of the other two VMs (static .11/.12/.13 — a `for_each` instance cannot reference its siblings). |
-| `SSH_KEY` | Path to the per-run private key used to drive proxy/backend. |
+| `PROXY_IP` | Private address of the proxy VM (static .12 — a `for_each` instance cannot reference its siblings). |
+| `BACKEND_IPS` | Comma-separated, ORDERED private addresses of the backend pool (static .13-.16). Order is load-bearing: index 0 is `backend0`, the member `direct` calibrates against. Consumers split on the comma rather than assuming a count. |
+| `SSH_KEY` | Path to the per-run private key used to drive proxy/backends. |
 
 No cloud credential is ever stored on a VM: `bench` fetches an IAM token from
 `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token`
@@ -62,7 +63,8 @@ provider block, NOT a `gce-http-token` metadata key.
 ```
 s3://$BENCH_BUCKET/runs/<runid>/
   payload.tar          uploaded by the runner BEFORE apply; bench + compose + proxy configs
-  boot-ok.<role>       written by each VM once cloud-init finishes (diagnoses a boot failure)
+  boot-ok.<role>       written by each VM once cloud-init finishes (diagnoses a boot failure);
+                       <role> is loadgen | proxy | backend0..backend3, one object per VM
   log                  the suite's running log, re-uploaded every ~30s
   results.tar          every artifact, uploaded once the suite finishes
   DONE                 written last, after results.tar; its presence means "complete"

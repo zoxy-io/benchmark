@@ -13,7 +13,7 @@
 //! the only evidence of what went wrong.
 //!
 //! Nothing here logs an argv by default. Command lines carry the peers' private
-//! addresses (compose needs `BACKEND_IP`), and this output is published.
+//! addresses (compose needs `BACKENDn_IP`), and this output is published.
 
 const std = @import("std");
 const Io = std.Io;

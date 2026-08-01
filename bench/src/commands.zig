@@ -239,28 +239,32 @@ pub fn runSuite(
         );
         break :blk .{
             .proxy_ip = "127.0.0.1",
-            .backend_ip = "127.0.0.1",
+            // One entry: locally the whole pool is four containers on this
+            // machine reached over docker DNS, so the only address the driver
+            // itself needs is the one `direct` measures — backend0, which is the
+            // member that publishes :9000 on the host.
+            .backend_ips = &.{"127.0.0.1"},
             .ssh = null,
             .remote_dir = ".",
         };
     } else blk: {
         const proxy_ip = Env.get(environ, "PROXY_IP");
-        const backend_ip = Env.get(environ, "BACKEND_IP");
         const ssh_key = Env.get(environ, "SSH_KEY");
-        if (proxy_ip.len == 0 or backend_ip.len == 0 or ssh_key.len == 0) {
-            std.debug.print("bench suite: PROXY_IP, BACKEND_IP and SSH_KEY are required (or pass --local)\n", .{});
+        const backend_ips = try parseBackendIps(arena, Env.get(environ, "BACKEND_IPS"));
+        if (proxy_ip.len == 0 or backend_ips.len == 0 or ssh_key.len == 0) {
+            std.debug.print("bench suite: PROXY_IP, BACKEND_IPS and SSH_KEY are required (or pass --local)\n", .{});
             return 2;
         }
 
         // Registered so any address that reaches a log line is scrubbed, and so
         // CI masks them if this ever runs somewhere with a console.
         redact.register(proxy_ip);
-        redact.register(backend_ip);
+        for (backend_ips) |ip| redact.register(ip);
 
         const known_hosts = Env.get(environ, "SSH_KNOWN_HOSTS");
         break :blk .{
             .proxy_ip = proxy_ip,
-            .backend_ip = backend_ip,
+            .backend_ips = backend_ips,
             .ssh = .{
                 .key_path = ssh_key,
                 .known_hosts = if (known_hosts.len > 0) known_hosts else "/home/ubuntu/.ssh/known_hosts",
@@ -291,6 +295,44 @@ pub fn runSuite(
     // run visibly red.
     if (res.aborted or ok == 0) return 3;
     return 0;
+}
+
+/// Split `BACKEND_IPS` (cloud-init writes it from terraform's pinned addresses)
+/// into the origin pool, preserving order — index 0 is backend0, the member
+/// `direct` calibrates against.
+///
+/// Empty entries are dropped rather than kept as blanks: a trailing comma would
+/// otherwise become a fifth "backend" at the empty address, and the failure
+/// would be a compose invocation with `BACKEND4_IP=` in it rather than anything
+/// that names the real problem. An entirely empty spec yields an empty slice,
+/// which the caller turns into a usage error.
+pub fn parseBackendIps(arena: Allocator, spec: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |raw| {
+        const ip = std.mem.trim(u8, raw, " \t");
+        if (ip.len == 0) continue;
+        try out.append(arena, ip);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "parseBackendIps keeps pool order and drops blanks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ips = try parseBackendIps(arena, "10.10.0.13,10.10.0.14, 10.10.0.15 ,10.10.0.16,");
+    try std.testing.expectEqual(@as(usize, 4), ips.len);
+    // Order is load-bearing: `direct` measures [0].
+    try std.testing.expectEqualStrings("10.10.0.13", ips[0]);
+    try std.testing.expectEqualStrings("10.10.0.15", ips[2]);
+    try std.testing.expectEqualStrings("10.10.0.16", ips[3]);
+
+    // The caller turns this into "BACKEND_IPS is required" rather than running
+    // a suite with no origin.
+    try std.testing.expectEqual(@as(usize, 0), (try parseBackendIps(arena, "")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try parseBackendIps(arena, " , ")).len);
 }
 
 /// Split a comma-separated list, rejecting names the suite does not know.

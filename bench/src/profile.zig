@@ -161,7 +161,20 @@ pub const c1k: Profile = .{
         // has nothing to do with its proxying. Pin upstream to the conn_slots
         // default so the two agree. (zoxy is fixing this default upstream.)
         .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
-        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "1386" },
+        // FOUR TIMES conn_slots, not equal to it, since the origin became a
+        // four-node pool. zoxy's upstream pool is process-wide but parked PER
+        // ENDPOINT on keep-alive, and the pick policy is round-robin per
+        // request — so a single downstream connection rotates through all four
+        // backends and wants a warm upstream parked at each. Held at 1386 the
+        // pool would be ~1/4 of what steady state asks for, and zoxy would shed
+        // on `zoxy_l7_shed_upstream_slots`: a number that measures the pool
+        // rather than the proxy, and one that reads as a regression against
+        // every pre-pool run.
+        //
+        // 5544 = 4 x 1386, comfortably under the ~11463 comptime ceiling.
+        // Watch `zoxy_shed_upstream_slots` in the run artifacts — nonzero means
+        // this arithmetic is still wrong.
+        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
     },
 };
 
@@ -247,6 +260,15 @@ pub const c10k: Profile = .{
         // this zoxy sheds ~1/3 of responses by admission policy at 10k
         // connections and the number measures the cap, not the proxy.
         .{ .key = "ZOXY_CONN_SLOTS", .value = "11464" },
+        // NOT 4x conn_slots, unlike c1k — there is no room. The pool is already
+        // AT the comptime ceiling, so with a four-node origin this profile
+        // cannot park a warm upstream per (connection, endpoint) the way c1k
+        // can; round-robin will evict and redial instead. That is a real
+        // handicap and it is the honest one available: the alternative is
+        // lowering conn_slots, which trades admission capacity zoxy demonstrably
+        // needs at 10k for pool depth. If `zoxy_shed_upstream_slots` shows up
+        // here, this profile is measuring the ceiling and not the proxy, and the
+        // fix is upstream in zoxy rather than in this file.
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "11464" },
     },
 };

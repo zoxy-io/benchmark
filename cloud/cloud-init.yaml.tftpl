@@ -1,10 +1,17 @@
 #cloud-config
-# ONE template for all three roles, switched on ${role}. Everything above the
+# ONE template for every host, switched on ${role}. Everything above the
 # switch — the docker pin, the sysctls, the fd limits, the payload — has to be
-# provably identical on loadgen/proxy/backend, or the benchmark is measuring
-# hosts instead of proxies. Keeping it in a single file is how that stays true
-# under editing; three templates would drift the first time someone fixed a bug
-# in two of them. Only the tail differs, behind one `if role == "loadgen"`.
+# provably identical on loadgen/proxy/backend0..backend3, or the benchmark is
+# measuring hosts instead of proxies. That matters more with a POOL than it did
+# with a single origin: four backends that drifted apart would make the proxy's
+# throughput depend on which member each request drew. Keeping it in a single
+# file is how that stays true under editing; separate templates would drift the
+# first time someone fixed a bug in some of them. Only the tail differs, behind
+# one `if role == "loadgen"`.
+#
+# ${role} is the bare role name — "loadgen", "proxy", "backend0".."backend3" —
+# so `boot-ok.${role}` names exactly which host failed to come up, and the
+# `if` above is the ONLY place the value is interpreted.
 #
 # NOTE: this file is templatefile() input, so every `$${...}` a shell would
 # expand has to be written with a doubled dollar. Bare `$VAR` is untouched.
@@ -85,7 +92,10 @@ write_files:
       BENCH_PROFILES=${bench_profiles}
       BENCH_PROXIES=${bench_proxies}
       PROXY_IP=${proxy_ip}
-      BACKEND_IP=${backend_ip}
+      # Comma-separated and ORDERED: the first entry is backend0, which is the
+      # host `direct` calibrates against. Every consumer splits on the comma
+      # rather than assuming a count.
+      BACKEND_IPS=${backend_ips}
       SSH_KEY=${ssh_key_path}
       BENCH_ROLE=${role}
       # Not in the contract, which names only SSH_KEY — but remote.Ssh passes
@@ -264,7 +274,22 @@ write_files:
       }
 
       wait_peer "$PROXY_IP" || fail "proxy never became ready"
-      wait_peer "$BACKEND_IP" || fail "backend never became ready"
+      # EVERY member of the pool. A run that starts while one backend is still
+      # booting does not fail — it produces numbers, and they look like a proxy
+      # regression, because the proxy round-robins a quarter of its requests
+      # into a refused connection. So this gate is all-or-nothing.
+      #
+      # `tr` rather than `IFS=,`: fail() exits, and an exit inside the `( ... )`
+      # a scoped IFS would need leaves only the subshell — the run would carry
+      # on with a backend it just declared dead. The index, not the address, is
+      # what goes in the message: this log is uploaded and streamed into a
+      # public CI log, and no benchmark output may contain an address
+      # (bench/CONTRACT.md, redact.assertNoIps).
+      i=0
+      for ip in $(echo "$BACKEND_IPS" | tr ',' ' '); do
+        wait_peer "$ip" || fail "backend #$i never became ready"
+        i=$((i + 1))
+      done
 
       # the contract's `log`: re-uploaded every ~30s so the runner can stream a
       # run it has no other way to watch.
