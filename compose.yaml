@@ -381,7 +381,7 @@ services:
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.52.1
     container_name: cadvisor
-    profiles: [monitoring, backend, zoxy, haproxy, pingora]
+    profiles: [monitoring, backend, zoxy, haproxy, envoy, nginx, pingora]
     # The proxy host's cAdvisor is the run's ONLY source of container CPU and
     # memory — the driver polls /metrics on :8081 at 1Hz — so this service is
     # part of the measurement, not a convenience. It also names the container it
