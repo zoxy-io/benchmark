@@ -38,6 +38,12 @@ pub const Row = struct {
     mem: ?f64 = null,
     /// Change in sustained throughput against the previous night, as a ratio.
     delta: ?f64 = null,
+    /// The row's leading caveat, printed under the table when the row is not
+    /// plain `ok`. Without it a degraded row is a bare "⚠" that says something
+    /// is wrong but not what — and the caveat this exists for, a stale zoxy
+    /// build, is the one that decides whether the number above it means
+    /// anything at all.
+    note: ?[]const u8 = null,
 };
 
 pub const Embed = struct {
@@ -128,6 +134,14 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
 
         if (r.status == .degraded) try w.writer.writeAll("  ⚠");
         try w.writer.writeByte('\n');
+    }
+
+    // Caveats under the table rather than in it — they are sentences, and the
+    // columns above are aligned to stay readable in Discord's monospace block.
+    for (e.rows) |r| {
+        if (r.status == .ok) continue;
+        const n = r.note orelse continue;
+        try w.writer.print("\n⚠ {s}: {s}\n", .{ r.name, n });
     }
     try w.writer.writeAll("```");
 
@@ -628,4 +642,31 @@ test "randomBoundary is not a constant" {
     // A fixed boundary would be guessable from a part's content, and a
     // collision splits the multipart body at the wrong place.
     try std.testing.expect(!std.mem.eql(u8, randomBoundary(io, &a), randomBoundary(io, &b)));
+}
+
+test "a degraded row says WHY, not just that it is degraded" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = [_]Row{
+        .{
+            .name = "zoxy",
+            .status = .degraded,
+            .sustained = 43120,
+            .note = "STALE BUILD — ran zoxy 03308bf, but main was 91d03b1 when this build ran",
+        },
+        .{ .name = "haproxy", .status = .ok, .sustained = 21000 },
+    };
+    const body = try renderTable(arena, .{ .title = "c1k", .ref_rate = 2000, .rows = &rows });
+
+    // The marker AND the reason. A nightly reader sees this post before they
+    // see the report, and a stale build decides whether zoxy's number above
+    // means anything.
+    try std.testing.expect(std.mem.indexOf(u8, body, "⚠") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "STALE BUILD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "⚠ zoxy:") != null);
+
+    // An ok row contributes no caveat line, even if one were ever attached.
+    try std.testing.expect(std.mem.indexOf(u8, body, "⚠ haproxy:") == null);
 }

@@ -525,6 +525,21 @@ fn readStatuses(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) ![]ar
     while (it.next()) |e| {
         const o = e.value_ptr.*.object;
         const status_str = if (o.get("status")) |v| v.string else "ok";
+
+        // Provenance — the version that answered, how it was built, and (for
+        // zoxy) which commit. All of this was already being RECORDED in
+        // profile.json and then dropped right here, so the report never saw
+        // it: the build-parity note that suite.zig writes because it "must
+        // travel WITH the numbers" reached no reader at all.
+        var notes: std.ArrayList([]const u8) = .empty;
+        if (o.get("notes")) |v| {
+            if (v == .array) {
+                for (v.array.items) |n| {
+                    if (n == .string) try notes.append(arena, n.string);
+                }
+            }
+        }
+
         try out.append(arena, .{
             .name = e.key_ptr.*,
             .status = std.meta.stringToEnum(artifact.Status, status_str) orelse .ok,
@@ -532,10 +547,24 @@ fn readStatuses(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) ![]ar
                 std.meta.stringToEnum(artifact.Stage, v.string)
             else
                 null) else null,
-            .err = if (o.get("error")) |v| (if (v == .string) v.string else null) else null,
+            .err = strField(o, "error"),
+            .version = strField(o, "version"),
+            .zoxy_commit = strField(o, "zoxy_commit"),
+            .zoxy_ref = strField(o, "zoxy_ref"),
+            .zoxy_ref_sha = strField(o, "zoxy_ref_sha"),
+            .build_info = strField(o, "build_info"),
+            .notes = try notes.toOwnedSlice(arena),
         });
     }
     return out.toOwnedSlice(arena);
+}
+
+/// A string field of a profile.json proxy record, or null when it is absent or
+/// JSON `null` (every one of these is nullable by design — a stock image has no
+/// build descriptor, only zoxy has a commit).
+fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = o.get(key) orelse return null;
+    return if (v == .string) v.string else null;
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {

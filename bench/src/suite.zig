@@ -328,6 +328,96 @@ fn cacheableImage(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// How to ask a RUNNING container what version it is.
+///
+/// Asked of the container that actually served the ramp, not of compose.yaml:
+/// the tag in the compose file is what was requested, and the point of
+/// recording a version at all is to know what answered. `head -1` because
+/// haproxy follows its version line with a support-lifetime blurb, and `2>&1`
+/// because several of these write to stderr (nginx always does).
+///
+/// Proxies with no version CLI fall back to the image reference, which is where
+/// their version lives anyway — pingora is built from a pinned Cargo.toml and
+/// tagged with the pingora-core version it links (`pingora-http:0.8`).
+fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
+    const asks_itself = [_]struct { proxy: []const u8, argv: []const u8 }{
+        .{ .proxy = "haproxy", .argv = "haproxy -v" },
+        .{ .proxy = "envoy", .argv = "envoy --version" },
+        .{ .proxy = "zoxy", .argv = "zoxy --version" },
+    };
+    for (asks_itself) |e| {
+        if (std.mem.eql(u8, name, e.proxy)) {
+            return std.fmt.allocPrint(arena, "docker exec {s} {s} 2>&1 | head -1", .{ name, e.argv });
+        }
+    }
+    return std.fmt.allocPrint(arena, "docker inspect -f '{{{{.Config.Image}}}}' {s} 2>/dev/null", .{name});
+}
+
+/// Ask GitHub what `ref` points at right now, as plain text.
+///
+/// `Accept: application/vnd.github.sha` makes the commits endpoint answer with
+/// the bare 40-character sha instead of a commit object, so nothing on the VM
+/// has to parse JSON — there is no jq on the fleet image.
+///
+/// Run on the PROXY HOST rather than the runner because that is the box with
+/// egress to GitHub in the nightly's network layout, and because it is the same
+/// path the Dockerfile's cache-bust `ADD` takes: if this resolves, so did that.
+///
+/// Best-effort by design. Losing the freshness check must never cost the run —
+/// it returns null and the record simply carries no `zoxy_ref_sha`, which the
+/// comparison below treats as "unknown", not as "stale".
+fn resolveRef(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    fleet: Fleet,
+    ref: []const u8,
+    timeout_ns: u64,
+) ?[]const u8 {
+    const res = remote.check(
+        gpa,
+        arena,
+        io,
+        fleet.proxyHost(),
+        "resolve zoxy ref",
+        std.fmt.allocPrint(
+            arena,
+            "curl -sS --max-time 20 -H 'Accept: application/vnd.github.sha' " ++
+                "https://api.github.com/repos/zoxy-io/zoxy/commits/{s}",
+            .{ref},
+        ) catch return null,
+        timeout_ns,
+    ) catch return null;
+
+    const sha = std.mem.trim(u8, res.stdout, " \n\r\t");
+    return if (isSha(sha)) sha else null;
+}
+
+/// A full 40-character hex commit sha.
+///
+/// Guards the freshness check against its own inputs: GitHub answers a bad ref
+/// or a rate limit with a JSON error body and a 200-shaped curl exit, and
+/// treating "Not Found" as a commit would report every build as stale.
+fn isSha(s: []const u8) bool {
+    if (s.len != 40) return false;
+    for (s) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+/// Whether the zoxy that ran is a different commit than the ref pointed at when
+/// the build started.
+///
+/// Unknown on either side is NOT stale. An unreachable GitHub or an unreadable
+/// commit file is a check that could not run, and reporting that as a stale
+/// build would train readers to ignore the one signal that matters.
+fn isStaleBuild(ran: ?[]const u8, want: ?[]const u8) bool {
+    const r = ran orelse return false;
+    const w = want orelse return false;
+    return !std.mem.eql(u8, r, w);
+}
+
 const warm_probe_attempts = 30;
 const warm_probe_interval_ns = 2 * std.time.ns_per_s;
 
@@ -499,6 +589,26 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         break;
     }
 
+    // What `profile.zoxy_ref` points at RIGHT NOW, resolved before the build so
+    // the comparison afterwards is against the commit this build should have
+    // picked up. Resolving it after the ramps instead would make a legitimate
+    // mid-run push to zoxy look identical to a stale build.
+    //
+    // Only worth asking when zoxy is actually in tonight's set.
+    const zoxy_ref_sha: ?[]const u8 = blk: {
+        for (opts.proxies) |name| {
+            if (std.mem.eql(u8, name, "zoxy")) break;
+        } else break :blk null;
+
+        const sha = resolveRef(gpa, arena, io, opts.fleet, profile.zoxy_ref, deadline.inspect);
+        if (sha) |s| {
+            redact.log("bench: [zoxy] ref {s} -> {s}", .{ profile.zoxy_ref, s });
+        } else {
+            redact.log("bench: [zoxy] could not resolve ref {s}; freshness unchecked", .{profile.zoxy_ref});
+        }
+        break :blk sha;
+    };
+
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
         if (isDirect(name)) continue;
@@ -645,7 +755,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
         defer watchdog.done.store(true, .release);
 
-        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, &stage) catch |e| blk: {
+        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, zoxy_ref_sha, &stage) catch |e| blk: {
             redact.log("bench: [{s}] {s} at stage {s}", .{ name, @errorName(e), stage.str() });
             break :blk artifact.ProxyRecord{
                 .name = name,
@@ -698,6 +808,9 @@ fn runOne(
     opts: Options,
     name: []const u8,
     proxy_idx: usize,
+    // What `profile.zoxy_ref` resolved to before the build, or null if GitHub
+    // could not be reached. Only zoxy uses it; see the freshness check below.
+    zoxy_ref_sha: ?[]const u8,
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
     const p = opts.prof;
@@ -713,6 +826,11 @@ fn runOne(
     var notes: std.ArrayList([]const u8) = .empty;
     var zoxy_commit: ?[]const u8 = null;
     var build_info: ?[]const u8 = null;
+    var version: ?[]const u8 = null;
+    // Set when the running zoxy is NOT the commit `profile.zoxy_ref` pointed at
+    // when the build ran, which makes tonight's zoxy numbers a measurement of
+    // some other commit than the one the report will name.
+    var stale_build = false;
 
     const target = if (direct)
         try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ip, p.req_path })
@@ -885,6 +1003,48 @@ fn runOne(
             } else |_| {
                 try notes.append(arena, "could not read the running zoxy image's commit");
             }
+
+            // Is that actually tonight's main? The Dockerfile busts its clone
+            // layer on what the ref POINTS AT, so this should always agree —
+            // which is exactly why it is worth asserting. If that mechanism
+            // ever breaks, every night afterwards keeps publishing a frozen
+            // commit under the name "main" and the trend reads as stability.
+            //
+            // Silent when either side is unknown: an unreachable GitHub is a
+            // missing check, not a failed one.
+            if (isStaleBuild(zoxy_commit, zoxy_ref_sha)) {
+                stale_build = true;
+                redact.log(
+                    "bench: [zoxy] STALE BUILD: ran {s} but {s} is {s}",
+                    .{ zoxy_commit.?, profile.zoxy_ref, zoxy_ref_sha.? },
+                );
+                // Prepended, not appended: this has to be the first thing a
+                // reader sees about the row, ahead of the build-parity note
+                // already sitting there.
+                try notes.insert(arena, 0, try std.fmt.allocPrint(
+                    arena,
+                    "STALE BUILD — ran zoxy {s}, but {s} was {s} when this build ran; " ++
+                        "these numbers are not a measurement of {s}",
+                    .{ zoxy_commit.?, profile.zoxy_ref, zoxy_ref_sha.?, profile.zoxy_ref },
+                ));
+            }
+        }
+
+        // What the running proxy says it is. Last of the provenance probes so a
+        // version failure cannot cost the ones above.
+        if (remote.check(
+            gpa,
+            arena,
+            io,
+            opts.fleet.proxyHost(),
+            "version",
+            try versionProbe(arena, name),
+            deadline.inspect,
+        )) |res| {
+            const v = std.mem.trim(u8, res.stdout, " \n\r\t");
+            if (v.len > 0) version = v;
+        } else |_| {
+            try notes.append(arena, "could not read the running proxy's version");
         }
     }
 
@@ -1019,6 +1179,13 @@ fn runOne(
         // the clamp value, and the report must not print it as a measurement.
         try notes.append(arena, "latency histogram saturated at 60s; tail percentiles are a floor, not a value");
     }
+    if (stale_build) {
+        // The ramp itself is fine — some zoxy really was measured — so this is
+        // not `failed`. But it is not the commit the report names, and a
+        // trend point that silently repeats last night's binary is worse than
+        // an absent one, so it must never render as a plain `ok`.
+        status = .degraded;
+    }
 
     return .{
         .name = name,
@@ -1035,7 +1202,10 @@ fn runOne(
         .socket_errors = outcome.socket_errors,
         .saturated = outcome.saturated,
         .cadvisor_samples = outcome.cadvisor_samples,
+        .version = version,
         .zoxy_commit = zoxy_commit,
+        .zoxy_ref = if (std.mem.eql(u8, name, "zoxy")) profile.zoxy_ref else null,
+        .zoxy_ref_sha = if (std.mem.eql(u8, name, "zoxy")) zoxy_ref_sha else null,
         .build_info = build_info,
         .notes = try notes.toOwnedSlice(arena),
     };
@@ -1424,4 +1594,60 @@ test "nowIso produces a sortable UTC stamp" {
     try std.testing.expectEqual(@as(usize, 20), s.len);
     try std.testing.expectEqual(@as(u8, 'T'), s[10]);
     try std.testing.expectEqual(@as(u8, 'Z'), s[19]);
+}
+
+test "a stale zoxy build is detected, and an unrunnable check is not one" {
+    const main_sha = "91d03b10f698256857615c2e256ce29548dfd51a";
+    const other = "03308bfe33d2a0239cf2e40fe28e6a78686bb634";
+
+    // The failure this exists for: the image baked some older commit while the
+    // ref had moved on. That is the Dockerfile's cache-bust having failed.
+    try std.testing.expect(isStaleBuild(other, main_sha));
+    // The intended nightly state.
+    try std.testing.expect(!isStaleBuild(main_sha, main_sha));
+
+    // Neither side known == the check did not run. Reporting these as stale
+    // would fire on every night GitHub is unreachable and teach a reader to
+    // ignore the warning that matters.
+    try std.testing.expect(!isStaleBuild(null, main_sha));
+    try std.testing.expect(!isStaleBuild(other, null));
+    try std.testing.expect(!isStaleBuild(null, null));
+}
+
+test "only a real commit sha counts as a resolved ref" {
+    try std.testing.expect(isSha("91d03b10f698256857615c2e256ce29548dfd51a"));
+    // What GitHub actually answers with when the check cannot be made: an
+    // error body, which must resolve to "unknown" rather than to a commit that
+    // then mismatches and reports a false stale build.
+    try std.testing.expect(!isSha("Not Found"));
+    try std.testing.expect(!isSha("{\"message\":\"API rate limit exceeded\"}"));
+    try std.testing.expect(!isSha(""));
+    // Right length, not hex.
+    try std.testing.expect(!isSha("z1d03b10f698256857615c2e256ce29548dfd51a"));
+    // A short sha is not enough to compare against a full one.
+    try std.testing.expect(!isSha("91d03b1"));
+}
+
+test "the version probe asks the container, and falls back to the image tag" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Proxies that can answer for themselves are asked directly, inside the
+    // container that served the ramp rather than of compose.yaml.
+    const hap = try versionProbe(arena, "haproxy");
+    try std.testing.expect(std.mem.indexOf(u8, hap, "docker exec haproxy haproxy -v") != null);
+    // stderr folded in and one line kept: haproxy follows its version with a
+    // support-lifetime blurb, and several of these write to stderr.
+    try std.testing.expect(std.mem.indexOf(u8, hap, "2>&1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hap, "head -1") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, try versionProbe(arena, "envoy"), "envoy --version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try versionProbe(arena, "zoxy"), "zoxy --version") != null);
+
+    // pingora has no version flag; its version is the pingora-core release it
+    // links, which is what its image tag carries.
+    const ping = try versionProbe(arena, "pingora");
+    try std.testing.expect(std.mem.indexOf(u8, ping, "docker inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ping, "{{.Config.Image}}") != null);
 }

@@ -118,11 +118,14 @@ pub fn render(
         try out.writeAll(if (std.mem.eql(u8, p.name, "direct")) "<tr class=\"baseline\">" else "<tr>");
 
         // The colour swatch is the report's only legend.
+        try out.writeAll("<td>");
         if (has_hist) {
-            try out.print("<td><a class=\"proxycell\" href=\"#hist-{s}\"><span class=\"swatch s-{s}\"></span>{s}</a></td>", .{ p.name, p.name, p.name });
+            try out.print("<a class=\"proxycell\" href=\"#hist-{s}\"><span class=\"swatch s-{s}\"></span>{s}</a>", .{ p.name, p.name, p.name });
         } else {
-            try out.print("<td><span class=\"proxycell\"><span class=\"swatch s-{s}\"></span>{s}</span></td>", .{ p.name, p.name });
+            try out.print("<span class=\"proxycell\"><span class=\"swatch s-{s}\"></span>{s}</span>", .{ p.name, p.name });
         }
+        try writeVersion(out, st);
+        try out.writeAll("</td>");
 
         if (!usable) {
             // No numbers at all — a failed proxy must never render as zeros.
@@ -250,6 +253,28 @@ fn writeLatencyCellP99(out: *Writer, p: *const report.ProxyData, st: ?artifact.P
     try out.print("<td>{d:.2}ms</td>", .{v});
 }
 
+/// The version that actually answered, under the proxy's name.
+///
+/// A benchmark number means nothing without the build it came from, and until
+/// now the page named neither — a reader had to take "haproxy" on faith and go
+/// read compose.yaml to find out which haproxy. zoxy additionally gets its
+/// commit, short-form, since its version alone (`zoxy 0.0.5`) does not identify
+/// a nightly build of a moving `main`.
+fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
+    const r = st orelse return;
+    var buf: [512]u8 = undefined;
+
+    if (r.version) |v| {
+        try out.print("<span class=\"prov\">{s}</span>", .{escapeHtml(&buf, v)});
+    }
+    if (r.zoxy_commit) |c| {
+        // Short sha: the full 40 is in profile.json for anyone bisecting, and
+        // the table has to stay readable.
+        const short = if (c.len > 9) c[0..9] else c;
+        try out.print("<span class=\"prov\">@{s}</span>", .{escapeHtml(&buf, short)});
+    }
+}
+
 fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
     const r = st orelse {
         try out.writeAll("<span class=\"badge\">ok</span>");
@@ -257,20 +282,23 @@ fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
     };
     switch (r.status) {
         .ok => try out.writeAll("<span class=\"badge\">ok</span>"),
-        .degraded => {
-            try out.writeAll("<span class=\"badge warn\">⚠ degraded");
-            if (r.notes.len > 0) {
-                var nbuf: [512]u8 = undefined;
-                try out.print(" · {s}", .{escapeHtml(&nbuf, r.notes[0])});
-            }
-            try out.writeAll("</span>");
-        },
+        .degraded => try out.writeAll("<span class=\"badge warn\">⚠ degraded</span>"),
         .failed => {
             try out.writeAll("<span class=\"badge fail\">failed");
             if (r.stage) |s| try out.print(" · {s}", .{s.str()});
             try out.writeAll("</span>");
         },
         .skipped => try out.writeAll("<span class=\"badge\">skipped</span>"),
+    }
+
+    // EVERY note, on every status — not just the first, and not only when
+    // degraded. Both limits used to hide things that were recorded precisely
+    // because a reader needs them: an `ok` zoxy's build-parity note (SIMD
+    // against haproxy's generic x86-64 image) reached no reader at all, and a
+    // degraded proxy showed one note while silently dropping the rest.
+    for (r.notes) |n| {
+        var nbuf: [1024]u8 = undefined;
+        try out.print("<div class=\"note\">{s}</div>", .{escapeHtml(&nbuf, n)});
     }
 }
 
@@ -607,4 +635,105 @@ test "the page carries no external font imports" {
     try std.testing.expect(std.mem.indexOf(u8, css, "@import") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, "fonts.googleapis.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, "fontshare.com") == null);
+}
+
+test "the report names the build each number came from" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var present = [_]report.ProxyData{.{
+        .name = "zoxy",
+        .rows = &.{},
+        .sustained = 43120,
+        .hist = null,
+        .dist_hist = null,
+        .hgrm_file = "",
+        .mem = null,
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed_raw = &.{},
+    }};
+    const statuses = [_]artifact.ProxyRecord{.{
+        .name = "zoxy",
+        .status = .degraded,
+        .version = "zoxy 0.0.5",
+        .zoxy_commit = "03308bfe33d2a0239cf2e40fe28e6a78686bb634",
+        .notes = &.{
+            "STALE BUILD — ran zoxy 03308bf, but main was 91d03b1 when this build ran",
+            "compiled for this host's CPU with SIMD",
+        },
+    }};
+
+    var buf: [128 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try render(arena, &out, .{
+        .present = &present,
+        .rps = &.{},
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed = &.{},
+    }, &statuses, .{
+        .runid = "r",
+        .profile_name = "c1k",
+        .ref_rate = 2000,
+        .connections = 1000,
+        .deadline_ms = 0,
+    });
+    const s = out.buffered();
+
+    // The version that answered, and the commit that produced it — a number
+    // without its build is not reproducible.
+    try std.testing.expect(std.mem.indexOf(u8, s, "zoxy 0.0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "@03308bfe3") != null);
+    // Short sha in the table; the full one stays in profile.json.
+    try std.testing.expect(std.mem.indexOf(u8, s, "03308bfe33d2a0239cf2e40fe28e6a78686bb634") == null);
+
+    // EVERY note reaches the page. Both of these used to be dropped: notes
+    // rendered only on `degraded` and only the first one.
+    try std.testing.expect(std.mem.indexOf(u8, s, "STALE BUILD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "compiled for this host's CPU with SIMD") != null);
+}
+
+test "an ok proxy's notes are rendered too, not only a degraded one's" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var present = [_]report.ProxyData{.{
+        .name = "zoxy",
+        .rows = &.{},
+        .sustained = 43120,
+        .hist = null,
+        .dist_hist = null,
+        .hgrm_file = "",
+        .mem = null,
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed_raw = &.{},
+    }};
+    // The exact case that was invisible: suite.zig records the SIMD-parity note
+    // because it "must travel WITH the numbers", and the proxy is perfectly ok.
+    const statuses = [_]artifact.ProxyRecord{.{
+        .name = "zoxy",
+        .status = .ok,
+        .notes = &.{"compiled for this host's CPU with SIMD; stock images are generic x86-64"},
+    }};
+
+    var buf: [128 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try render(arena, &out, .{
+        .present = &present,
+        .rps = &.{},
+        .cpu = &.{},
+        .p99 = &.{},
+        .shed = &.{},
+    }, &statuses, .{
+        .runid = "r",
+        .profile_name = "c1k",
+        .ref_rate = 2000,
+        .connections = 1000,
+        .deadline_ms = 0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "generic x86-64") != null);
 }

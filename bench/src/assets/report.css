@@ -69,6 +69,17 @@ th:first-child,td:first-child { text-align:left }
 /* table proxy cell: color swatch + name (the report's only legend now) */
 .proxycell { display:flex; align-items:center; gap:8px }
 .proxycell .swatch { flex:none }
+/* build provenance under the proxy name — which build produced these numbers.
+   Secondary to the name and wrapping freely: a version string can be long
+   (envoy's is a git sha, a version, a build type and a TLS backend). */
+.prov { display:block; color:var(--haze-dim); font-size:.68rem; line-height:1.5;
+  margin-left:17px; overflow-wrap:anywhere }
+/* a recorded caveat about a row — build parity, a stale build, a saturated
+   histogram. Left-aligned against the right-aligned status column it sits in,
+   because these are sentences, not values. */
+.note { text-align:left; color:var(--haze); font-size:.68rem; line-height:1.5;
+  margin-top:6px; max-width:34ch; overflow-wrap:anywhere }
+td:has(> .note) { min-width:22ch }
 th { color:var(--amber); font-weight:500; font-size:.68rem; letter-spacing:.14em; text-transform:uppercase }
 tbody tr:hover td { background:rgba(233,239,250,.02) }
 td:first-child { color:var(--paper); font-weight:500 }

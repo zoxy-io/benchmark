@@ -418,6 +418,7 @@ pub fn readProfile(
             var status: artifact.Status = .ok;
             var stage: ?artifact.Stage = null;
             var saturated = false;
+            var note: ?[]const u8 = null;
             if (proxies.get(pname)) |st| {
                 const so = st.object;
                 if (strOf(so.get("status"))) |v| {
@@ -425,6 +426,16 @@ pub fn readProfile(
                 }
                 if (strOf(so.get("stage"))) |v| {
                     stage = std.meta.stringToEnum(artifact.Stage, v);
+                }
+                // The leading note, which suite.zig orders so the most serious
+                // one is first. A bare "⚠" in the post says something is wrong
+                // without saying what, and a stale zoxy build — the one caveat
+                // that invalidates the headline number — has to be readable
+                // without opening the report.
+                if (so.get("notes")) |v| {
+                    if (v == .array and v.array.items.len > 0 and v.array.items[0] == .string) {
+                        note = v.array.items[0].string;
+                    }
                 }
                 if (so.get("saturated")) |v| saturated = v == .bool and v.bool;
             }
@@ -440,6 +451,7 @@ pub fn readProfile(
                 .p99_ms = if (lat) |l| numOf(l.object.get("p99")) else null,
                 .saturated = saturated,
                 .mem = numOf(o.get("mem")),
+                .note = note,
             });
         }
     }

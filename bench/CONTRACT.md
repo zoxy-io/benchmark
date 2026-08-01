@@ -91,7 +91,7 @@ Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
 <runid>/
   manifest.json
   c1k/
-    profile.json                     per-proxy status + ramp params (replaces meta.json)
+    profile.json                     per-proxy status, provenance + ramp params (replaces meta.json)
     <proxy>.ndjson                   zrk timeseries, byte-identical to the CLI's
     <proxy>.hgrm                     whole-run percentile distribution
     <proxy>.cadvisor.ndjson          {"t":..,"cpu_seconds_total":..,"mem_ws":..,"cadvisor_ms":..} @1Hz
@@ -100,3 +100,24 @@ Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
 
 No IP address appears in any of these. `bench` refuses to write an artifact
 containing one (see `redact.assertNoIps`).
+
+Each `profile.json` proxy record carries the build its numbers came from, read
+out of the container that actually served the ramp rather than from
+compose.yaml:
+
+    version        what the running proxy answers (`haproxy -v`, `envoy
+                   --version`, `zoxy --version`), or its image reference for one
+                   with no version CLI (pingora, whose tag carries the
+                   pingora-core release it links)
+    build_info     optimisation mode and target CPU, from the image's own
+                   /etc/<proxy>/build-info — absent for a stock upstream image
+    zoxy_commit    the commit the running zoxy image baked (zoxy only)
+    zoxy_ref       the ref the build asked for, normally `main`
+    zoxy_ref_sha   what that ref pointed at when the build ran, resolved from
+                   GitHub independently of the image
+
+`zoxy_commit != zoxy_ref_sha` means the build did not pick up the ref it named
+— the failure the Dockerfile's cache-bust exists to prevent — and marks the
+record `degraded` with a `STALE BUILD` note. Either side being null means the
+check could not run (GitHub unreachable), which is not the same as stale and is
+not reported as such.

@@ -84,10 +84,31 @@ pub const ProxyRecord = struct {
     /// clamp value, so the report must say "saturated" rather than print one.
     saturated: bool = false,
     cadvisor_samples: usize = 0,
+    /// What the running proxy says it is — `haproxy -v`, `envoy --version`,
+    /// `zoxy --version`, or the image reference for one with no version CLI.
+    ///
+    /// Every number this harness publishes is a claim about a specific build of
+    /// a specific proxy, and the version was the one part of that claim nothing
+    /// recorded. An image tag in compose.yaml is what was ASKED for; this is
+    /// what answered, read out of the container that actually served the ramp.
+    version: ?[]const u8 = null,
     /// Resolved commit of the running zoxy image, for zoxy only. Recorded
     /// because the Dockerfile caches its git clone, so a floating ref can
     /// silently be an older commit than requested.
     zoxy_commit: ?[]const u8 = null,
+    /// The zoxy ref the build was asked for (`profile.zoxy_ref`, normally
+    /// `main`) and what that ref pointed at when the build ran, resolved
+    /// independently from GitHub rather than from the image.
+    ///
+    /// Together with `zoxy_commit` these make the freshness of the nightly
+    /// CHECKABLE instead of merely intended. The trend chart's whole premise is
+    /// that each night measures whatever main is that night; a build that
+    /// silently reused a cached clone would keep reporting a frozen commit as
+    /// "main" and the chart would read as stability rather than as a stuck
+    /// build. `zoxy_commit != zoxy_ref_sha` is exactly that failure, and it
+    /// degrades the record rather than passing quietly.
+    zoxy_ref: ?[]const u8 = null,
+    zoxy_ref_sha: ?[]const u8 = null,
     /// How the image was compiled — optimisation mode and target CPU, read from
     /// the image's own /etc/<proxy>/build-info.
     ///
@@ -249,8 +270,14 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
         try j.key("cadvisor_samples");
         try j.int(@intCast(r.cadvisor_samples));
 
+        try j.key("version");
+        if (r.version) |v| try j.string(v) else try j.nullValue();
         try j.key("zoxy_commit");
         if (r.zoxy_commit) |c| try j.string(c) else try j.nullValue();
+        try j.key("zoxy_ref");
+        if (r.zoxy_ref) |c| try j.string(c) else try j.nullValue();
+        try j.key("zoxy_ref_sha");
+        if (r.zoxy_ref_sha) |c| try j.string(c) else try j.nullValue();
         try j.key("build_info");
         if (r.build_info) |b| try j.string(b) else try j.nullValue();
 
