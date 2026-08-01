@@ -144,7 +144,7 @@ fn cmdSuite(init: std.process.Init, args: []const [:0]const u8) !void {
 
     const spec = try flagValue(args, "--proxies") orelse
         commands.Env.get(environ, "BENCH_PROXIES");
-    const proxies = try commands.parseProxies(arena, if (spec.len > 0) spec else "direct,zoxy,haproxy,pingora,envoy");
+    const proxies = try commands.parseProxies(arena, if (spec.len > 0) spec else "zoxy,haproxy,nginx,pingora,envoy");
 
     const runid = try flagValue(args, "--runid") orelse commands.Env.get(environ, "BENCH_RUNID");
     if (runid.len == 0) return fail("bench suite: --runid or BENCH_RUNID is required", .{});
@@ -315,9 +315,9 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     const inputs = try arena.alloc(report.ProxyInput, ordered.len);
     for (ordered, 0..) |name, k| {
         const tags = meta.tagsFor(name);
-        // cAdvisor samples replace the Prometheus CPU/memory queries. `direct`
-        // has no container, and an archived run predates the poller — both come
-        // back empty, which the report renders as absent rather than as zero.
+        // cAdvisor samples replace the Prometheus CPU/memory queries. An
+        // archived run predates the poller and comes back empty, which the
+        // report renders as absent rather than as zero.
         const cad = try report.loadCadvisor(
             arena,
             io,

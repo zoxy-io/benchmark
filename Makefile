@@ -41,7 +41,7 @@ ZIG_CPU ?= x86_64_v3
 ZIG_PKG ?= zig-pkg
 PROFILE ?= c1k
 RUN ?= results/latest
-LOCAL_PROXIES ?= direct,zoxy
+LOCAL_PROXIES ?= zoxy
 
 .PHONY: help build test local report up down clean
 
@@ -59,7 +59,7 @@ test:
 # A whole run against this machine's docker daemon — no cloud, no ssh, ~6 min
 # for one profile. NOT a benchmark result: the generator shares CPU, cache and
 # memory bandwidth with the proxy it is measuring, and the fleet's network is
-# replaced by loopback, which removes a ceiling the real `direct` baseline sits
+# replaced by loopback, which removes a network ceiling the cloud path sits
 # near. It exists to iterate on the harness, a proxy config or the report
 # without paying cloud time. Everything downstream knows — the run records
 # fleet=local, the report is banner-marked, and `bench index` keeps it out of

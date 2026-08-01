@@ -246,7 +246,7 @@ pub fn renderIndex(
             try out.print(
                 "<section class=\"card\"><h2>{s} · sustained req/s over time</h2>" ++
                     "<p class=\"sub\">one point per night; a fresh fleet each run, so read a proxy " ++
-                    "against the direct baseline of the same night rather than in absolute terms</p>",
+                    "against the others of the same night rather than in absolute terms</p>",
                 .{p.name},
             );
             // A static legend, not just the hover tooltip: this is the site's
@@ -350,6 +350,10 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
         try out.append(arena, .{
             .name = proxy,
             .pts = try pts.toOwnedSlice(arena),
+            // Historical only: `direct` was the no-proxy origin calibration and
+            // was drawn dashed so it read as a reference rather than a
+            // competitor. No run produces it any more, but nights before the
+            // removal are still in history — see report.proxy_order.
             .dashed = std.mem.eql(u8, proxy, "direct"),
         });
     }

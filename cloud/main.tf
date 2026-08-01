@@ -121,8 +121,8 @@ locals {
   # work choosing a member per request; one origin measured only the forwarding
   # path. Each is deliberately SMALLER than the old single box (2 cores, was 4)
   # while the pool is larger in total (8 cores, was 4), so no proxy is ever
-  # waiting on the origin — see the `direct` note in variables.tf for the
-  # calibration that proves it rather than assumes it.
+  # waiting on the origin — see the sizing note in variables.tf for the
+  # reasoning, and for what was given up to stop measuring it every night.
   #
   # The count is 4 in three places that cannot read each other: here, the
   # `backend0..backend3` services in compose.yaml, and the endpoint lists in
@@ -143,9 +143,9 @@ locals {
     proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, ip = "10.10.0.12" }
   }, local.backends)
 
-  # Ordered, so BACKEND_IPS[0] is backend0 everywhere — `direct` calibrates
-  # against that one specifically, and a map's iteration order must not decide
-  # which host that is.
+  # Ordered, so BACKEND_IPS[n] is backendN everywhere: the compose profile, the
+  # extra_hosts entry and the terraform host must all name the same machine, and
+  # a map's iteration order must not decide which.
   backend_ips = [for name in local.backend_names : local.backends[name].ip]
 
   known_hosts = join("\n", [

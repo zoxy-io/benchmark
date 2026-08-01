@@ -62,6 +62,13 @@ services:
     cpuset: "0"
     extra_hosts: *backend-hosts
 
+  nginx:
+    <<: *host-net
+    cpuset: "0"
+    # nginx resolves each backendN once at startup via getaddrinfo, which reads
+    # these /etc/hosts entries — no runtime resolver needed (like pingora)
+    extra_hosts: *backend-hosts
+
   pingora:
     <<: *host-net
     cpuset: "0"

@@ -1,6 +1,6 @@
 # benchmark
 
-Compares **zoxy** against **HAProxy**, **Envoy** and **Pingora**: every proxy
+Compares **zoxy** against **HAProxy**, **nginx**, **Envoy** and **Pingora**: every proxy
 gets the *identical* linearly-growing **open-loop** load ramp until it stops
 keeping up, and the output is one self-contained HTML report overlaying
 **latency, CPU, memory and achieved req/s against offered load**.
@@ -9,14 +9,15 @@ It runs **unattended every night** ([`.github/workflows/nightly.yml`](.github/wo
 CI creates a throwaway six-VM fleet with no public addresses, the loadgen
 drives the whole suite itself, results come back through Object Storage, the
 fleet is destroyed, and the summary is posted to Discord and published to Pages.
-Traefik and nginx-as-a-proxy were part of an earlier comparison and were
-removed; Envoy went through that same removal once and came back. `git log`
-restores any of them, which is a better starting point than a config that has
-sat unexercised.
+Traefik, and a `direct` no-proxy origin baseline, were part of an earlier
+comparison and were removed; Envoy and nginx each went through that same removal
+and came back. `git log` restores any of them, which is a better starting point
+than a config that has sat unexercised.
 
 Every proxy is an **HTTP/1.1 reverse proxy** doing the same job — HAProxy
-`mode http`, Envoy `http_connection_manager`, Pingora's ~90-line Rust binary on
-Cloudflare's framework, zoxy's phase-1 `http` listener: parse each request,
+`mode http`, nginx `proxy_pass`, Envoy `http_connection_manager`, Pingora's
+~90-line Rust binary on Cloudflare's framework, zoxy's phase-1 `http`
+listener: parse each request,
 **pick an origin from a four-node pool**, forward it over a pooled keep-alive
 upstream, stream the response back. The generator speaks HTTP end-to-end and
 the origins are nginx.
@@ -62,8 +63,8 @@ under its own limit (it hits the proxy's concurrency-collapse wall first), so
 there is no second loadgen and no VU/goroutine-heavy generator. **Runs are
 guarded**: `CONNECTIONS` caps in-flight concurrency (zrk keeps one request in
 flight per connection — too high and past saturation it piles connections and
-collapses the path), and a `direct` pseudo-proxy calibrates that the origin
-itself saturates above the proxies. **Local = plumbing, cloud = numbers**: quote the 6-VM cloud
+collapses the path), and the origin is a four-node pool sized well above what
+any 1-CPU proxy can drive. **Local = plumbing, cloud = numbers**: quote the 6-VM cloud
 runs.
 
 ## Running it
@@ -73,7 +74,7 @@ federation, the results bucket — is in [docs/SETUP.md](docs/SETUP.md); after
 that, use `workflow_dispatch` to trigger a run by hand.
 
 Ramp profiles are compiled into [`bench/src/profile.zig`](bench/src/profile.zig)
-and run across `direct, zoxy, haproxy, pingora, envoy`. Only `c1k` runs on the
+and run across `zoxy, haproxy, nginx, pingora, envoy`. Only `c1k` runs on the
 schedule; pass `profiles: c1k,c10k` on a manual dispatch to run `c10k` too:
 
 | profile | connections | deadline | runs nightly? | what it answers |
@@ -96,8 +97,8 @@ make up/down   # the backend origin pool, for poking at a proxy by hand
 cloud and no ssh — a ~6 minute loop for working on the harness, a proxy config
 or the report. **It is not a benchmark result**: the load generator shares CPU,
 cache and memory bandwidth with the proxy it is measuring, and the fleet's
-network is replaced by loopback, which removes a ceiling the real `direct`
-baseline demonstrably sits near. That is enforced rather than documented — the
+network is replaced by loopback, which removes a network ceiling the cloud path
+demonstrably sits near. That is enforced rather than documented — the
 run records `fleet: local`, the report carries a banner, and the trend chart
 refuses the data.
 
@@ -110,10 +111,11 @@ noticed.
 ## Fairness rules (what makes the numbers comparable)
 
 - **Same job for every proxy**: all are HTTP/1.1 reverse proxies — HAProxy
-  `mode http`, Envoy `http_connection_manager`, Pingora (a ~90-line Rust binary
-  on Cloudflare's framework — `proxies/pingora`), zoxy's phase-1 `http`
-  listener. Everyone parses each request and keeps both the client and the
-  pooled upstream connection alive — nobody skips HTTP parsing that others pay.
+  `mode http`, nginx `proxy_pass` over an `upstream` block, Envoy
+  `http_connection_manager`, Pingora (a ~90-line Rust binary on Cloudflare's
+  framework — `proxies/pingora`), zoxy's phase-1 `http` listener. Everyone
+  parses each request and keeps both the client and the pooled upstream
+  connection alive — nobody skips HTTP parsing that others pay.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).
@@ -157,22 +159,27 @@ noticed.
   main's current HEAD. Pin a SHA only to reproduce a specific past run.
 - **Same balancing policy for every proxy**: the origin is a four-node pool and
   every proxy is pinned to **strict round-robin** — haproxy `balance
-  roundrobin`, envoy `lb_policy: ROUND_ROBIN`, pingora an atomic counter, zoxy
-  `"pick": "rr"`. Round-robin is not everyone's default (zoxy's is p2c, which
+  roundrobin`, nginx's default method over its `upstream` block, envoy
+  `lb_policy: ROUND_ROBIN`, pingora an atomic counter, zoxy `"pick": "rr"`. Round-robin is not everyone's default (zoxy's is p2c, which
   would very likely serve it better), and that is the point: an unpinned policy
   makes the chart a comparison of endpoint-pick algorithms wearing proxy names.
-  Nobody active-health-checks either — haproxy and envoy ship it, pingora as
-  written does not, and every backend is up for the whole run, so a member that
-  did fail should surface as errors rather than be silently routed around by
-  some proxies and not others.
+  Nobody health-checks the pool either — haproxy and envoy ship active checks,
+  nginx ships *passive* ones on by default (`max_fails=1`, so one error ejects
+  an origin for 10s), and pingora as written has none. All of it is off:
+  every backend is up for the whole run, and a member that did fail should
+  surface as errors rather than be silently routed around by some proxies and
+  not others. nginx's needed an explicit `max_fails=0` — the default would
+  quietly drop it to a three-origin pool past the knee, which is where this
+  benchmark spends its time.
 - **Origin headroom**: the pool has 8 cores against the proxy's 1, and each
-  member takes ~1/4 of the offered load. The `direct` pseudo-proxy (in
-  `BENCH_PROXIES`/`--proxies`) is what proves that rather than asserting it —
-  zrk resolves one address, so `direct` puts **100% of the load on backend0
-  alone**, four times what that host sees in a proxied run. A direct row above
-  the fastest proxy therefore proves the whole pool has 4x+ headroom. If direct
-  ever drops *below* a proxy, the baseline has stopped bounding anything and
-  every number above it is suspect — raise `backend_cores`.
+  member takes ~1/4 of the offered load, so the origin is not the thing being
+  measured. This is now *asserted from the sizing*, not measured. A `direct`
+  pseudo-proxy used to ramp straight at the origin every night and prove it —
+  that was worth a full ramp per profile while the origin was a single 4-core
+  box a fast proxy could plausibly approach, and stopped being worth it against
+  a pool four times that size. If a proxy ever plateaus at a suspiciously round
+  number, re-add it from `git log` before believing the plateau is the proxy's:
+  it is the only check that ever bounded the origin *and* the network path.
 
 ## Layout
 

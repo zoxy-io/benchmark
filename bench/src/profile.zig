@@ -117,11 +117,14 @@ pub const Profile = struct {
 ///
 /// At 100k req/s of 1 KiB bodies the offered load is ~820 Mbps, which is at or
 /// past what a 2-vCPU standard-v3 NIC sustains. That is deliberate: the ramp has
-/// to extend past every proxy's knee for the knee to be visible at all. But it
-/// does mean the `direct` baseline is expected to top out on the NETWORK rather
-/// than on the origin, so `direct` marks where the measurement rig itself
-/// saturates, not where nginx does — read a proxy against it, never as a
-/// fraction of line rate.
+/// to extend past every proxy's knee for the knee to be visible at all.
+///
+/// It does mean the rig has a ceiling of its own, somewhere near line rate, and
+/// NOTHING measures it any more: the `direct` baseline used to top out on the
+/// network rather than on the origin and so marked exactly where the rig
+/// saturated. Read proxies against each other, never as a fraction of line rate
+/// — and if two proxies ever converge on the same suspiciously round plateau,
+/// suspect this ceiling and restore `direct` from git history to find it.
 /// The zoxy ref every profile builds. `main` ON PURPOSE: the nightly exists to
 /// catch a regression the morning after it lands, so each night must build
 /// whatever main is at the time. Points on the trend chart are deliberately

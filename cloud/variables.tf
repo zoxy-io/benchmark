@@ -66,10 +66,11 @@ variable "bench_profiles" {
 
 variable "bench_proxies" {
   type = string
-  # Matches nightly.yml's own default. traefik/nginx were deleted rather than
-  # parked (commands.zig's parseProxies rejects them outright); envoy came
-  # back after being temporarily out of the comparison.
-  default     = "direct,zoxy,haproxy,pingora,envoy"
+  # Matches nightly.yml's own default. traefik and the `direct` no-proxy
+  # baseline were deleted rather than parked (commands.zig's parseProxies
+  # rejects them outright); envoy and nginx each came back after being
+  # temporarily out of the comparison.
+  default     = "zoxy,haproxy,nginx,pingora,envoy"
   description = "BENCH_PROXIES — comma-separated, passed straight to `bench suite --proxies`."
 }
 
@@ -126,7 +127,7 @@ variable "image_id" {
 #
 # That build is most of a nightly. The fleet is ephemeral, so there is no layer
 # cache and zoxy is compiled from source every run: measured at ~13 min of a
-# 37-min four-proxy run, against 5-min ramps. haproxy, a stock image, builds in 1s.
+# 37-min run, against 5-min ramps. haproxy and nginx, stock images, build in 1s.
 #
 # CAVEAT worth re-checking after any change here: Yandex standard-v3 scales the
 # NETWORK allowance with vCPU count, and that is benchmark-visible. Proxied
@@ -154,13 +155,14 @@ variable "proxy_memory" {
 #     each member takes ~1/4 of the offered load, so the pool has to be wrong by
 #     4x before it can bottleneck anything.
 #
-# `direct` is what turns that second claim from arithmetic into a measurement.
-# zrk resolves exactly one address, so it cannot fan out across the pool — it
-# hits backend0 with 100% of the offered load, four times what that host sees in
-# a proxied run. If the direct row clears the fastest proxy, the pool provably
-# has 4x+ headroom. If it does NOT, that is the signal to raise backend_cores:
-# the direct row has stopped proving anything, and every proxy number above it
-# is suspect.
+# That second claim is ASSERTED from this sizing, not measured. A `direct`
+# pseudo-proxy used to ramp straight at backend0 every night and prove it —
+# removed once the origin became a pool, because it cost a full ramp per profile
+# to re-answer a question a 4x-oversized origin no longer raises.
+#
+# The cost of that removal: nothing now bounds the origin OR the network path
+# empirically. If a proxy plateaus at a suspiciously round number, restore
+# `direct` from git history before concluding the plateau belongs to the proxy.
 variable "backend_cores" {
   type    = number
   default = 2

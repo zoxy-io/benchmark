@@ -444,13 +444,13 @@ yc iam workload-identity federated-credential delete <credential-id>
 
 ### Smoke run — smallest useful shape
 
-One profile, two proxies. `direct` calibrates the origin and `zoxy` is the one
-proxy whose image is built from source, so this exercises the slow path without
-paying for the full matrix (~15 minutes rather than ~70).
+One profile, two proxies. `zoxy` is the one whose image is built from source and
+`haproxy` is a stock image, so this exercises both the slow and the fast path
+without paying for the full matrix (~15 minutes rather than ~70).
 
 ```sh
 gh workflow run nightly.yml --repo "$GH_REPO" --ref main \
-  -f profiles=c1k -f proxies=direct,zoxy
+  -f profiles=c1k -f proxies=zoxy,haproxy
 
 gh run watch --repo "$GH_REPO"
 ```
@@ -486,11 +486,11 @@ Check, in this order:
 ### Full run
 
 ```sh
-gh workflow run nightly.yml --repo "$GH_REPO" --ref main   # defaults: c1k,c10k x 4 proxies
+gh workflow run nightly.yml --repo "$GH_REPO" --ref main   # defaults: c1k,c10k x 5 proxies
 ```
 
 Expect roughly: 4 min boot, 5-20 min of cold docker builds, then
-2 profiles x 4 proxies x ~350 s ≈ 47 min. If it approaches the 150-minute job
+2 profiles x 5 proxies x ~350 s ≈ 58 min. If it approaches the 150-minute job
 timeout, cut the proxy list rather than raising the timeout.
 
 ### Then enable the cron

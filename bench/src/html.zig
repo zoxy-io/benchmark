@@ -48,13 +48,15 @@ pub fn render(
     statuses: []const artifact.ProxyRecord,
     opts: Options,
 ) !void {
-    // Crop every chart's offered axis to where the LAST real proxy stops keeping
-    // up. The p99 curves are keep-up-filtered, so their rightmost offered IS
-    // that knee. Past it only the direct baseline has data, and the full ramp
-    // would waste half the chart width on empty space.
+    // Crop every chart's offered axis to where the LAST proxy stops keeping up.
+    // The p99 curves are keep-up-filtered, so their rightmost offered IS that
+    // knee, and the full ramp would waste half the chart width on empty space.
+    //
+    // This used to skip `direct`, which kept up far past every proxy and so
+    // would have set the crop to the whole ramp on its own. With it gone there
+    // is nothing to exclude.
     var crop: ?f64 = null;
     for (g.p99) |s| {
-        if (std.mem.eql(u8, s.name, "direct")) continue;
         for (s.pts) |p| crop = @max(crop orelse 0, p.x);
     }
 
@@ -115,7 +117,7 @@ pub fn render(
         const usable = st == null or st.?.status.usable();
         const has_hist = if (p.hist) |*hh| hh.count() > 0 else false;
 
-        try out.writeAll(if (std.mem.eql(u8, p.name, "direct")) "<tr class=\"baseline\">" else "<tr>");
+        try out.writeAll("<tr>");
 
         // The colour swatch is the report's only legend.
         try out.writeAll("<td>");
@@ -124,7 +126,7 @@ pub fn render(
         } else {
             try out.print("<span class=\"proxycell\"><span class=\"swatch s-{s}\"></span>{s}</span>", .{ p.name, p.name });
         }
-        try writeVersion(out, p.name, st);
+        try writeVersion(out, st);
         try out.writeAll("</td>");
 
         if (!usable) {
@@ -170,7 +172,7 @@ pub fn render(
         .ylog = true,
         .xmax = crop,
     }, g.p99);
-    try card(arena, out, "Load shed vs offered", "offered load the proxy couldn't serve (1 − achieved/offered), minus the direct baseline's loadgen-side shortfall", .{
+    try card(arena, out, "Load shed vs offered", "offered load the proxy couldn't serve (1 − achieved/offered); the first few seconds include the generator's own ramp-up shortfall, which is not the proxy's", .{
         .id = "shed",
         .yfmt = .pct,
         .xmax = crop,
@@ -261,17 +263,15 @@ fn writeLatencyCellP99(out: *Writer, p: *const report.ProxyData, st: ?artifact.P
 /// read compose.yaml to find out which haproxy. zoxy additionally gets its
 /// commit, short-form, since its version alone (`zoxy 0.0.5`) does not identify
 /// a nightly build of a moving `main`.
-fn writeVersion(out: *Writer, name: []const u8, st: ?artifact.ProxyRecord) !void {
+fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
     var vbuf: [128]u8 = undefined;
     var ebuf: [512]u8 = undefined;
 
     const version: ?[]const u8 = if (st) |r| r.version else null;
     const commit: ?[]const u8 = if (st) |r| r.zoxy_commit else null;
 
-    // ALWAYS one line, on every row. Two reasons, both about the table reading
-    // straight: a row that is two lines tall beside rows that are one looks
-    // broken, and `direct` — the origin baseline, which has no container and so
-    // no version — would otherwise be the short row in every report.
+    // ALWAYS one line, on every row: a row that is two lines tall beside rows
+    // that are one looks broken.
     //
     // The full string as recorded goes in `title`, so shortening costs a reader
     // nothing: it is a hover away here and verbatim in profile.json.
@@ -280,10 +280,9 @@ fn writeVersion(out: *Writer, name: []const u8, st: ?artifact.ProxyRecord) !void
     try out.writeAll(">");
 
     if (version == null and commit == null) {
-        // Said, not left blank. For `direct` this is the point of the row —
-        // there is no proxy on the path — and for anything else it means the
-        // probe could not read one, which is worth seeing.
-        try out.writeAll(if (std.mem.eql(u8, name, "direct")) "no proxy" else "—");
+        // Said, not left blank: it means the probe could not read a version,
+        // which is worth seeing rather than hiding behind an empty cell.
+        try out.writeAll("—");
         try out.writeAll("</span>");
         return;
     }
@@ -498,7 +497,7 @@ fn card(
     for (series, 0..) |s, i| {
         const pts = try arena.alloc(svg.Point, s.pts.len);
         for (s.pts, 0..) |p, k| pts[k] = .{ .x = p.x, .y = p.y };
-        conv[i] = .{ .name = s.name, .pts = pts, .dashed = s.ref or s.baseline };
+        conv[i] = .{ .name = s.name, .pts = pts, .dashed = s.ref };
     }
 
     try out.print("<section class=\"card\"><h2>{s}</h2><p class=\"sub\">{s}</p><div class=\"chartwrap\" id=\"wrap-{s}\">", .{ title, sub, opts.id });
@@ -944,9 +943,10 @@ test "every row carries a provenance line, so none is shorter than its neighbour
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The mix that made the table uneven: `direct` has no container and so no
-    // version, while the proxy beside it has one. Without a line on both, one
-    // row is a line shorter than the other.
+    // The mix that makes the table uneven: one proxy's version probe came back
+    // and the other's did not. Without a line on both, one row is a line
+    // shorter than the other. (`direct` used to be the guaranteed no-version
+    // row; a failed probe is the case that remains.)
     var present = [_]report.ProxyData{
         .{
             .name = "haproxy",
@@ -961,9 +961,9 @@ test "every row carries a provenance line, so none is shorter than its neighbour
             .shed_raw = &.{},
         },
         .{
-            .name = "direct",
+            .name = "pingora",
             .rows = &.{},
-            .sustained = 67000,
+            .sustained = 9300,
             .hist = null,
             .dist_hist = null,
             .hgrm_file = "",
@@ -975,7 +975,7 @@ test "every row carries a provenance line, so none is shorter than its neighbour
     };
     const statuses = [_]artifact.ProxyRecord{
         .{ .name = "haproxy", .status = .ok, .version = "HAProxy version 3.0.25-eb573a937 2026/07/03" },
-        .{ .name = "direct", .status = .ok },
+        .{ .name = "pingora", .status = .ok },
     };
 
     var buf: [128 * 1024]u8 = undefined;
@@ -997,7 +997,7 @@ test "every row carries a provenance line, so none is shorter than its neighbour
 
     // One `.prov` per data row — two rows, two lines.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "class=\"prov\""));
-    // And direct's says why it has no version rather than sitting blank.
-    try std.testing.expect(std.mem.indexOf(u8, s, "no proxy") != null);
+    // The unprobed one says so with a dash rather than sitting blank.
+    try std.testing.expect(std.mem.indexOf(u8, s, "—</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, ">3.0.25<") != null);
 }

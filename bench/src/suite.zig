@@ -32,15 +32,17 @@ pub const Fleet = struct {
     /// A slice rather than a count, so growing or shrinking the pool is a
     /// terraform + compose + proxy-config change and touches nothing here.
     ///
-    /// Order is load-bearing in exactly one place: `direct` measures
-    /// `backend_ips[0]`. Everything else treats the pool as a set.
+    /// Nothing reads a particular index any more — the order is kept only so
+    /// `BACKENDn_IP` names the same host as terraform's `backendN` and the
+    /// compose profile of the same name. It was load-bearing while `direct`
+    /// measured `backend_ips[0]`.
     backend_ips: []const []const u8,
     /// null selects LOCAL mode: compose runs against this machine's docker
     /// daemon and both peers are loopback. The numbers a local run produces are
     /// NOT comparable to a fleet run — the generator shares CPU, cache and
     /// memory bandwidth with the proxy it is measuring, and the network the
-    /// fleet crosses is replaced by loopback, which removes a ceiling the cloud
-    /// `direct` baseline demonstrably sits near. Local mode is for working on
+    /// fleet crosses is replaced by loopback, which removes a network ceiling
+    /// the cloud path demonstrably sits near. Local mode is for working on
     /// the harness, not for producing results; everything downstream is
     /// labelled so a local run cannot be mistaken for a nightly.
     ssh: ?remote.Ssh,
@@ -644,7 +646,6 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
 
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
-        if (isDirect(name)) continue;
         redact.log("bench: [{s}] building", .{name});
         const t0 = Io.Timestamp.now(io, .awake);
 
@@ -847,7 +848,6 @@ fn runOne(
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
     const p = opts.prof;
-    const direct = isDirect(name);
     // Local mode never varies the port — bridge networking already tears down
     // and rebinds cleanly (Docker's own NAT layer, not a raw app bind()), and
     // varying it there would also mean varying compose.yaml's static
@@ -865,19 +865,9 @@ fn runOne(
     // some other commit than the one the report will name.
     var stale_build = false;
 
-    // `direct` measures backend0 ALONE, taking 100% of the offered load. zrk
-    // resolves exactly one address, so it cannot fan out across the pool — and
-    // the single member is the more useful baseline anyway: in a proxied run
-    // that same host sees roughly a quarter of the load, so a direct row that
-    // clears the fastest proxy proves the pool has 4x+ headroom. A direct row
-    // that does NOT clear it means the baseline has stopped bounding anything
-    // and the proxy numbers above it are suspect (cloud/variables.tf).
-    const target = if (direct)
-        try std.fmt.allocPrint(arena, "http://{s}:9000{s}", .{ opts.fleet.backend_ips[0], p.req_path })
-    else
-        try std.fmt.allocPrint(arena, "http://{s}:{d}{s}", .{ opts.fleet.proxy_ip, port, p.req_path });
+    const target = try std.fmt.allocPrint(arena, "http://{s}:{d}{s}", .{ opts.fleet.proxy_ip, port, p.req_path });
 
-    if (!direct) {
+    {
         // What the PREVIOUS proxy left behind on the proxy host, before this one
         // takes over. Bounded and best-effort — a diagnostic must never be able
         // to fail a run.
@@ -1091,7 +1081,10 @@ fn runOne(
     enter(stage, .warm, name);
     try warmProbe(io, target, name);
 
-    const cadvisor_addr: ?net.IpAddress = if (direct) null else try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
+    // Unconditional now: every proxy in the comparison runs in a container on
+    // the proxy host. It used to be optional because `direct` had no container
+    // to sample.
+    const cadvisor_addr: ?net.IpAddress = try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
     // Best-effort: give cAdvisor a bounded head start before the ramp opens
     // its own 300s sampling window. See cadvisor.waitUntilFound's doc
@@ -1210,7 +1203,7 @@ fn runOne(
             };
         }
     }
-    if (!direct and outcome.cadvisor_samples == 0) {
+    if (outcome.cadvisor_samples == 0) {
         status = .degraded;
         try notes.append(arena, "no cAdvisor samples: CPU and memory are absent, not zero");
     }
@@ -1389,7 +1382,6 @@ fn sweepProxyHost(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) !void 
 }
 
 fn teardownProxy(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, name: []const u8) !void {
-    if (isDirect(name)) return;
     // Verify the post-condition rather than trusting `stop`: a container that
     // ignores SIGTERM keeps host port 8080 and would answer the NEXT proxy's
     // probe. `docker rm -f` after the graceful attempt makes that impossible.
@@ -1486,10 +1478,6 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, port: ?u16) ![]
     return buf.toOwnedSlice(arena);
 }
 
-fn isDirect(name: []const u8) bool {
-    return std.mem.eql(u8, name, "direct");
-}
-
 const Flusher = struct {
     gpa: Allocator,
     io: Io,
@@ -1580,9 +1568,13 @@ test "a proxy's placeholder record is replaced in place, not duplicated" {
     try std.testing.expect(records.items[1].err == null);
 }
 
-test "isKnownProxy excludes direct, which has no container" {
+test "isKnownProxy names only proxies that run in a container" {
     try std.testing.expect(isKnownProxy("zoxy"));
+    // `direct` was the one entry in BENCH_PROXIES with no container. It is gone
+    // from the comparison entirely now, so this is no longer a special case —
+    // an unknown name is just unknown.
     try std.testing.expect(!isKnownProxy("direct"));
+    try std.testing.expect(!isKnownProxy("mystery"));
 }
 
 const test_fleet: Fleet = .{

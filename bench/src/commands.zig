@@ -240,9 +240,9 @@ pub fn runSuite(
         break :blk .{
             .proxy_ip = "127.0.0.1",
             // One entry: locally the whole pool is four containers on this
-            // machine reached over docker DNS, so the only address the driver
-            // itself needs is the one `direct` measures — backend0, which is the
-            // member that publishes :9000 on the host.
+            // machine, reached by the proxies over docker DNS rather than by
+            // address. The driver only needs somewhere to send `backend up`,
+            // and locally that one call starts the entire pool.
             .backend_ips = &.{"127.0.0.1"},
             .ssh = null,
             .remote_dir = ".",
@@ -298,8 +298,9 @@ pub fn runSuite(
 }
 
 /// Split `BACKEND_IPS` (cloud-init writes it from terraform's pinned addresses)
-/// into the origin pool, preserving order — index 0 is backend0, the member
-/// `direct` calibrates against.
+/// into the origin pool, preserving order — entry N is `backendN`, which is the
+/// host terraform named, the compose profile started, and the `BACKENDn_IP`
+/// override points at.
 ///
 /// Empty entries are dropped rather than kept as blanks: a trailing comma would
 /// otherwise become a fifth "backend" at the empty address, and the failure
@@ -324,7 +325,8 @@ test "parseBackendIps keeps pool order and drops blanks" {
 
     const ips = try parseBackendIps(arena, "10.10.0.13,10.10.0.14, 10.10.0.15 ,10.10.0.16,");
     try std.testing.expectEqual(@as(usize, 4), ips.len);
-    // Order is load-bearing: `direct` measures [0].
+    // Order matters: entry N must stay backendN, or a proxy is pointed at the
+    // wrong host by BACKENDn_IP.
     try std.testing.expectEqualStrings("10.10.0.13", ips[0]);
     try std.testing.expectEqualStrings("10.10.0.15", ips[2]);
     try std.testing.expectEqualStrings("10.10.0.16", ips[3]);
@@ -354,8 +356,16 @@ pub fn parseProxies(arena: Allocator, spec: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
+/// `direct` was removed here the same way traefik was: deleted, not parked, so
+/// a leftover `BENCH_PROXIES=direct,...` in a dispatch or a saved command line
+/// fails loudly instead of quietly measuring nothing.
+///
+/// It was a pseudo-proxy that ramped straight at the origin to prove the origin
+/// itself saturated above the proxies. With a four-node pool at 8 cores against
+/// a 1-CPU proxy that claim stopped being in doubt, and the check cost a full
+/// ramp per profile per night.
 const all_proxies = [_][]const u8{
-    "direct", "zoxy", "haproxy", "pingora", "envoy",
+    "zoxy", "haproxy", "nginx", "pingora", "envoy",
 };
 
 fn knownProxy(name: []const u8) bool {
@@ -370,10 +380,20 @@ test "parseProxies accepts the default set and trims spaces" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const got = try parseProxies(arena, "direct, zoxy ,haproxy,pingora");
+    const got = try parseProxies(arena, "zoxy ,haproxy,pingora, envoy");
     try std.testing.expectEqual(@as(usize, 4), got.len);
-    try std.testing.expectEqualStrings("direct", got[0]);
-    try std.testing.expectEqualStrings("pingora", got[3]);
+    try std.testing.expectEqualStrings("zoxy", got[0]);
+    try std.testing.expectEqualStrings("envoy", got[3]);
+}
+
+test "parseProxies rejects direct, which is no longer part of the comparison" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A stale dispatch input or a saved command line naming it must fail, not
+    // silently run a shorter comparison.
+    try std.testing.expectError(error.UnknownProxy, parseProxies(arena, "direct,zoxy"));
 }
 
 test "parseProxies rejects a typo rather than silently dropping it" {
@@ -388,13 +408,12 @@ test "parseProxies rejects a typo rather than silently dropping it" {
 test "parseProxies rejects proxies whose configs were removed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // traefik/nginx were deleted rather than parked. Naming one must fail here —
-    // at argument parsing, with the name in the message — rather than later as a
-    // compose service that does not exist. envoy came BACK (its config was
-    // restored from git history and re-verified end to end), which is why it is
-    // no longer in this list.
+    // traefik was deleted rather than parked. Naming it must fail here — at
+    // argument parsing, with the name in the message — rather than later as a
+    // compose service that does not exist. envoy and nginx both came BACK
+    // (each config restored from git history and re-verified end to end),
+    // which is why neither is in this list any more.
     try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "traefik"));
-    try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "nginx"));
 }
 
 // ---------------------------------------------------------------------------

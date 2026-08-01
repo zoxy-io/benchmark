@@ -1,0 +1,77 @@
+# L7 HTTP reverse proxy :8080 -> the backend0..backend3 pool (parity with every
+# other proxy here — parse HTTP/1.1, pick an origin, reverse-proxy the request,
+# keeping both the client and the pooled upstream connection alive). This is an
+# envsubst template (official-image mechanism): worker count is hardcoded to 1
+# to match the 1-CPU quota (explicit — `auto` would count HOST cores and
+# oversubscribe the cgroup, the trap haproxy's nbthread / envoy's --concurrency
+# avoid too). access_log off => the hot path never touches disk. Each
+# `backendN` resolves once at startup via the container's resolver (bridge DNS)
+# or /etc/hosts (cloud extra_hosts); the origins are already healthy by then
+# (depends_on), so no runtime resolver is needed — same as pingora.
+worker_processes 1;
+worker_rlimit_nofile 262144;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 65536;
+    use epoll;       # auto-detected on Linux, explicit for documentation
+    multi_accept on; # drain the accept queue in one wakeup under bursts
+}
+
+http {
+    access_log off;              # hot path never touches disk
+    server_tokens off;
+
+    # Four origins. nginx's default balancing method IS round-robin, which is
+    # what every proxy in this comparison is pinned to — stated here rather
+    # than left implicit, because it now decides something. No `least_conn`,
+    # no weights.
+    #
+    # `max_fails=0` is NOT cosmetic. Unlike the others, nginx ships PASSIVE
+    # health checking on by default (max_fails=1, fail_timeout=10s): one failed
+    # connection ejects that origin from balancing for ten seconds. Every
+    # backend stays up for the whole run, so this never fires in the healthy
+    # case — but this benchmark deliberately drives the proxy past its knee,
+    # and a connection error there would silently drop nginx to a three-origin
+    # pool mid-ramp while haproxy (no `check`), envoy, pingora and zoxy all
+    # keep hammering four. That is an availability feature masquerading as
+    # throughput, so it is turned off rather than measured.
+    upstream origin {
+        server backend0:9000 max_fails=0;
+        server backend1:9000 max_fails=0;
+        server backend2:9000 max_fails=0;
+        server backend3:9000 max_fails=0;
+
+        # Pool + keep-alive the upstream leg for parity with the other L7
+        # proxies (haproxy http-reuse, envoy/pingora pools, zoxy's per-endpoint
+        # idle lists). Without this nginx opens a fresh backend connection per
+        # request and pays a connect on the hot path.
+        #
+        # 2048, not 512, and for the same reason pingora's pool was multiplied:
+        # this cache is per WORKER and shared across every server in the group,
+        # so with four origins 512 would leave ~128 idle connections each and
+        # reintroduce exactly the per-request connect this line exists to
+        # prevent. Round-robin means one client connection rotates through all
+        # four, so each wants a warm upstream.
+        keepalive 2048;
+        keepalive_requests 1000000;
+        keepalive_timeout 60s;
+    }
+
+    server {
+        # Rendered by the image's envsubst hook from the container environment.
+        # The listener port varies per (profile, proxy) turn on the cloud fleet
+        # — see compose.yaml's x-proxy-common for why — and this file is a
+        # mounted template, so compose's own `${}` interpolation never reaches
+        # it. Same mechanism the backend origin's template already uses for
+        # BACKEND_CPUS.
+        listen ${PROXY_PORT};
+        location / {
+            proxy_pass http://origin;
+            # keep-alive to the upstream requires HTTP/1.1 with the per-hop
+            # Connection header cleared (nginx defaults to HTTP/1.0 + close).
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+}

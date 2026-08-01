@@ -18,7 +18,8 @@
 //! Pingora ships `pingora-load-balancing` with exactly this, but pulling in a
 //! selection framework — with its health-check background service and discovery
 //! machinery — to rotate a fixed four-element array would add moving parts the
-//! other proxies do not have here (nobody active-health-checks in this run).
+//! other proxies do not have here (no proxy health-checks the pool in this run;
+//! nginx even had its default passive checks turned off for parity).
 //! An atomic counter is the whole algorithm.
 //!
 //! Knobs via env (set by compose, matching the other proxies):
@@ -119,7 +120,7 @@ fn main() {
     // Default upstream_keepalive_pool_size is 128 (and it's a per-thread LRU,
     // so with threads=1 that's the effective cap) — well under CONNECTIONS=500,
     // so under load the idle-connection pool churns and reopens fresh upstream
-    // TCP connections instead of reusing them. Match nginx's `keepalive 512`
+    // TCP connections instead of reusing them. Matches nginx's `keepalive`
     // (parity: envoy raises its circuit-breaker max_connections the same way).
     //
     // Times the pool size, because this is the TOTAL pool and it is now shared

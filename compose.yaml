@@ -3,13 +3,15 @@
 # One file describes every role; compose profiles pick what runs where:
 #   backend     the four-node nginx origin POOL (local: all four containers on
 #               this host; cloud: one container per backend VM, profile backendN)
-#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|pingora|envoy)
-# The comparison is direct/zoxy/haproxy/pingora/envoy. traefik and nginx were
-# removed rather than parked: an unexercised proxy config rots — its TLS/ALPN
-# pinning and its healthcheck probe go stale unnoticed — so git history is a
-# better starting point for re-adding one than a stale file is. envoy went
-# through that same removal once and came back (its config was restored from
-# git history and re-verified end to end) — see commands.zig's parseProxies.
+#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|nginx|pingora|envoy)
+# The comparison is zoxy/haproxy/nginx/pingora/envoy. traefik and the `direct`
+# no-proxy origin baseline were removed rather than parked: an unexercised
+# proxy config rots — its TLS/ALPN pinning and its healthcheck probe go stale
+# unnoticed — so git history is a better starting point for re-adding one than
+# a stale file is. envoy and nginx have each been through that removal and come
+# back, each config restored from git history and re-verified end to end, which
+# is the process working rather than an argument against it — see commands.zig's
+# parseProxies.
 # The load generator is not a compose service: the `bench` binary runs directly
 # on the loadgen host (static musl, no container, so no seccomp profile to
 # reconcile with io_uring) and drives this file over ssh.
@@ -96,7 +98,7 @@ x-proxy-common: &proxy-common
 # name. Serving, not merely bound, is the condition worth waiting on; a proxy
 # that listens but cannot reach its upstream is not ready to be measured.
 #
-# One timing block for all six, because the check runs INSIDE the proxy's own
+# One timing block for all five, because the check runs INSIDE the proxy's own
 # cgroup: its fork+exec is charged to the CPU number cAdvisor reports, so the
 # cadence has to be identical for every proxy or it is a fairness leak. Probe
 # hard while starting (start_interval), then back off to 30s ≈ 10 execs across
@@ -111,7 +113,7 @@ x-healthcheck-timing: &healthcheck-timing
 # The probe must already exist inside each proxy's own image — no extra package
 # may be installed into a container whose memory footprint is a published
 # number. That splits them in two, checked image by image rather than
-# assumed: the alpine-based one (haproxy) carries busybox wget.
+# assumed: the alpine-based ones (haproxy, nginx) carry busybox wget.
 x-healthcheck-wget: &healthcheck-wget
   <<: *healthcheck-timing
   test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PROXY_PORT:-8080}/1k"]
@@ -150,9 +152,10 @@ x-healthcheck-bash: &healthcheck-bash
 #     address. Bringing up the `backend` profile there would try to bind :9000
 #     four times on one host and fail three of them.
 #
-# Only backend0 publishes a host port: it is what `direct` measures locally, and
-# the other three are reached by the proxies over the compose network, which
-# needs no mapping. In cloud, `ports:` is reset by the overlay anyway.
+# Only backend0 publishes a host port: it is the one a human can curl locally
+# to check the origin by hand, and the other three are reached by the proxies
+# over the compose network, which needs no mapping. In cloud, `ports:` is reset
+# by the overlay anyway.
 x-backend: &backend
   image: nginx:1.27-alpine
   # 2, matching cloud/variables.tf's backend_cores — it becomes nginx's
@@ -201,7 +204,7 @@ services:
     profiles: [backend, backend3]
 
   # ------------------------------------------------------- proxies under test --
-  # All six: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
+  # All five: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
   # an `http` listener, so EVERY proxy now parses requests and reverse-proxies
   # them), upstream = the backend0..backend3 pool, keep-alive both legs, no
   # access logs. The generator speaks h1 end-to-end; the origin is nginx.
@@ -326,6 +329,27 @@ services:
     ports:
       - "8080:8080"
     healthcheck: *healthcheck-bash
+
+  nginx:
+    <<: *proxy-common
+    # nginx runs as an HTTP reverse proxy (proxy_pass) over a four-server
+    # upstream with a keepalive pool — the stock official image, no custom
+    # build. The image's envsubst hook renders the template into /etc/nginx at
+    # start; worker_processes is hardcoded to 1 (1 CPU) and the listener port
+    # comes from PROXY_PORT below.
+    image: nginx:1.27-alpine
+    container_name: nginx
+    profiles: [nginx]
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      # Read by envsubst when it renders the template, NOT by compose
+      # interpolation into the mounted file — see the `listen` line there.
+      PROXY_PORT: ${PROXY_PORT:-8080}
+    volumes:
+      - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    ports:
+      - "8080:8080"
+    healthcheck: *healthcheck-wget
 
   pingora:
     <<: *proxy-common

@@ -68,7 +68,7 @@ pub const Error = error{
 /// has a live container while one proxy is being measured, which is what makes
 /// a leftover from the previous iteration detectable.
 pub const known_proxies = [_][]const u8{
-    "zoxy", "haproxy", "pingora", "envoy",
+    "zoxy", "haproxy", "nginx", "pingora", "envoy",
 };
 
 pub const Observation = struct {
@@ -481,7 +481,7 @@ test "matchKnownProxy returns the static entry, not the caller's slice" {
     try std.testing.expect(matched.ptr != scratch.ptr);
     try std.testing.expectEqualStrings("haproxy", matched);
 
-    try std.testing.expect(matchKnownProxy("nginx") == null);
+    try std.testing.expect(matchKnownProxy("mystery") == null);
 }
 
 test "nameLabel finds name regardless of label order" {
@@ -614,8 +614,12 @@ test "isKnownProxy covers the comparison set" {
     // invisible to the preflight sweep AND the identity witness — exactly the
     // corruption class this whole mechanism exists to catch.
     try std.testing.expect(isKnownProxy("envoy"));
-    // `direct` has no container at all — it must never be treated as an
-    // intruder, or every direct baseline would fail its identity check.
+    // nginx came back the same way envoy did, and the same trap applies: miss
+    // it here and a leftover nginx container is invisible to both the
+    // preflight sweep and the identity witness.
+    try std.testing.expect(isKnownProxy("nginx"));
+    // `direct` is gone from the comparison and never had a container; it is
+    // named here only so a leftover reference to it stays a plain unknown.
     try std.testing.expect(!isKnownProxy("direct"));
     try std.testing.expect(!isKnownProxy("cadvisor"));
 }

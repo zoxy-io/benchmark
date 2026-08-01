@@ -64,7 +64,7 @@ on:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
         type: string
-        default: direct,zoxy,haproxy,pingora,envoy
+        default: zoxy,haproxy,nginx,pingora,envoy
 
 # `id-token: write` is needed by the Yandex OIDC exchange in the bench job, and
 # again — along with `pages: write` — by the publish job it hands off to, whose
@@ -115,7 +115,7 @@ jobs:
       # just not in the default nightly set while that investigation is open.
       # Pass `profiles: c1k,c10k` on a manual dispatch to run it anyway.
       BENCH_PROFILES: ${{ inputs.profiles || 'c1k' }}
-      BENCH_PROXIES: ${{ inputs.proxies || 'direct,zoxy,haproxy,pingora,envoy' }}
+      BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
       YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID }}

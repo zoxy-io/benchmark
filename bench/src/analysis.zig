@@ -455,26 +455,6 @@ fn ptLessThan(_: void, a: Point, b: Point) bool {
     return a.x < b.x;
 }
 
-/// Linear interpolation of y at x over x-sorted points; clamps to the end values
-/// outside the range, 0 if empty. Used to read the direct baseline's shed at
-/// another run's offered levels (their window grids differ by fractions of a
-/// second).  (report.py:345)
-pub fn interp(pts: []const Point, x: f64) f64 {
-    if (pts.len == 0) return 0;
-    if (x <= pts[0].x) return pts[0].y;
-    if (x >= pts[pts.len - 1].x) return pts[pts.len - 1].y;
-
-    var lo: usize = 0;
-    var hi: usize = pts.len - 1;
-    while (hi - lo > 1) {
-        const m = (lo + hi) / 2;
-        if (pts[m].x <= x) lo = m else hi = m;
-    }
-    const a = pts[lo];
-    const b = pts[hi];
-    return if (b.x > a.x) a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x) else a.y;
-}
-
 /// zrk's histogram tops out at `hist_highest` (60s, zrk/src/stats.zig:35) and
 /// CLAMPS rather than drops, so a catastrophically overloaded run reports every
 /// tail percentile as exactly that ceiling. Those are not measurements, and the
@@ -573,14 +553,6 @@ test "merge aligns loadgens by interval index and sums them" {
     try std.testing.expectEqual(@as(f64, 1000), w[0].achieved);
     // latency is the max across loadgens, not the sum or the mean
     try std.testing.expectApproxEqAbs(@as(f64, 0.004), w[0].p99, 1e-12);
-}
-
-test "interp clamps outside the range and is linear within it" {
-    const pts = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 100 } };
-    try std.testing.expectEqual(@as(f64, 0), interp(&pts, -5));
-    try std.testing.expectEqual(@as(f64, 100), interp(&pts, 50));
-    try std.testing.expectApproxEqAbs(@as(f64, 50), interp(&pts, 5), 1e-12);
-    try std.testing.expectEqual(@as(f64, 0), interp(&.{}, 1));
 }
 
 test "smoothMedian kills a lone spike but keeps the trend" {

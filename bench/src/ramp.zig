@@ -42,7 +42,8 @@ pub const Options = struct {
     /// Full URL, always an IP literal — zoxy does no DNS and a hostname here
     /// would also drag zrk's untimed resolver into the measurement path.
     target: []const u8,
-    /// Where to sample container CPU/memory, or null for `direct` (no container).
+    /// Where to sample container CPU/memory. Optional because a caller may have
+    /// no cAdvisor to point at; every proxy in the comparison runs in a container.
     cadvisor_addr: ?net.IpAddress,
     /// Output base path; `.ndjson`, `.hgrm` and `.summary.json` are appended.
     out_base: []const u8,

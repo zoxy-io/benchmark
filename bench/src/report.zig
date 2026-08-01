@@ -25,8 +25,15 @@ const Point = analysis.Point;
 
 /// Display order for the summary table and every series list. Proxies present in
 /// the run but not named here follow, in the order the run recorded them.
+///
+/// `direct` is still listed, and deliberately, even though it is no longer part
+/// of the comparison and no run produces it any more: `bench index` walks THIS
+/// list to build the trend chart out of history.ndjson, and every night before
+/// the removal has direct rows in there. Dropping it here would erase that line
+/// from the chart retroactively rather than letting it end where it stopped.
+/// Nothing else reaches it — a name only matters here if the data contains it.
 pub const proxy_order = [_][]const u8{
-    "zoxy", "haproxy", "pingora", "envoy", "direct",
+    "zoxy", "haproxy", "nginx", "pingora", "envoy", "direct",
 };
 
 /// Dark-ground hues (zoxy.io palette): zoxy is the amber signal, the rest are
@@ -34,6 +41,9 @@ pub const proxy_order = [_][]const u8{
 pub const palette = [_]struct { name: []const u8, hex: []const u8 }{
     .{ .name = "zoxy", .hex = "#fb9e0e" },
     .{ .name = "haproxy", .hex = "#38bdf8" },
+    // Matches --c-nginx in report.css, which kept its entry through the
+    // removal; the swatch and line rules there are already keyed on s-nginx.
+    .{ .name = "nginx", .hex = "#34d399" },
     .{ .name = "pingora", .hex = "#f472b6" },
     .{ .name = "envoy", .hex = "#a78bfa" },
     .{ .name = "direct", .hex = "#6d7385" },
@@ -62,8 +72,8 @@ pub const ProxyData = struct {
     /// two would either wrongly filter the chart or wrongly widen the table.
     dist_hist: ?Histogram,
     hgrm_file: []const u8,
-    /// Peak container working-set bytes; null for `direct` (no container) and
-    /// for any run whose cAdvisor samples are absent.
+    /// Peak container working-set bytes; null for any run whose cAdvisor
+    /// samples are absent.
     mem: ?f64,
     /// Container cores vs offered; empty when no cAdvisor samples exist.
     cpu: []Point,
@@ -76,8 +86,6 @@ pub const Series = struct {
     pts: []const Point,
     /// The synthetic y=x perfect-keep-up diagonal.
     ref: bool = false,
-    /// The no-proxy origin calibration, not a competitor.
-    baseline: bool = false,
 };
 
 pub const Gathered = struct {
@@ -174,7 +182,7 @@ pub fn gather(
             pts[i] = .{ .x = r.offered, .y = r.achieved };
             xmax = @max(xmax, r.offered);
         }
-        try rps.append(arena, .{ .name = p.name, .pts = pts, .baseline = isDirect(p.name) });
+        try rps.append(arena, .{ .name = p.name, .pts = pts });
     }
     {
         const diag = try arena.alloc(Point, 2);
@@ -185,7 +193,7 @@ pub fn gather(
 
     // --- cpu: median over 7 points, to damp genuine second-to-second jitter
     // (scheduling, the periodic healthcheck exec, cAdvisor housekeeping stalls
-    // that widen a real interval). `direct` has no container to measure.
+    // that widen a real interval).
     //
     // This median used to be load-bearing for a DIFFERENT reason, and that
     // reason was a bug: the rate was computed against the poll clock, so a poll
@@ -198,7 +206,7 @@ pub fn gather(
     // being cosmetic. Do not widen it to fix a number that looks wrong.
     var cpu: std.ArrayList(Series) = .empty;
     for (present) |*p| {
-        if (isDirect(p.name) or p.cpu.len == 0) continue;
+        if (p.cpu.len == 0) continue;
         try cpu.append(arena, .{
             .name = p.name,
             .pts = try analysis.smoothMedian(arena, p.cpu, 7),
@@ -209,28 +217,33 @@ pub fn gather(
     var p99: std.ArrayList(Series) = .empty;
     for (present) |*p| {
         if (p.p99.len == 0) continue;
-        try p99.append(arena, .{ .name = p.name, .pts = p.p99, .baseline = isDirect(p.name) });
+        try p99.append(arena, .{ .name = p.name, .pts = p.p99 });
     }
 
     // --- shed: every window shown, no offered floor. Raw shed is signed (see
-    // analysis.merge) and median-smoothed; THEN the direct baseline's smoothed
-    // shortfall at the same offered is subtracted before clamping at 0. The
-    // loadgen itself falls a few % short of the schedule in the first ~15s
-    // (connect overhead, TCP slow-start) and `direct` measures exactly that with
-    // no proxy on the path — subtracting it isolates the proxy's own shedding,
-    // so curves sit at zero from the left edge until the proxy's real knee.
-    var base: []const Point = &.{};
-    for (present) |*p| {
-        if (isDirect(p.name)) base = p.shed_raw;
-    }
+    // analysis.merge), median-smoothed, then clamped at 0.
+    //
+    // It used to have the `direct` baseline's smoothed shortfall subtracted at
+    // the same offered level first. That mattered: the loadgen itself falls a
+    // few % short of the schedule in the first ~15s (connect overhead, TCP
+    // slow-start), `direct` measured exactly that with no proxy on the path,
+    // and subtracting it made every curve sit at zero from the left edge until
+    // the proxy's real knee.
+    //
+    // Removing `direct` removed the only measurement of that shortfall, so the
+    // subtraction is gone and the generator's own ramp-up is now INSIDE these
+    // curves. A few % at the extreme left is the loadgen, not the proxy — the
+    // chart caption says so, because nothing in the data distinguishes them any
+    // more. Curves are still comparable to each other (every proxy carries the
+    // same generator overhead); they are not comparable to a pre-removal run's.
     var shed: std.ArrayList(Series) = .empty;
     for (present) |*p| {
         if (p.shed_raw.len == 0) continue;
         const pts = try arena.alloc(Point, p.shed_raw.len);
         for (p.shed_raw, 0..) |q, i| {
-            pts[i] = .{ .x = q.x, .y = @max(0.0, q.y - analysis.interp(base, q.x)) };
+            pts[i] = .{ .x = q.x, .y = @max(0.0, q.y) };
         }
-        try shed.append(arena, .{ .name = p.name, .pts = pts, .baseline = isDirect(p.name) });
+        try shed.append(arena, .{ .name = p.name, .pts = pts });
     }
 
     return .{
@@ -332,10 +345,6 @@ pub const ProxyInput = struct {
     mem: ?f64 = null,
     cpu: []Point = &.{},
 };
-
-fn isDirect(name: []const u8) bool {
-    return std.mem.eql(u8, name, "direct");
-}
 
 /// Basename of the whole-run .hgrm (for a download link), or "".
 fn hgrmFilename(
@@ -493,8 +502,6 @@ pub fn writeJson(
         try j.string(p.name);
         try j.key("self");
         try j.boolean(std.mem.eql(u8, p.name, "zoxy"));
-        try j.key("baseline");
-        try j.boolean(isDirect(p.name));
 
         // Verbatim, as the container answered — the same string profile.json
         // and the HTML table carry. Shortening it to a marketing-sized label
@@ -601,10 +608,6 @@ fn writeSeries(
         try j.endArray();
         if (s.ref) {
             try j.key("ref");
-            try j.boolean(true);
-        }
-        if (s.baseline) {
-            try j.key("baseline");
             try j.boolean(true);
         }
         try j.endObject();
