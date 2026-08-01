@@ -65,6 +65,15 @@ pub const Options = struct {
     /// Left off for the run report's charts, where each series is hundreds of
     /// samples of a continuous ramp and a dot per sample is just ink.
     markers: bool = false,
+    /// x is an ORDINAL position — the Nth observation — not a measured quantity.
+    ///
+    /// Changes two things, both because a fraction of a run means nothing: the
+    /// axis ends exactly on the last observation instead of being rounded up to
+    /// a round number, and ticks land on whole runs, counted from 1.
+    ///
+    /// Must be set together with `XAxis.labels` on the same chart's data blob,
+    /// or the crosshair maps to a different x range than the drawing.
+    x_ordinal: bool = false,
 };
 
 /// A small fixed-capacity tick list. 24 is far more than a readable axis ever
@@ -109,6 +118,26 @@ pub fn niceTicks(lo: f64, hi_in: f64, n: usize) Ticks {
         t += step;
     }
     out.append(roundTo(t, 10)) catch {};
+    return out;
+}
+
+/// Integer tick positions 0..hi, thinned so the axis never carries more labels
+/// than it can show.
+///
+/// For an axis whose x is a COUNT of observations, where a fractional tick is
+/// meaningless — `niceTicks` happily labels run 0.5.
+pub fn ordinalTicks(hi: f64) Ticks {
+    var out: Ticks = .{};
+    const n: usize = @intFromFloat(@max(hi, 0));
+    // At most ~9 labels, and always a whole number of runs apart.
+    const stride: usize = @max(1, (n + 8) / 8);
+    var i: usize = 0;
+    while (i <= n) : (i += stride) {
+        out.append(@floatFromInt(i)) catch return out;
+    }
+    // The last run always gets a tick, even when the stride skipped it: it is
+    // the one a reader is looking for.
+    if ((n % stride) != 0) out.append(@floatFromInt(n)) catch {};
     return out;
 }
 
@@ -243,9 +272,14 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     };
     if (xmax <= 0) xmax = 1;
 
-    const xticks = niceTicks(0, xmax, 5);
+    const xticks = if (opts.x_ordinal) ordinalTicks(xmax) else niceTicks(0, xmax, 5);
     const xt = xticks.slice();
-    const xmaxt = xt[xt.len - 1];
+    // An ordinal axis ends ON the last observation. `niceTicks` rounds up to a
+    // round number, which for 8 runs (x = 0..7) puts the axis end at 8 — a tick
+    // for a night that does not exist, with the newest run stranded 12% short of
+    // the right edge. It reads as the latest run being missing, which is exactly
+    // how it was reported.
+    const xmaxt = if (opts.x_ordinal) @max(xmax, 1) else xt[xt.len - 1];
 
     // The y scale is fitted to the VISIBLE window only.
     var ylo: f64 = 0;
@@ -315,7 +349,14 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
         try writeYGridLine(out, ctx.y(t), fmtTick(&buf, t, opts.yfmt));
     }
     for (xt) |t| {
-        try out.print("<text class=\"tick\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ ctx.x(t), h - mb + 18, fmtSi(&buf, t) });
+        // An ordinal axis counts from 1: the eighth night is "8", not "7". The
+        // tooltip names the actual run, so this only has to agree with how a
+        // person counts them.
+        const label = if (opts.x_ordinal)
+            std.fmt.bufPrint(&buf, "{d:.0}", .{t + 1}) catch "?"
+        else
+            fmtSi(&buf, t);
+        try out.print("<text class=\"tick\" x=\"{d:.1}\" y=\"{d:.0}\" text-anchor=\"middle\">{s}</text>", .{ ctx.x(t), h - mb + 18, label });
     }
     try writeXAxis(out, opts.x_label);
     try writeYUnitLabel(out, opts.y_unit);
@@ -429,10 +470,17 @@ pub fn writeChartData(
         break :blk @max(m, 1);
     };
     if (xmax <= 0) xmax = 1;
-    const ticks = niceTicks(0, xmax, 5);
-    const t = ticks.slice();
+    // Must match `chart`'s own xmaxt exactly, or the crosshair reads a
+    // different x than the one drawn. `labels` is what makes the axis ordinal —
+    // the same signal `Options.x_ordinal` carries on the drawing side.
     try j.key("xmax");
-    try j.float(t[t.len - 1], 4);
+    if (x.labels.len > 0) {
+        try j.float(@max(xmax, 1), 4);
+    } else {
+        const ticks = niceTicks(0, xmax, 5);
+        const t = ticks.slice();
+        try j.float(t[t.len - 1], 4);
+    }
 
     try j.key("x");
     try j.beginObject();
@@ -706,4 +754,65 @@ test "markers are drawn for discrete observations, and let out of the clip" {
         try std.testing.expect(std.mem.indexOf(u8, s, "<circle") == null);
         try std.testing.expect(std.mem.indexOf(u8, s, "<rect x=\"62\"") != null);
     }
+}
+
+test "an ordinal axis ends on the last observation, not on a round number" {
+    var buf: [8192]u8 = undefined;
+
+    // Eight nights occupy x = 0..7. niceTicks rounds that up to 8 — a tick for
+    // a ninth night that does not exist — and strands the newest run 12% short
+    // of the right edge, which is exactly how "we still don't have run 8 on the
+    // chart" was reported.
+    const pts = [_]Point{
+        .{ .x = 0, .y = 40000 }, .{ .x = 1, .y = 41000 },
+        .{ .x = 2, .y = 42000 }, .{ .x = 3, .y = 43000 },
+        .{ .x = 4, .y = 41000 }, .{ .x = 5, .y = 42000 },
+        .{ .x = 6, .y = 43000 }, .{ .x = 7, .y = 44000 },
+    };
+    const series = [_]Series{.{ .name = "zoxy", .pts = &pts }};
+
+    var out: std.Io.Writer = .fixed(&buf);
+    _ = try chart(&out, .{ .id = "t", .markers = true, .x_ordinal = true }, &series);
+    const s = out.buffered();
+
+    // The newest run lands ON the right edge of the plot (w - mr = 704).
+    try std.testing.expect(std.mem.indexOf(u8, s, "cx=\"704.0\"") != null);
+    // Counted from 1, so the eighth night is labelled "8" — and there is no "9".
+    try std.testing.expect(std.mem.indexOf(u8, s, ">8</text>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ">9</text>") == null);
+
+    // The non-ordinal path is unchanged: still rounded, still 0-based.
+    var out2: std.Io.Writer = .fixed(&buf);
+    _ = try chart(&out2, .{ .id = "t" }, &series);
+    try std.testing.expect(std.mem.indexOf(u8, out2.buffered(), "cx=\"704.0\"") == null);
+}
+
+test "the ordinal axis and its hover blob agree on xmax" {
+    // They are computed in two different functions; disagreeing puts the
+    // crosshair on a different x than the one drawn.
+    var buf: [8192]u8 = undefined;
+    const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 3 } };
+    const series = [_]Series{.{ .name = "zoxy", .pts = &pts }};
+    const runids = [_][]const u8{ "r1", "r2", "r3" };
+
+    var out: std.Io.Writer = .fixed(&buf);
+    try writeChartData(&out, "trend", &series, .si, null, .{ .name = "run", .labels = &runids });
+    // 2, the last observation — not niceTicks' rounded-up 2.5.
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "\"xmax\":2.0") != null);
+}
+
+test "ordinalTicks stays whole-numbered and always marks the last run" {
+    // Small: every run gets a tick.
+    const few = ordinalTicks(3);
+    try std.testing.expectEqual(@as(usize, 4), few.slice().len);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), few.slice()[3], 1e-9);
+
+    // Large: thinned, but the last run is never the one dropped — it is the one
+    // a reader is looking for.
+    const many = ordinalTicks(30);
+    const t = many.slice();
+    try std.testing.expect(t.len <= 10);
+    try std.testing.expectApproxEqAbs(@as(f64, 30), t[t.len - 1], 1e-9);
+    // Whole runs only; `niceTicks` would happily label run 0.5.
+    for (t) |v| try std.testing.expectApproxEqAbs(v, @round(v), 1e-9);
 }

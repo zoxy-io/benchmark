@@ -264,6 +264,9 @@ pub fn renderIndex(
                 .yfmt = .si,
                 .y_unit = "req/s",
                 .x_label = "run",
+                // x counts nights, so the axis ends on the last one and ticks
+                // land on whole runs — see Options.x_ordinal.
+                .x_ordinal = true,
                 // One point per night, so the nights have to be visible as
                 // points. Without this a profile with a single night of
                 // history drew an empty chart — a one-point `<polyline>` has
