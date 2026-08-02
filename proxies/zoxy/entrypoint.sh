@@ -15,6 +15,18 @@ set -eu
 
 BACKENDS=${BACKENDS:-backend0:9000,backend1:9000,backend2:9000,backend3:9000}
 
+# access_log_buffer_bytes fixed at its compiled ceiling (constants.zig's
+# access_log_buffer_bytes_max, 1 MiB), not left at the 32 KiB default: the
+# access log is two of these buffers with one write in flight, so the real
+# burst-absorption depth before lines drop is one buffer's worth, and at 32
+# KiB that was ~131 typical lines — far too little at c10k concurrency on the
+# 1-CPU box this runs on, where the write's own round trip already competes
+# with the event loop for the one core. The c1k run this was found on dropped
+# 48.51% of completed requests' log lines at the default; every other proxy
+# in the comparison writes (or buffers) every line, so an undersized zoxy
+# default was contaminating the comparison with a capacity artifact rather
+# than a genuine throughput difference.
+#
 # Optional c10k knobs: config.zig's `limits.conn_slots`/`limits.upstream_slots`
 # default to 1386/1024 (~32 MiB); omitting a key or passing `{}` is identical
 # to leaving it at its compiled default (all `Limits` fields default; see
@@ -22,13 +34,12 @@ BACKENDS=${BACKENDS:-backend0:9000,backend1:9000,backend2:9000,backend3:9000}
 # compiled ceiling — a deployment opts up explicitly, here). Neither set =>
 # `{}`, today's default behavior, byte-for-byte. relay_buffers isn't set on
 # purpose — it defaults to conn_slots when omitted.
-fields=""
+fields="\"access_log_buffer_bytes\": 1048576"
 if [ -n "${ZOXY_CONN_SLOTS:-}" ]; then
-    fields="\"conn_slots\": ${ZOXY_CONN_SLOTS}"
+    fields="$fields, \"conn_slots\": ${ZOXY_CONN_SLOTS}"
 fi
 if [ -n "${ZOXY_UPSTREAM_SLOTS:-}" ]; then
-    [ -n "$fields" ] && fields="$fields, "
-    fields="${fields}\"upstream_slots\": ${ZOXY_UPSTREAM_SLOTS}"
+    fields="${fields}, \"upstream_slots\": ${ZOXY_UPSTREAM_SLOTS}"
 fi
 LIMITS="{${fields}}"
 
