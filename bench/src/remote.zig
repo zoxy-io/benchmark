@@ -327,8 +327,33 @@ pub const Host = union(enum) {
     local,
 };
 
-/// Run a command on `host`, returning an error if it did not succeed. The
-/// child's stderr is passed through the redaction filter before being logged.
+/// The tail of one captured stream, redacted and printed under `label`.
+///
+/// 16 KiB, not 1 KiB. BuildKit prints the real error FIRST and then its own
+/// epilogue — a Dockerfile source frame plus a `failed to solve: process
+/// "/bin/sh -c ..."` line echoing the whole RUN command — and that boilerplate
+/// alone runs well past 1 KiB. So on a `docker compose build` failure, which is
+/// the single most common thing this function has to explain, a 1 KiB tail was
+/// GUARANTEED to be pure epilogue with the compiler's output cut off the front.
+///
+/// `exec` already keeps the first 1 MiB of each stream (max_output), so this
+/// only bounds what gets PRINTED — the data was there.
+fn printTail(arena: Allocator, label: []const u8, stream: []const u8) !void {
+    if (stream.len == 0) return;
+    const keep = 16 * 1024;
+    const tail = stream[stream.len -| keep ..];
+    // Heap, not a stack array: `scrub` silently stops at the end of its output
+    // buffer, so a buffer smaller than the slice would trade the truncation
+    // above for the same truncation one layer down. Every registered address is
+    // longer than the `<addr>` it becomes, so the result cannot outgrow its
+    // input.
+    const scrubbed = try arena.alloc(u8, tail.len);
+    std.debug.print("  [{s}] {s}\n", .{ label, redact.scrub(scrubbed, tail) });
+}
+
+/// Run a command on `host`, returning an error if it did not succeed. Both of
+/// the child's streams are passed through the redaction filter before being
+/// logged.
 pub fn check(
     gpa: Allocator,
     arena: Allocator,
@@ -346,33 +371,21 @@ pub fn check(
     if (!res.ok()) {
         var buf: [64]u8 = undefined;
         redact.log("bench: {s} failed ({s})", .{ what, res.describe(&buf) });
-        if (res.stderr.len > 0) {
-            // 16 KiB, not 1 KiB. BuildKit prints the real error FIRST and then
-            // its own epilogue — a Dockerfile source frame plus a `failed to
-            // solve: process "/bin/sh -c ..."` line echoing the whole RUN
-            // command — and that boilerplate alone runs well past 1 KiB. So on
-            // a `docker compose build` failure, which is the single most
-            // common thing this function has to explain, a 1 KiB tail was
-            // GUARANTEED to be pure epilogue with the compiler's output cut
-            // off the front.
-            //
-            // Run 30693210951 is the case in point: zoxy failed to build on
-            // the proxy VM and the entire diagnostic was the frame, opening
-            // mid-word at "uilding". The cause is not recoverable from that
-            // log, only from the next occurrence.
-            //
-            // `exec` already keeps the first 1 MiB of stderr (max_output), so
-            // this only ever widened what gets PRINTED — the data was there.
-            const keep = 16 * 1024;
-            const tail = res.stderr[res.stderr.len -| keep ..];
-            // Heap, not a stack array: `scrub` silently stops at the end of its
-            // output buffer, so a buffer smaller than the slice would trade the
-            // truncation above for the same truncation one layer down. Every
-            // registered address is longer than the `<addr>` it becomes, so the
-            // result cannot outgrow its input.
-            const scrubbed = try arena.alloc(u8, tail.len);
-            std.debug.print("  {s}\n", .{redact.scrub(scrubbed, tail)});
-        }
+        // BOTH streams, stdout first. Only printing stderr is how two zoxy
+        // build failures in a row (runs 30693210951 and 30749146321) came out
+        // as nothing but a Dockerfile source frame: `docker compose build`
+        // splits its output, and the half this was printing is the useless
+        // half. Compose writes its own progress lines and the `failed to
+        // solve:` epilogue to stderr, while BuildKit writes the STEP LOG — the
+        // `#N 12.3 <line>` echo of everything the RUN itself printed, i.e. the
+        // compiler's actual error — to stdout. Widening the stderr tail from
+        // 1 KiB to 16 KiB after the first occurrence therefore bought nothing:
+        // the cause was never on that stream to begin with.
+        //
+        // stdout first because that is the cause and stderr is the epilogue,
+        // which is also the order BuildKit emits them in.
+        try printTail(arena, "stdout", res.stdout);
+        try printTail(arena, "stderr", res.stderr);
         return error.RemoteCommandFailed;
     }
     return res;
