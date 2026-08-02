@@ -206,8 +206,50 @@ services:
   # ------------------------------------------------------- proxies under test --
   # All five: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
   # an `http` listener, so EVERY proxy now parses requests and reverse-proxies
-  # them), upstream = the backend0..backend3 pool, keep-alive both legs, no
-  # access logs. The generator speaks h1 end-to-end; the origin is nginx.
+  # them), upstream = the backend0..backend3 pool, keep-alive both legs, and an
+  # access log per request. The generator speaks h1 end-to-end; the origin is
+  # nginx.
+  #
+  # ACCESS LOGS ARE ON, and that is a deliberate change of what this benchmark
+  # measures — a production reverse proxy logs its requests, and a comparison
+  # with logging off measures a configuration nobody deploys. Four things travel
+  # with it and none of them is a detail:
+  #
+  #   1. Numbers before and after this change are NOT comparable. Every proxy
+  #      now does per-request formatting and a write it did not do before, so a
+  #      drop across this commit on the trend chart is this commit, not a
+  #      regression in anything.
+  #
+  #   2. The sink is a FILE, /tmp/access.log, not the container's stdout.
+  #      Stdout is a pipe that dockerd drains; when dockerd falls behind, the
+  #      64K pipe buffer fills and the proxy BLOCKS inside its own event loop on
+  #      the log write. That turns the ramp into a measurement of docker's log
+  #      driver, and it is not a hazard a production deployment has to accept.
+  #      A file write lands in page cache and returns. /tmp specifically because
+  #      it is the one path writable by every image's user with no mkdir and no
+  #      chown — envoy and haproxy both run non-root. The container is removed
+  #      after each turn, so the file goes with it.
+  #
+  #      haproxy is the one exception in MECHANISM, not in result: it has no
+  #      file-path log target at all — its log targets are syslog, a socket, a
+  #      ring or a file DESCRIPTOR — so its fd 1 is redirected to the same file
+  #      (see its `command` below). The other four are told the path directly.
+  #
+  #   3. Each proxy logs in ITS OWN stock format, not a common one — haproxy's
+  #      `option httplog`, nginx's `main`, envoy's default line, zoxy's fixed
+  #      JSON, and a chosen one for pingora, which ships none. That is the line
+  #      each proxy's operators actually read, but the formats differ in length
+  #      (roughly 90-250 bytes), so part of the spread is format verbosity and
+  #      has to be read that way.
+  #
+  #   4. They still disagree about BACKPRESSURE, which the file sink narrows but
+  #      does not erase. nginx, haproxy and pingora write once per request and
+  #      wear whatever the write costs. envoy buffers and flushes on a timer.
+  #      zoxy DROPS lines rather than stall its event loop. Dropping is cheaper
+  #      than writing, so zoxy would look faster for free unless the drops are
+  #      counted; `bench` reads `zoxy_access_log_dropped` off its admin endpoint
+  #      after every ramp (see suite.zig's accessLogDropped), and a nonzero
+  #      value is noted on the proxy's row rather than left in the numbers.
   # container_name == service name == the `name` label cAdvisor exports, which
   # is how the report joins CPU/mem to a proxy.
   zoxy:
@@ -294,6 +336,23 @@ services:
       # (same mechanism BACKENDn_ADDR already uses) — haproxy.cfg is a static
       # mounted file, so compose's `${}` interpolation never reaches it.
       PROXY_PORT: ${PROXY_PORT:-8080}
+    # haproxy is the only proxy here that cannot be told to log to a PATH — its
+    # log targets are syslog, a socket, a ring or a file descriptor, and
+    # haproxy.cfg's `log stdout` is its alias for fd 1. So the file sink every
+    # other proxy configures for itself is made here, by redirecting fd 1.
+    #
+    # Only stdout is redirected. haproxy's startup [NOTICE] lines go to stderr,
+    # so `docker logs haproxy` still explains a container that failed to start —
+    # which is exactly what reportStartFailure reads.
+    #
+    # `exec docker-entrypoint.sh` rather than re-spelling haproxy's own flags:
+    # the image's entrypoint is what adds `-W -db` (master-worker, foreground),
+    # and a hand-written copy of that would drift the day the image changes it.
+    # `exec` so haproxy still ends up as PID 1 and takes the stop signal
+    # directly.
+    entrypoint: ["sh", "-c"]
+    command:
+      - exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg >> /tmp/access.log
     volumes:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:

@@ -16,6 +16,18 @@ path = "src/main.rs"
 pingora-core = "0.8"
 pingora-proxy = "0.8"
 async-trait = "0.1"
+# Access-log timestamps. Already in the tree as a pingora-core dependency, so
+# this pulls in no new crate — it only makes the dependency direct, since
+# main.rs now names it. Formatting a calendar timestamp per request is work the
+# other four proxies' access logs all do; doing it with epoch integers instead
+# would make pingora's line cheaper than theirs for no reason but convenience.
+#
+# `default-features = false` is load-bearing: chrono's default `clock` feature
+# drags in iana-time-zone to discover the LOCAL zone, a crate that is not in
+# this lockfile because pingora-core takes chrono with `alloc` only. `now` is
+# the feature that provides `Utc::now()` without any of that — this log stamps
+# UTC, so the local zone is never consulted.
+chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
 
 [profile.release]
 opt-level = 3

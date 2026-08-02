@@ -116,6 +116,42 @@ noticed.
   framework — `proxies/pingora`), zoxy's phase-1 `http` listener. Everyone
   parses each request and keeps both the client and the pooled upstream
   connection alive — nobody skips HTTP parsing that others pay.
+- **Everyone access-logs every request**, because a production reverse proxy
+  does and a comparison with logging off measures a configuration nobody
+  deploys. Four things follow, and all four have to be read with the numbers:
+  - **Numbers from before this landed are not comparable to numbers after it.**
+    Every proxy now pays per-request formatting and a write it did not pay
+    before. A step down across that commit on the trend chart is the commit.
+  - **The sink is a file** — `/tmp/access.log` — **not the container's
+    stdout.** Stdout is a pipe dockerd drains, and a proxy that fills it blocks
+    inside its own event loop, which makes the ramp a measurement of docker's
+    log driver rather than of the proxy. A file write lands in page cache and
+    returns. `/tmp` is not a production path; it is the one location writable
+    by all five images' users with no `mkdir` and no `chown` (envoy and haproxy
+    run non-root), and the container is removed after each turn so the file
+    goes with it. One proxy gets there differently: **haproxy** has no
+    file-path log target in its configuration language at all — syslog, a
+    socket, a ring or a file descriptor — so compose redirects its fd 1 to that
+    same file. Its startup `[NOTICE]` lines are on stderr, so `docker logs`
+    still explains a failed start.
+  - **Each proxy logs its OWN stock format**, not a common one — haproxy
+    `option httplog`, nginx's `main`, envoy's default line, zoxy's fixed JSON.
+    That is the line each proxy's operators actually read, but the formats run
+    from roughly 90 to 250 bytes, so some of the spread is format verbosity.
+    Pingora is the exception in kind: it ships no access log at all (it is a
+    framework), so `proxies/pingora/src/main.rs` picks one — combined-shaped,
+    plus a microsecond duration, with the same per-second timestamp cache nginx
+    and haproxy keep internally, so it is not handicapped by formatting a date
+    40,000 times a second that the others do not.
+  - **They still disagree about backpressure**, which the file sink narrows but
+    does not erase. nginx, haproxy and pingora write once per request and wear
+    the cost. Envoy buffers and flushes on a timer. zoxy **drops** the line
+    rather than stall its event loop. Dropping is cheaper than writing, so zoxy
+    would post a throughput number the others were not allowed to earn unless
+    the drops are counted. `bench` reads `zoxy_access_log_dropped` off zoxy's
+    admin endpoint after every ramp into `access_log_dropped` in the run
+    record; nonzero puts a note on that proxy's row saying how much logging
+    work was skipped there and not elsewhere.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).

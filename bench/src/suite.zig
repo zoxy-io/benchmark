@@ -179,7 +179,19 @@ const deadline = struct {
         + warm_probe // first 200
         + cadvisor_warm // cAdvisor discovery head start, before the ramp
         + teardown // after runOne returns, still inside the window
-        + 4 * inspect // leftover check, identity, image id, build-info
+        // Every `deadline.inspect`-bounded probe runOne can make in one turn,
+        // counted for the WORST case, which is zoxy — two of the six are only
+        // asked of it. In order: sockets before start, the leftover/identity
+        // container check, the image's build descriptor, zoxy's baked commit,
+        // the running proxy's version, and zoxy's access-log drop counter.
+        //
+        // This read `4 * inspect` while the code made six such calls: the
+        // commit probe was added without bumping it, and the drop counter would
+        // have been the second. Undercounting here is exactly the run #24
+        // failure mode — the watchdog wins a race it should always lose and one
+        // slow proxy takes every proxy after it — so it is worth re-counting
+        // this list whenever a probe is added, not just believing the comment.
+        + 6 * inspect
         + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
     }
 };
@@ -374,6 +386,73 @@ fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
         }
     }
     return std.fmt.allocPrint(arena, "docker inspect -f '{{{{.Config.Image}}}}' {s} 2>/dev/null", .{name});
+}
+
+/// How many access-log lines zoxy threw away while serving the ramp.
+///
+/// Every proxy in the comparison access-logs every request, and they do not
+/// agree about what happens when the sink cannot keep up. nginx, haproxy and
+/// pingora write once per request and wear the cost. envoy buffers and flushes
+/// on a timer. zoxy does neither: it DROPS the line and counts it, rather than
+/// let logging stall its event loop.
+///
+/// That is a legitimate design choice and not a cheat — but it is also work
+/// zoxy did not do and the other four did, so left unmeasured it arrives as
+/// throughput. This is the only proxy here whose logging can silently do less,
+/// which is why it is the only one probed.
+///
+/// Asked over zoxy's admin listener, which answers the same Prometheus text for
+/// any path (`admin.bind` in config.template.json). Reached from INSIDE the
+/// container over bash's /dev/tcp — the mechanism compose's healthcheck already
+/// uses against this image — because the admin port is published in neither
+/// mode and the runtime image carries no curl.
+///
+/// Best-effort: null on any failure, which the caller reports as an unread
+/// counter rather than as a clean zero.
+fn accessLogDropped(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) ?u64 {
+    const res = remote.check(
+        gpa,
+        arena,
+        io,
+        fleet.proxyHost(),
+        "zoxy access-log drops",
+        // `|| true`: grep exits 1 when the counter is absent, which is a
+        // question answered ("no such metric"), not a transport failure.
+        "docker exec zoxy bash -c 'exec 3<>/dev/tcp/127.0.0.1/9101 && " ++
+            "printf \"GET /metrics HTTP/1.1\\r\\nHost: admin\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && " ++
+            "cat <&3' 2>/dev/null | grep access_log_dropped || true",
+        deadline.inspect,
+    ) catch return null;
+
+    return counterValue(res.stdout);
+}
+
+/// The value of the first real sample line in a scrap of Prometheus text.
+///
+/// `# HELP` and `# TYPE` lines carry the metric's own name, so a grep for it
+/// matches them too and they arrive first. They are skipped HERE rather than in
+/// the shell pipeline above, where excluding them would be one more layer of
+/// quoting to get right across both ssh and `sh -c`.
+fn counterValue(text: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        // `<name>[{labels}] <value>` — the value is the last field.
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        var last: ?[]const u8 = null;
+        while (fields.next()) |f| last = f;
+        const v = last orelse continue;
+
+        if (std.fmt.parseInt(u64, v, 10)) |n| return n else |_| {}
+        // Prometheus samples are floats by specification even when the counter
+        // behind them is an integer, so an exporter is free to render `0.0`.
+        if (std.fmt.parseFloat(f64, v)) |f| {
+            if (f >= 0) return @intFromFloat(@round(f));
+        } else |_| {}
+    }
+    return null;
 }
 
 /// Ask GitHub what `ref` points at right now, as plain text.
@@ -1162,6 +1241,15 @@ fn runOne(
     const outcome = try ramp.readOutcome(arena, io, outcome_path);
     const end_iso = try nowIso(io, arena);
 
+    // Asked HERE, after the ramp and before `teardownProxy` removes the
+    // container: the counter is cumulative over the process's life, so it has
+    // to be read while that process is still alive, and reading it before the
+    // ramp would only ever report zero.
+    const access_log_dropped: ?u64 = if (std.mem.eql(u8, name, "zoxy"))
+        accessLogDropped(gpa, arena, io, opts.fleet)
+    else
+        null;
+
     // --- classify.
     //
     // An identity violation voids the measurement outright: cAdvisor saw a
@@ -1212,6 +1300,38 @@ fn runOne(
         // the clamp value, and the report must not print it as a measurement.
         try notes.append(arena, "latency histogram saturated at 60s; tail percentiles are a floor, not a value");
     }
+    if (std.mem.eql(u8, name, "zoxy")) {
+        if (access_log_dropped) |dropped| {
+            if (dropped > 0) {
+                // NOT degraded, on the `saturated` precedent above rather than
+                // the `stale_build` one below: the ramp measured the proxy it
+                // says it did, so the record is usable — it just carries a
+                // caveat the reader has to be handed.
+                //
+                // And degrading here would cost more than it bought.
+                // `index.zig`'s previousSustained skips degraded nights when it
+                // picks a regression baseline, so a counter that is routinely
+                // nonzero at saturation would leave zoxy with no baseline at
+                // all and quietly switch its regression detection off — trading
+                // a visible caveat for an invisible blind spot.
+                const share = if (outcome.completed > 0)
+                    100.0 * @as(f64, @floatFromInt(dropped)) / @as(f64, @floatFromInt(outcome.completed))
+                else
+                    0;
+                try notes.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "dropped {d} access-log lines ({d:.2}% of completed requests) instead of blocking on stdout; " ++
+                        "the other proxies block or buffer, so this much logging work was skipped here and not by them",
+                    .{ dropped, share },
+                ));
+            }
+        } else {
+            try notes.append(
+                arena,
+                "could not read zoxy's access-log drop counter; whether logging was lossy here is unknown, not zero",
+            );
+        }
+    }
     if (stale_build) {
         // The ramp itself is fine — some zoxy really was measured — so this is
         // not `failed`. But it is not the commit the report names, and a
@@ -1240,6 +1360,7 @@ fn runOne(
         .zoxy_ref = if (std.mem.eql(u8, name, "zoxy")) profile.zoxy_ref else null,
         .zoxy_ref_sha = if (std.mem.eql(u8, name, "zoxy")) zoxy_ref_sha else null,
         .build_info = build_info,
+        .access_log_dropped = access_log_dropped,
         .notes = try notes.toOwnedSlice(arena),
     };
 }
@@ -1664,6 +1785,35 @@ test "nowIso produces a sortable UTC stamp" {
     try std.testing.expectEqual(@as(usize, 20), s.len);
     try std.testing.expectEqual(@as(u8, 'T'), s[10]);
     try std.testing.expectEqual(@as(u8, 'Z'), s[19]);
+}
+
+test "the drop counter is read past the HELP and TYPE lines that share its name" {
+    // What the grep actually returns: a scrape matches the metric's own name in
+    // its comment lines too, and those arrive FIRST. Taking the first line
+    // would parse a sentence, not a count.
+    try std.testing.expectEqual(@as(?u64, 4211), counterValue(
+        \\# HELP zoxy_access_log_dropped access log lines dropped
+        \\# TYPE zoxy_access_log_dropped counter
+        \\zoxy_access_log_dropped 4211
+        \\
+    ));
+
+    // The clean case, which is the one that means the comparison is fair.
+    try std.testing.expectEqual(@as(?u64, 0), counterValue("zoxy_access_log_dropped 0\n"));
+
+    // Labels sit between the name and the value, so the value is the LAST
+    // field rather than the second.
+    try std.testing.expectEqual(@as(?u64, 7), counterValue("zoxy_access_log_dropped{sink=\"stdout\"} 7\n"));
+
+    // Prometheus samples are floats by specification even when the counter is
+    // an integer; an exporter rendering `0.0` must not read as "unknown",
+    // which the caller reports very differently from zero.
+    try std.testing.expectEqual(@as(?u64, 12), counterValue("zoxy_access_log_dropped 12.0\n"));
+
+    // Absent counter, or a scrape that failed and produced nothing: unknown.
+    // The caller must be able to tell this from a genuine zero.
+    try std.testing.expectEqual(@as(?u64, null), counterValue(""));
+    try std.testing.expectEqual(@as(?u64, null), counterValue("# HELP zoxy_access_log_dropped nope\n"));
 }
 
 test "a stale zoxy build is detected, and an unrunnable check is not one" {

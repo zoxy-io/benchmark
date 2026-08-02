@@ -2,7 +2,8 @@
 # build — every proxy now parses HTTP/1.1 and reverse-proxies requests). Worker
 # count is hardcoded to 1 via --concurrency in the compose command (1 CPU).
 # STRICT_DNS because the upstreams are hostnames (compose services locally,
-# extra_hosts entries in cloud). No access log. Envoy keeps both the downstream
+# extra_hosts entries in cloud). Access logging is ON, to stdout, in envoy's own
+# stock format (see access_log below). Envoy keeps both the downstream
 # and the pooled upstream connections alive by default.
 #
 # The upstream is a four-node POOL (backend0..backend3) and the pick policy is
@@ -30,6 +31,32 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
+                # Access log -> a FILE, in envoy's DEFAULT format. No
+                # `log_format`/`json_format` key on purpose: leaving it out is
+                # what selects the stock line envoy documents as its default
+                # access log, which is the line an envoy operator actually
+                # reads. Each proxy here logs its own idiomatic format rather
+                # than a common one; the five differ in length (roughly 90-250
+                # bytes), which has to be read WITH the numbers.
+                #
+                # /tmp/access.log and not /dev/stdout: a write to stdout is a
+                # write to a pipe dockerd drains, and a proxy that fills that
+                # pipe blocks on it, turning the ramp into a measurement of
+                # docker's log driver. Every proxy here logs to this same path
+                # for that reason — /tmp specifically because it is writable by
+                # each image's user without a mkdir, and envoy's own compose
+                # command already writes /tmp/envoy.yaml.
+                #
+                # Envoy buffers access-log writes and flushes them on a timer
+                # (`file_flush_interval`, 10s by default) or when the buffer
+                # fills, rather than writing once per request as nginx does.
+                # That is envoy's own design, not a setting made here, and it is
+                # part of what this comparison now measures.
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
                 common_http_protocol_options:
                   idle_timeout: 60s
                 route_config:

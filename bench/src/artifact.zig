@@ -118,6 +118,18 @@ pub const ProxyRecord = struct {
     /// that mismatch would handicap zoxy by a wide margin and leave no trace
     /// anywhere, since the run completes and the report renders normally.
     build_info: ?[]const u8 = null,
+    /// Access-log lines zoxy DROPPED during the ramp, for zoxy only. `null`
+    /// everywhere else, and on zoxy when the counter could not be read.
+    ///
+    /// Every proxy here access-logs every request, and they disagree about what
+    /// to do when the sink cannot keep up: nginx, haproxy and pingora write once
+    /// per request and wear the cost, envoy buffers and flushes on a timer, and
+    /// zoxy drops the line rather than stall its event loop. Dropping is
+    /// CHEAPER than writing, so a zoxy that quietly discarded a tenth of its log
+    /// lines would post a throughput number the others were not allowed to
+    /// earn. This is the count that makes that visible; zero means the
+    /// comparison is clean.
+    access_log_dropped: ?u64 = null,
     notes: []const []const u8 = &.{},
 };
 
@@ -280,6 +292,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
         if (r.zoxy_ref_sha) |c| try j.string(c) else try j.nullValue();
         try j.key("build_info");
         if (r.build_info) |b| try j.string(b) else try j.nullValue();
+        try j.key("access_log_dropped");
+        if (r.access_log_dropped) |d| try j.int(@intCast(d)) else try j.nullValue();
 
         try j.key("notes");
         try j.beginArray();

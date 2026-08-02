@@ -22,15 +22,28 @@
 //! nginx even had its default passive checks turned off for parity).
 //! An atomic counter is the whole algorithm.
 //!
+//! Every request is ACCESS-LOGGED via the `logging` hook, to the same
+//! /tmp/access.log file the other proxies write (haproxy `option httplog` with
+//! its fd redirected by compose, nginx `access_log`, envoy `FileAccessLog`).
+//! Pingora ships no access log of its own, so `access_log` below picks the
+//! format rather than reproducing one.
+//!
+//!   ACCESS_LOG  where that file goes (default /tmp/access.log)
+//!
 //! Knobs via env (set by compose, matching the other proxies):
 //!   LISTEN     downstream bind (default 0.0.0.0:8080)
 //!   UPSTREAMS  comma-separated host:port pool (default backend0..backend3:9000),
 //!              each resolved ONCE at startup with retry (parity with zoxy's
 //!              no-runtime-DNS model).
 
+use std::cell::RefCell;
+use std::fmt::Write as FmtWrite;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -39,15 +52,147 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 
+/// Per-request state, existing only to time the request for the access log.
+///
+/// `new_ctx` runs once per REQUEST — pingora calls it after reading the request
+/// header and before any filter, and calls it again for each subsequent request
+/// on a kept-alive connection (pingora-proxy's `process_new_http`). So this
+/// clock starts at "header parsed" and stops in `logging`, which is the
+/// proxy's own handling time and excludes waiting for a client that has not
+/// sent anything yet.
+struct Ctx {
+    start: Instant,
+}
+
+/// Scratch space the access log reuses for every line.
+struct LogState {
+    /// Unix second `stamp` was rendered for.
+    second: i64,
+    /// The formatted timestamp of that second.
+    ///
+    /// nginx and haproxy both keep a cached time string and refresh it on a
+    /// tick rather than formatting a calendar date per request. Doing the same
+    /// here is not tuning pingora past its peers, it is refusing to handicap it
+    /// against them: at 40k requests/sec a naive `format()` per line would
+    /// charge pingora 40k date conversions a second that nginx and haproxy do
+    /// not pay.
+    stamp: String,
+    /// The line under construction.
+    ///
+    /// Assembled in memory and written with ONE `write_all`, which is the whole
+    /// reason it exists. `write!` straight at a `File` goes through
+    /// `Write::write_fmt`, and that issues a syscall per formatted fragment —
+    /// a dozen writes per request where nginx does one. (Writing to `println!`
+    /// hid this: Rust's stdout is a `LineWriter`, so it coalesces to the
+    /// newline on its own. A file handle does not.)
+    line: String,
+}
+
+thread_local! {
+    /// A `thread_local!` and not a mutex because this proxy is hardcoded to one
+    /// worker thread (`conf.threads = 1` below), so there is exactly one of
+    /// these and it is never contended.
+    static LOG_STATE: RefCell<LogState> = RefCell::new(LogState {
+        second: 0,
+        stamp: String::new(),
+        line: String::new(),
+    });
+}
+
+/// One access-log line to the access-log file.
+///
+/// Pingora ships NO access log — it is a framework, and `logging()` is the hook
+/// its own examples use to emit one. So unlike the other four proxies here
+/// there is no stock format to reproduce, and this is a choice rather than a
+/// default: the NCSA "combined" shape nginx also writes, plus the request
+/// duration, which is the field a proxy operator actually deploys an access log
+/// for (haproxy's `option httplog` and envoy's default line both carry timings).
+///
+/// The referer and user-agent slots are literal `-`: the generator sends
+/// neither, so reproducing combined's shape faithfully costs two header lookups
+/// that can only ever return nothing.
+///
+/// The byte count sits in combined's `$body_bytes_sent` position but is NOT
+/// what nginx puts there. Pingora's `body_bytes_sent()` documents itself as
+/// "response body bytes (application, not wire)" and then adds the serialized
+/// response header to it as well (pingora-core's v1/server.rs, in
+/// `write_response_header`) — measured here as 1259 for a 1024-byte body. So
+/// this field is total response bytes, which happens to agree with haproxy's
+/// `%B` and zoxy's `bytes_out` and to disagree with nginx's. Recorded rather
+/// than corrected: subtracting the header would mean tracking it separately to
+/// make one proxy's log agree with another's, and the formats here are
+/// deliberately each proxy's own.
+///
+/// One unbuffered `write_all` per line, at a FILE and not at stdout. Writing to
+/// stdout means writing to a pipe dockerd drains, and a proxy that fills that
+/// pipe blocks on the log write — measuring docker's log driver rather than the
+/// proxy. A file write lands in page cache and returns. That gives pingora the
+/// same discipline as nginx's unbuffered `access_log`, against envoy's timed
+/// flush and zoxy's drop-on-backpressure queue.
+fn access_log(out: &Mutex<File>, session: &Session, status: u16, elapsed: Duration) {
+    let req = session.req_header();
+    let client = match session.client_addr() {
+        Some(a) => a.to_string(),
+        None => "-".to_string(),
+    };
+
+    let now = chrono::Utc::now();
+    let secs = now.timestamp();
+    LOG_STATE.with(|state| {
+        // Destructured so `line` and `stamp` are disjoint borrows: the format
+        // below reads one while writing the other.
+        let LogState { second, stamp, line } = &mut *state.borrow_mut();
+        if *second != secs || stamp.is_empty() {
+            *second = secs;
+            stamp.clear();
+            let _ = write!(stamp, "{}", now.format("%d/%b/%Y:%H:%M:%S %z"));
+        }
+
+        line.clear();
+        let _ = writeln!(
+            line,
+            // Six decimals, not nginx's three. `$request_time`'s millisecond
+            // resolution rounds every request in this benchmark to `0.000`
+            // (zoxy measures the same work at ~230us), and a latency field that
+            // is constant is worse than no field: it costs the same bytes and
+            // carries nothing.
+            "{} - - [{}] \"{} {} {:?}\" {} {} \"-\" \"-\" {:.6}",
+            client,
+            stamp,
+            req.method,
+            req.uri,
+            req.version,
+            status,
+            session.body_bytes_sent(),
+            elapsed.as_secs_f64(),
+        );
+
+        // Errors are dropped on purpose: a proxy must not die because its log
+        // sink did. A short write is not retried for the same reason — the run
+        // is measuring the cost of logging, and a partial line is a cosmetic
+        // problem where a stalled event loop would be a measurement one.
+        let _ = out.lock().unwrap().write_all(line.as_bytes());
+    });
+}
+
 struct HttpProxy {
     upstreams: Vec<SocketAddr>,
     next: AtomicUsize,
+    /// The access-log sink, opened once at startup and appended to per request.
+    ///
+    /// A `Mutex` because `ProxyHttp` is shared across workers by contract; with
+    /// `conf.threads = 1` there is only ever one, so it is never contended.
+    log: Mutex<File>,
 }
 
 #[async_trait]
 impl ProxyHttp for HttpProxy {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = Ctx;
+    fn new_ctx(&self) -> Self::CTX {
+        Ctx {
+            start: Instant::now(),
+        }
+    }
 
     /// The one required hook: name the upstream for this request. Strict
     /// round-robin over the pool, plain HTTP (no TLS), no SNI. Pingora dials it
@@ -67,6 +212,18 @@ impl ProxyHttp for HttpProxy {
     ) -> Result<Box<HttpPeer>> {
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.upstreams.len();
         Ok(Box::new(HttpPeer::new(self.upstreams[i], false, String::new())))
+    }
+
+    /// Called once the response has been fully sent downstream, or the request
+    /// died — pingora's designated access-log phase. See `access_log` for why
+    /// the format is a choice here and a reproduction everywhere else.
+    ///
+    /// A request that failed before a response was written has no status; `0`
+    /// records that rather than inventing one, the same value pingora's own
+    /// example logs in that case.
+    async fn logging(&self, session: &mut Session, _e: Option<&pingora_core::Error>, ctx: &mut Self::CTX) {
+        let status = session.response_written().map_or(0, |r| r.status.as_u16());
+        access_log(&self.log, session, status, ctx.start.elapsed());
     }
 }
 
@@ -90,6 +247,10 @@ fn main() {
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let upstreams = std::env::var("UPSTREAMS")
         .unwrap_or_else(|_| "backend0:9000,backend1:9000,backend2:9000,backend3:9000".to_string());
+    // Same path every proxy in this benchmark logs to; see access_log for why
+    // it is a file and why it is /tmp.
+    let access_log_path =
+        std::env::var("ACCESS_LOG").unwrap_or_else(|_| "/tmp/access.log".to_string());
 
     // All-or-nothing: resolve_with_retry panics rather than skipping a member,
     // because a pingora quietly round-robining across three backends while
@@ -102,8 +263,20 @@ fn main() {
         .map(resolve_with_retry)
         .collect();
     assert!(!addrs.is_empty(), "pingora-http: UPSTREAMS is empty");
+
+    // Opened HERE, before the server starts, and unwrapped: a proxy that cannot
+    // open its access log has not been configured the way the run recorded, and
+    // silently serving without one would put a number on the chart that no
+    // other proxy earned. Failing at startup makes it the harness's
+    // start-failure path instead, which reports the reason.
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&access_log_path)
+        .unwrap_or_else(|e| panic!("pingora-http: cannot open {access_log_path}: {e}"));
+
     eprintln!(
-        "pingora-http: listen={listen} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1",
+        "pingora-http: listen={listen} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1, access_log={access_log_path}",
         addrs.len()
     );
 
@@ -139,6 +312,7 @@ fn main() {
         HttpProxy {
             upstreams: addrs,
             next: AtomicUsize::new(0),
+            log: Mutex::new(log),
         },
     );
     svc.add_tcp(&listen);

@@ -4,7 +4,8 @@
 # envsubst template (official-image mechanism): worker count is hardcoded to 1
 # to match the 1-CPU quota (explicit — `auto` would count HOST cores and
 # oversubscribe the cgroup, the trap haproxy's nbthread / envoy's --concurrency
-# avoid too). access_log off => the hot path never touches disk. Each
+# avoid too). Access logging is ON, to stdout, in the official image's own
+# stock `main` format (see the http block). Each
 # `backendN` resolves once at startup via the container's resolver (bridge DNS)
 # or /etc/hosts (cloud extra_hosts); the origins are already healthy by then
 # (depends_on), so no runtime resolver is needed — same as pingora.
@@ -19,7 +20,39 @@ events {
 }
 
 http {
-    access_log off;              # hot path never touches disk
+    # Access log -> the container's stdout, in the format the official nginx
+    # image ships. This whole file REPLACES that image's default nginx.conf, so
+    # `main` is reproduced here verbatim (combined + $http_x_forwarded_for)
+    # rather than inherited — a stock nginx logs this line, and the cost of
+    # writing it belongs in the numbers.
+    #
+    # Each proxy here logs in its own idiomatic format rather than a common
+    # one, so the line each writes is the line its own operators would read.
+    # The formats differ in length (roughly 90-250 bytes across the five, this
+    # being among the shortest), which has to be read WITH the numbers.
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    # A FILE, not stdout. Writing to stdout means writing to a pipe that
+    # dockerd drains; when dockerd falls behind, the 64 KiB pipe buffer fills
+    # and nginx's worker BLOCKS on the log write — at which point the ramp is
+    # measuring dockerd's log driver rather than nginx. A regular file goes to
+    # page cache and returns, with the kernel flushing it out of band.
+    #
+    # /tmp because it is the one path writable by every proxy image's user
+    # without a mkdir or a chown: envoy and haproxy both run non-root (envoy
+    # already writes /tmp/envoy.yaml in its own compose command), and the
+    # official nginx image's /var/log/nginx/access.log is a SYMLINK to
+    # /dev/stdout, which is exactly what this is avoiding. The path is uniform
+    # across all five so no proxy's sink is quietly different from another's.
+    # It is a benchmark's choice, not a production one.
+    #
+    # No `buffer=`/`gzip=` on purpose. Unbuffered is nginx's DEFAULT, so this is
+    # one write() per request — the stock behaviour, and the one worth
+    # measuring. Turning on a 64k buffer here would be tuning nginx's logging
+    # while the other four run theirs as shipped.
+    access_log /tmp/access.log main;
     server_tokens off;
 
     # Four origins. nginx's default balancing method IS round-robin, which is

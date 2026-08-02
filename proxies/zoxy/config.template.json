@@ -3,6 +3,7 @@
   "clusters": {
     "origin": { "endpoints": [@BACKEND_ADDRS@], "pick": "rr" }
   },
+  "access_log": { "sink": "file", "path": "/tmp/access.log" },
   "admin": { "bind": "0.0.0.0:9101" },
   "timeouts": {
     "connect_ms": 5000,

@@ -71,4 +71,10 @@ sed -e "s|@BACKEND_ADDRS@|$addrs|" -e "s/@LIMITS@/$LIMITS/" -e "s/@PORT@/${PROXY
 
 # One event loop per PROCESS (no thread/worker knob), capped to 1 CPU and pinned
 # to core 0 by the cloud overlay: run a SINGLE zoxy, exec'd so it stays PID 1.
+#
+# Stdout is deliberately NOT redirected, even though every proxy here logs to
+# /tmp/access.log: zoxy opens that file itself (`access_log.sink: "file"` in
+# config.template.json), so stdout carries only the startup banner — the memory
+# budget and resolved slot ceilings — which is what `docker logs` shows the
+# harness when a container fails to start. Redirecting would take that with it.
 exec /usr/local/bin/zoxy /etc/zoxy/config.json
