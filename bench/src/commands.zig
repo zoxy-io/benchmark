@@ -285,15 +285,29 @@ pub fn runSuite(
 
     var ok: usize = 0;
     var bad: usize = 0;
+    // The SUBJECT of the comparison, tracked apart from the count. Every other
+    // proxy here is a yardstick; a night without zoxy has no headline, no trend
+    // point, and nothing to catch a regression with.
+    var zoxy_lost = false;
     for (res.records) |r| {
         if (r.status.usable()) ok += 1 else bad += 1;
+        if (std.mem.eql(u8, r.name, "zoxy") and !r.status.usable()) zoxy_lost = true;
     }
     std.debug.print("bench suite [{s}]: {d} usable, {d} failed/skipped\n", .{ prof.name, ok, bad });
+    if (zoxy_lost) std.debug.print("bench suite [{s}]: zoxy produced no usable data\n", .{prof.name});
 
     // Exit 3 means "it ran, but the result is incomplete" — distinct from a
     // crash, so the workflow can still publish what there is while making the
     // run visibly red.
-    if (res.aborted or ok == 0) return 3;
+    //
+    // `zoxy_lost` is in here because red is what triggers a retry, and run
+    // 30749146321 is the case for it: zoxy failed to build, the other four
+    // ramped fine, `ok == 4` so this returned 0, the Verdict step saw four
+    // green stages, and nightly-retry.yml — which fires on `conclusion ==
+    // 'failure'` — sat out a night that had lost the only proxy the benchmark
+    // exists to measure. A failed envoy still does NOT redden the run: it costs
+    // a yardstick, and a second fleet is not worth one.
+    if (res.aborted or ok == 0 or zoxy_lost) return 3;
     return 0;
 }
 
