@@ -114,7 +114,10 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       set -a; . /etc/bench/env; set +a
-      base="https://storage.yandexcloud.net/$BENCH_BUCKET/runs/$BENCH_RUNID"
+      bucket="https://storage.yandexcloud.net/$BENCH_BUCKET"
+      # A run's own artifacts are namespaced by RUNID; `shared` objects
+      # deliberately are NOT — see the `-shared` verbs below.
+      base="$bucket/runs/$BENCH_RUNID"
       tok=$(curl -sfS -H 'Metadata-Flavor: Google' \
         http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
@@ -122,7 +125,17 @@ write_files:
         get) curl -sfS -H "Authorization: Bearer $tok" -o "$3" "$base/$2" ;;
         put) curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary "@$3" "$base/$2" ;;
         say) printf '%s\n' "$3" | curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary @- "$base/$2" ;;
-        *)   echo "usage: bench-os get|put|say <object> <file|text>" >&2; exit 2 ;;
+        # Outside the run prefix, at the bucket root. Anything that must
+        # OUTLIVE the run that wrote it goes here, and so far that is exactly
+        # the image cache: written under `runs/$BENCH_RUNID/` it was written
+        # into a prefix that, by construction, no later run ever looks in — a
+        # cache that could not hit even once. Runs 30749146321 and
+        # 30749896005 each rebuilt pingora from scratch (443s) and the zig
+        # toolchain (131s and 196s), and each then wrote both images to a
+        # folder nothing would ever read again.
+        get-shared) curl -sfS -H "Authorization: Bearer $tok" -o "$3" "$bucket/$2" ;;
+        put-shared) curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary "@$3" "$bucket/$2" ;;
+        *)   echo "usage: bench-os get|put|say|get-shared|put-shared <object> <file|text>" >&2; exit 2 ;;
       esac
 
   # Restore/save a built proxy image through Object Storage, so an ephemeral
@@ -140,6 +153,13 @@ write_files:
   # commit. So it hashes everything that reaches the build: the Dockerfile, the
   # whole build context, and the CPU MODEL, because PINGORA_TARGET_CPU is
   # `native` and an image built for one model must never be loaded on another.
+  #
+  # …and the plumbing was still where it broke. For its first weeks this cache
+  # never hit ONCE: it stored through `bench-os put`, which namespaces objects
+  # by BENCH_RUNID, so every save landed in the writing run's own prefix and
+  # every restore looked under a brand-new one. The suite said so every night —
+  # "[pingora] built in 443s", never "restored from cache" — which is the line
+  # to watch when changing any of this.
   - path: /usr/local/bin/bench-image-cache
     permissions: "0755"
     content: |
@@ -159,17 +179,24 @@ write_files:
              | sha256sum | cut -c1-16 )
       obj="cache/$name-$key.tar"
 
+      # `-shared`, NOT `get`/`put`: those are namespaced by BENCH_RUNID, and a
+      # cache written under this run's prefix is a cache no other run can read.
       case "$op" in
         restore)
-          bench-os get "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 || exit 1
-          docker load -i /tmp/$name-cache.tar >/dev/null 2>&1 || exit 1
-          docker image inspect "$tag" >/dev/null 2>&1 || exit 1
+          bench-os get-shared "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 \
+            || { echo "image cache: miss $name ($key)" >&2; exit 1; }
+          docker load -i /tmp/$name-cache.tar >/dev/null 2>&1 \
+            || { echo "image cache: unreadable $name ($key)" >&2; exit 1; }
+          docker image inspect "$tag" >/dev/null 2>&1 \
+            || { echo "image cache: $obj carries no $tag" >&2; exit 1; }
           echo "image cache: restored $name ($key)"
           ;;
         save)
-          docker save "$tag" -o /tmp/$name-cache.tar 2>/dev/null || exit 0
-          bench-os put "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 \
-            && echo "image cache: saved $name ($key)"
+          docker save "$tag" -o /tmp/$name-cache.tar 2>/dev/null \
+            || { echo "image cache: nothing tagged $tag to save" >&2; exit 0; }
+          bench-os put-shared "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 \
+            && echo "image cache: saved $name ($key)" \
+            || echo "image cache: upload failed for $obj" >&2
           rm -f /tmp/$name-cache.tar
           ;;
         *) exit 2 ;;
