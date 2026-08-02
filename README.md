@@ -188,11 +188,19 @@ noticed.
   which is a real and acknowledged handicap at that profile. Connections beyond
   the ceiling get a static shed response. Every other proxy has no such
   per-process cap.
-- **The zoxy build stays fresh**: `ZOXY_REF` defaults to `main` on purpose —
-  the nightly exists to catch a regression the morning after it lands. The
-  Dockerfile's clone layer is cache-busted on the GitHub commits API response
+- **zoxy is measured as shipped**: the nightly benches the **latest published
+  release** — `bench` resolves the tag, downloads that release's own
+  `x86_64-linux` tarball and verifies it against its `SHA256SUMS.txt`. That is
+  the binary a user downloads, which gives it the same standing as the stock
+  haproxy, nginx and envoy images it is charted against, and it takes the
+  longest and most failure-prone step out of an unattended run. The cost is
+  named: a regression now surfaces the night after it **ships**, and the trend
+  chart bisects to a release rather than a commit. Set `zoxy_ref` (bench/src/
+  profile.zig) to `main`, a branch or a SHA to build from source instead — the
+  only way to bench something unreleased. That path clones and compiles on the
+  fleet, and its clone layer is cache-busted on the GitHub commits API response
   for `$ZOXY_REF`, not on the ref string, so a `main` build always reflects
-  main's current HEAD. Pin a SHA only to reproduce a specific past run.
+  main's current HEAD.
 - **Same balancing policy for every proxy**: the origin is a four-node pool and
   every proxy is pinned to **strict round-robin** — haproxy `balance
   roundrobin`, nginx's default method over its `upstream` block, envoy

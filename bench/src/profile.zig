@@ -125,20 +125,34 @@ pub const Profile = struct {
 /// saturated. Read proxies against each other, never as a fraction of line rate
 /// — and if two proxies ever converge on the same suspiciously round plateau,
 /// suspect this ceiling and restore `direct` from git history to find it.
-/// The zoxy ref every profile builds. `main` ON PURPOSE: the nightly exists to
-/// catch a regression the morning after it lands, so each night must build
-/// whatever main is at the time. Points on the trend chart are deliberately
-/// different commits, and `zoxy_commit` in profile.json records which one
-/// produced each — that is what makes a regression bisectable.
+/// Which zoxy every profile measures.
+///
+/// `release` is not a git ref. It means "the latest published release", which
+/// `suite.resolveZoxySource` turns into a concrete tag before anything is
+/// built, and which then arrives as an upstream tarball rather than a compile
+/// (see proxies/zoxy/Dockerfile). Three things follow from that and they are
+/// the reason for the setting:
+///
+///   * It measures the binary users actually download — the same standing the
+///     stock haproxy, nginx and envoy images have here. A source build is our
+///     build of their code; a release is theirs.
+///   * It removes the longest, most failure-prone step of the night. The
+///     source path compiles on the fleet and fetches four git dependencies
+///     over NAT egress; run 30749146321 lost zoxy entirely to one transient
+///     failure in there, on a commit that built fine before and after.
+///   * The trend chart's points become versions rather than commits. That is
+///     the real cost: a regression is now bisectable only to a release, and it
+///     surfaces the night after it SHIPS, not the night after it lands.
+///
+/// Set this to `main` (or any branch, tag or sha) to get the old behaviour
+/// back — the source path is unchanged and still the only way to bench an
+/// unreleased commit or a PR. A floating ref only means anything if the clone
+/// is actually fresh, so that path keeps its cache-bust; see the Dockerfile.
 ///
 /// Passed explicitly rather than left to compose's `${ZOXY_REF:-main}` default,
-/// so a floating build is a stated intent rather than something that happens
+/// so what gets measured is a stated intent rather than something that happens
 /// because nobody set the variable.
-///
-/// A floating ref only means anything if the clone is actually fresh — see the
-/// cache-bust in proxies/zoxy/Dockerfile, without which "main" silently means
-/// "whatever main was when the layer was first built".
-pub const zoxy_ref = "main";
+pub const zoxy_ref = "release";
 
 const start_rate: u64 = 200;
 const max_rate: u64 = 100_000;

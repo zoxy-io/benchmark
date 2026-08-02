@@ -96,17 +96,19 @@ pub const ProxyRecord = struct {
     /// because the Dockerfile caches its git clone, so a floating ref can
     /// silently be an older commit than requested.
     zoxy_commit: ?[]const u8 = null,
-    /// The zoxy ref the build was asked for (`profile.zoxy_ref`, normally
-    /// `main`) and what that ref pointed at when the build ran, resolved
-    /// independently from GitHub rather than from the image.
+    /// The ref the build resolved to — a release tag (`v0.0.9`) by default, a
+    /// branch or sha on the source path — and what that ref pointed at when the
+    /// build ran, resolved independently from GitHub rather than from the
+    /// image. Never the literal `release`: that is a request, and the report
+    /// has to name the thing measured.
     ///
     /// Together with `zoxy_commit` these make the freshness of the nightly
-    /// CHECKABLE instead of merely intended. The trend chart's whole premise is
-    /// that each night measures whatever main is that night; a build that
-    /// silently reused a cached clone would keep reporting a frozen commit as
-    /// "main" and the chart would read as stability rather than as a stuck
-    /// build. `zoxy_commit != zoxy_ref_sha` is exactly that failure, and it
-    /// degrades the record rather than passing quietly.
+    /// CHECKABLE instead of merely intended. On the source path the trend
+    /// chart's premise is that each night measures whatever main is that night,
+    /// and a build that silently reused a cached clone would keep reporting a
+    /// frozen commit as "main" — the chart reading as stability rather than as
+    /// a stuck build. `zoxy_commit != zoxy_ref_sha` is exactly that failure,
+    /// and it degrades the record rather than passing quietly.
     zoxy_ref: ?[]const u8 = null,
     zoxy_ref_sha: ?[]const u8 = null,
     /// How the image was compiled — optimisation mode and target CPU, read from

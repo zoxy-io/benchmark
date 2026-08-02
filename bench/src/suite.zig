@@ -114,6 +114,10 @@ const deadline = struct {
     /// the whole profile rather than costing one proxy its slot.
     const backend_up: u64 = 180 * std.time.ns_per_s;
     const build: u64 = 900 * std.time.ns_per_s;
+    /// Bounds ONE attempt; `build_attempts` of them may run. See the retry at
+    /// the build call site for why this one is NOT in `turn`'s sum.
+    const build_attempts: u32 = 2;
+    const build_retry_backoff: u64 = 15 * std.time.ns_per_s;
     const start: u64 = 120 * std.time.ns_per_s;
     /// A transient registry pull hiccup or a stale port bind (runs #26, #30)
     /// shouldn't cost a proxy its entire night's data over one bad attempt.
@@ -495,6 +499,95 @@ fn resolveRef(
     return if (isSha(sha)) sha else null;
 }
 
+/// Where tonight's zoxy binary comes from, resolved once before any build.
+///
+/// `profile.zoxy_ref` is a REQUEST, and `release` is the one value of it that
+/// is not a git ref — it means "whatever the latest published release is",
+/// which only becomes a buildable tag once GitHub has been asked. Resolving it
+/// here, rather than letting the word `release` reach compose, is also what
+/// keeps the build step and the start step agreeing: both interpolate this same
+/// string into the image tag, and a tag resolved twice could resolve twice
+/// differently.
+pub const ZoxySource = struct {
+    /// Selects the stage in proxies/zoxy/Dockerfile.
+    flavour: []const u8,
+    /// A git ref for `source`; a release tag (`v0.0.9`) for `release`.
+    ref: []const u8,
+    /// The cpu model the binary is really built for — ours to choose only on
+    /// the source path. A release is compiled by upstream's own workflow with
+    /// `-Dcpu=x86_64_v3`, so that is what the image tag and profile.json must
+    /// say about it, whatever this host happens to be.
+    cpu: []const u8,
+
+    fn isSource(self: ZoxySource) bool {
+        return std.mem.eql(u8, self.flavour, "source");
+    }
+};
+
+/// Turn `profile.zoxy_ref` into a concrete `ZoxySource`, or null if `release`
+/// could not be resolved.
+///
+/// Null is NOT a fallback to the source build. The two flavours measure
+/// different binaries — a release is upstream's x86_64_v3 artifact, a source
+/// build is this host's `native` — so quietly substituting one for the other
+/// would change what the night measured without changing what it reports.
+///
+/// The latest tag comes off the `releases/latest` redirect rather than the JSON
+/// API: the fleet image has no jq, and `-w %{url_effective}` after `-L` lands
+/// on `…/releases/tag/<tag>` with nothing to parse.
+fn resolveZoxySource(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    fleet: Fleet,
+    timeout_ns: u64,
+) ?ZoxySource {
+    if (!std.mem.eql(u8, profile.zoxy_ref, "release")) {
+        return .{ .flavour = "source", .ref = profile.zoxy_ref, .cpu = "native" };
+    }
+
+    const res = remote.check(
+        gpa,
+        arena,
+        io,
+        fleet.proxyHost(),
+        "resolve latest zoxy release",
+        "curl -sS -o /dev/null -w '%{url_effective}' -L --max-time 20 " ++
+            "https://github.com/zoxy-io/zoxy/releases/latest",
+        timeout_ns,
+    ) catch return null;
+
+    const tag = tagFromLatestUrl(std.mem.trim(u8, res.stdout, " \n\r\t")) orelse return null;
+    return .{ .flavour = "release", .ref = arena.dupe(u8, tag) catch return null, .cpu = "x86_64_v3" };
+}
+
+/// The tag out of the URL `…/releases/latest` redirects to.
+///
+/// Null on anything else, which covers the interesting failure: GitHub serves
+/// an error or a rate limit as a normal page with a 200 and curl reports the
+/// URL it landed on, so "the request worked" says nothing about whether the
+/// answer is a release.
+fn tagFromLatestUrl(url: []const u8) ?[]const u8 {
+    const marker = "/releases/tag/";
+    const at = std.mem.lastIndexOf(u8, url, marker) orelse return null;
+    const tag = url[at + marker.len ..];
+    return if (isReleaseTag(tag)) tag else null;
+}
+
+/// A `v`-prefixed tag with nothing in it that a shell, a URL or an image tag
+/// would read as structure.
+///
+/// The same guard `isSha` is: GitHub answers an outage or a rate limit with a
+/// perfectly well-formed page, and this string goes on to become part of a
+/// download URL and a docker tag.
+fn isReleaseTag(s: []const u8) bool {
+    if (s.len < 2 or s.len > 32 or s[0] != 'v' or !std.ascii.isDigit(s[1])) return false;
+    for (s[1..]) |c| {
+        if (!std.ascii.isDigit(c) and c != '.' and c != '-' and !std.ascii.isAlphabetic(c)) return false;
+    }
+    return true;
+}
+
 /// A full 40-character hex commit sha.
 ///
 /// Guards the freshness check against its own inputs: GitHub answers a bad ref
@@ -650,13 +743,40 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     // were exactly the 5 minutes they are configured to be. The fleet is
     // ephemeral, so there is no docker layer cache and zoxy is rebuilt from
     // source (git clone + zig ReleaseFast) on a 2-core VM every single run.
+    // Which zoxy, and from where — resolved FIRST, because it decides how much
+    // of the rest of this phase has to happen at all. A release flavour is a
+    // download; a source flavour is a toolchain, a clone and a compile.
+    //
+    // Only asked when zoxy is in tonight's set: resolving `release` costs a
+    // round trip to GitHub and a run of the other four has no use for the
+    // answer.
+    const wants_zoxy = for (opts.proxies) |name| {
+        if (std.mem.eql(u8, name, "zoxy")) break true;
+    } else false;
+    const zoxy_src = if (wants_zoxy)
+        resolveZoxySource(gpa, arena, io, opts.fleet, deadline.inspect)
+    else
+        null;
+    if (wants_zoxy) {
+        if (zoxy_src) |z| {
+            redact.log("bench: [zoxy] {s} build at {s} (cpu {s})", .{ z.flavour, z.ref, z.cpu });
+        } else {
+            redact.log("bench: [zoxy] could not resolve the latest release — zoxy cannot build", .{});
+        }
+    }
+
     // The Zig toolchain zoxy's Dockerfile does `FROM`, made to exist before it
     // is needed. Cached in Object Storage because it is a pure function of the
     // version and the architecture, so the 55 MB fetch from ziglang.org happens
     // only when someone bumps it — not on every ephemeral fleet, in the critical
     // path of an unattended run, which is how run #21 lost a profile.
+    //
+    // Skipped entirely unless zoxy is being COMPILED. BuildKit does not resolve
+    // a stage the target does not reach, so a release build never looks at
+    // `FROM zoxy-bench/zig` and there is nothing for this to make exist.
     for (opts.proxies) |name| {
         if (!std.mem.eql(u8, name, "zoxy")) continue;
+        if (zoxy_src == null or !zoxy_src.?.isSource()) break;
         redact.log("bench: [zig] toolchain", .{});
         const hit = remote.check(
             gpa,
@@ -714,17 +834,25 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
             if (std.mem.eql(u8, name, "zoxy")) break;
         } else break :blk null;
 
-        const sha = resolveRef(gpa, arena, io, opts.fleet, profile.zoxy_ref, deadline.inspect);
+        const z = zoxy_src orelse break :blk null;
+        const sha = resolveRef(gpa, arena, io, opts.fleet, z.ref, deadline.inspect);
         if (sha) |s| {
-            redact.log("bench: [zoxy] ref {s} -> {s}", .{ profile.zoxy_ref, s });
+            redact.log("bench: [zoxy] ref {s} -> {s}", .{ z.ref, s });
         } else {
-            redact.log("bench: [zoxy] could not resolve ref {s}; freshness unchecked", .{profile.zoxy_ref});
+            redact.log("bench: [zoxy] could not resolve ref {s}; freshness unchecked", .{z.ref});
         }
         break :blk sha;
     };
 
     var build_failed: std.StringHashMapUnmanaged(void) = .empty;
     for (opts.proxies) |name| {
+        // Nothing to build zoxy FROM. Recorded as a build failure so it reads
+        // like one, rather than as a proxy that mysteriously never started.
+        if (std.mem.eql(u8, name, "zoxy") and zoxy_src == null) {
+            try build_failed.put(arena, name, {});
+            redact.log("bench: [zoxy] BUILD SKIPPED — no resolved source", .{});
+            continue;
+        }
         redact.log("bench: [{s}] building", .{name});
         const t0 = Io.Timestamp.now(io, .awake);
 
@@ -755,19 +883,48 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
             false;
 
         if (!cache_hit) {
-            _ = remote.check(
-                gpa,
-                arena,
-                io,
-                opts.fleet.proxyHost(),
-                try std.fmt.allocPrint(arena, "build {s}", .{name}),
-                try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
-                    opts.fleet.remote_dir, envPrefix(arena, p, opts.fleet, null) catch "", opts.fleet.composeCmd(), name, name,
-                }),
-                deadline.build,
-            ) catch {
-                try build_failed.put(arena, name, {});
-            };
+            const cmd = try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} build {s}", .{
+                opts.fleet.remote_dir,
+                envPrefix(arena, p, opts.fleet, zoxy_src, null) catch "",
+                opts.fleet.composeCmd(),
+                name,
+                name,
+            });
+            // Retried, for the same reason `start` is: a build reaches the
+            // network — a registry pull, a git clone, four zig dependency
+            // fetches — and one transient failure out there costs this proxy
+            // the entire night. Run 30749146321 lost zoxy that way, to a build
+            // that had succeeded 20 minutes earlier and succeeded again 40
+            // minutes later on the same commit.
+            //
+            // NOT counted in `deadline.turn`, unlike the start retries: the
+            // build phase runs before any proxy's turn and no watchdog covers
+            // it. The budget it does spend against is the workflow's — two
+            // `wait` chunks of 3300s — where a worst case of
+            // `build_attempts * deadline.build` per proxy still fits.
+            var attempt: u32 = 1;
+            while (true) : (attempt += 1) {
+                if (remote.check(
+                    gpa,
+                    arena,
+                    io,
+                    opts.fleet.proxyHost(),
+                    try std.fmt.allocPrint(arena, "build {s}", .{name}),
+                    cmd,
+                    deadline.build,
+                )) |_| {
+                    break;
+                } else |_| {
+                    if (attempt >= deadline.build_attempts) {
+                        try build_failed.put(arena, name, {});
+                        break;
+                    }
+                    redact.log("bench: [{s}] build attempt {d}/{d} failed, retrying", .{
+                        name, attempt, deadline.build_attempts,
+                    });
+                    io.sleep(.fromNanoseconds(deadline.build_retry_backoff), .awake) catch {};
+                }
+            }
 
             // Populate the cache only from a build that succeeded.
             if (!build_failed.contains(name)) {
@@ -868,7 +1025,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
         defer watchdog.done.store(true, .release);
 
-        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, zoxy_ref_sha, &stage) catch |e| blk: {
+        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, zoxy_src, zoxy_ref_sha, &stage) catch |e| blk: {
             redact.log("bench: [{s}] {s} at stage {s}", .{ name, @errorName(e), stage.str() });
             break :blk artifact.ProxyRecord{
                 .name = name,
@@ -921,8 +1078,12 @@ fn runOne(
     opts: Options,
     name: []const u8,
     proxy_idx: usize,
-    // What `profile.zoxy_ref` resolved to before the build, or null if GitHub
-    // could not be reached. Only zoxy uses it; see the freshness check below.
+    // Where tonight's zoxy came from, resolved before the build. Only zoxy uses
+    // it, but every proxy's compose invocation carries it: these variables are
+    // in zoxy's image tag, and `up` has to name the tag `build` produced.
+    zoxy_src: ?ZoxySource,
+    // What that ref resolved to before the build, or null if GitHub could not
+    // be reached. Only zoxy uses it; see the freshness check below.
     zoxy_ref_sha: ?[]const u8,
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
@@ -980,7 +1141,7 @@ fn runOne(
         const start_label = try std.fmt.allocPrint(arena, "start {s}", .{name});
         const start_cmd = try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
             opts.fleet.remote_dir,
-            try envPrefix(arena, p, opts.fleet, if (opts.fleet.isLocal()) null else port),
+            try envPrefix(arena, p, opts.fleet, zoxy_src, if (opts.fleet.isLocal()) null else port),
             opts.fleet.composeCmd(),
             name,
             name,
@@ -1113,19 +1274,24 @@ fn runOne(
                 try notes.append(arena, "could not read the running zoxy image's commit");
             }
 
-            // Is that actually tonight's main? The Dockerfile busts its clone
-            // layer on what the ref POINTS AT, so this should always agree —
-            // which is exactly why it is worth asserting. If that mechanism
-            // ever breaks, every night afterwards keeps publishing a frozen
-            // commit under the name "main" and the trend reads as stability.
+            // Is that actually what tonight's ref pointed at? On the source
+            // path the Dockerfile busts its clone layer on what the ref POINTS
+            // AT, so this should always agree — which is exactly why it is
+            // worth asserting. If that mechanism ever breaks, every night
+            // afterwards keeps publishing a frozen commit under the name "main"
+            // and the trend reads as stability. On the release path both sides
+            // are resolutions of the same TAG, so agreement is nearly given;
+            // what remains is a tag that moved mid-run, and the binary's own
+            // `zoxy --version` is the independent witness there.
             //
             // Silent when either side is unknown: an unreachable GitHub is a
             // missing check, not a failed one.
+            const asked_for = if (zoxy_src) |z| z.ref else profile.zoxy_ref;
             if (isStaleBuild(zoxy_commit, zoxy_ref_sha)) {
                 stale_build = true;
                 redact.log(
                     "bench: [zoxy] STALE BUILD: ran {s} but {s} is {s}",
-                    .{ zoxy_commit.?, profile.zoxy_ref, zoxy_ref_sha.? },
+                    .{ zoxy_commit.?, asked_for, zoxy_ref_sha.? },
                 );
                 // Prepended, not appended: this has to be the first thing a
                 // reader sees about the row, ahead of the build-parity note
@@ -1134,7 +1300,7 @@ fn runOne(
                     arena,
                     "STALE BUILD — ran zoxy {s}, but {s} was {s} when this build ran; " ++
                         "these numbers are not a measurement of {s}",
-                    .{ zoxy_commit.?, profile.zoxy_ref, zoxy_ref_sha.?, profile.zoxy_ref },
+                    .{ zoxy_commit.?, asked_for, zoxy_ref_sha.?, asked_for },
                 ));
             }
         }
@@ -1357,7 +1523,13 @@ fn runOne(
         .cadvisor_samples = outcome.cadvisor_samples,
         .version = version,
         .zoxy_commit = zoxy_commit,
-        .zoxy_ref = if (std.mem.eql(u8, name, "zoxy")) profile.zoxy_ref else null,
+        // The RESOLVED ref, not the request: on the release flavour `zoxy_ref`
+        // is the word "release" until GitHub answers, and a report that named
+        // it that could not say which zoxy it measured.
+        .zoxy_ref = if (std.mem.eql(u8, name, "zoxy"))
+            (if (zoxy_src) |z| z.ref else profile.zoxy_ref)
+        else
+            null,
         .zoxy_ref_sha = if (std.mem.eql(u8, name, "zoxy")) zoxy_ref_sha else null,
         .build_info = build_info,
         .access_log_dropped = access_log_dropped,
@@ -1574,7 +1746,7 @@ fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
     return proxy_port_base + profile_idx * proxy_port_slots + @as(u16, @intCast(proxy_idx));
 }
 
-fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, port: ?u16) ![]const u8 {
+fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySource, port: ?u16) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     // Only the cloud overlay interpolates BACKENDn_IP; locally the proxies reach
     // the pool by compose service name over docker DNS. One variable per member
@@ -1587,8 +1759,13 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, port: ?u16) ![]
         }
     }
     // Without this, compose falls back to `${ZOXY_REF:-main}` and builds a
-    // floating main rather than the pinned commit — see profile.zig's note.
-    try buf.print(arena, "ZOXY_REF={s} ", .{profile.zoxy_ref});
+    // floating main rather than the ref this run resolved — see profile.zig's
+    // note. All three travel together and all three are in the image tag, so
+    // the `build` call and the `up` call must be handed the SAME trio or the
+    // second one looks for a tag the first never produced.
+    if (zoxy) |z| {
+        try buf.print(arena, "ZOXY_FLAVOUR={s} ZOXY_REF={s} ZOXY_CPU={s} ", .{ z.flavour, z.ref, z.cpu });
+    }
     // Only for the `start` call — `build` has no listener to bind and no
     // meaningful per-turn port, so it passes null and every proxy's config
     // falls back to its own compose-level `${PROXY_PORT:-8080}` default.
@@ -1704,12 +1881,14 @@ const test_fleet: Fleet = .{
     .ssh = .{ .key_path = "k", .known_hosts = "kh" },
 };
 
+const test_zoxy_src: ZoxySource = .{ .flavour = "release", .ref = "v0.0.9", .cpu = "x86_64_v3" };
+
 test "envPrefix carries EVERY backend address as well as the profile's tuning" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const s = try envPrefix(arena, profile.c10k, test_fleet, 18096);
+    const s = try envPrefix(arena, profile.c10k, test_fleet, test_zoxy_src, 18096);
 
     // Miss one and that proxy starts with extra_hosts "backendN:" — which does
     // not fail its warm probe, because the other three still answer. It just
@@ -1733,9 +1912,50 @@ test "c1k widens zoxy's upstream pool to cover every endpoint" {
     // downstream connection rotate through all four — so the upstream pool has
     // to be a multiple of conn_slots, not equal to it. Equal is what shipped
     // before the origin became a pool, and it would shed here.
-    const s = try envPrefix(arena, profile.c1k, test_fleet, null);
+    const s = try envPrefix(arena, profile.c1k, test_fleet, test_zoxy_src, null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=1386") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=5544") != null);
+}
+
+test "envPrefix hands compose all three variables in zoxy's image tag" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Not three independent settings: they are the tag. Emit two of them at
+    // `build` and three at `up` and compose looks for an image nothing built.
+    const s = try envPrefix(arena, profile.c1k, test_fleet, test_zoxy_src, null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_FLAVOUR=release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_REF=v0.0.9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CPU=x86_64_v3") != null);
+}
+
+test "the latest release is read off the redirect, not out of JSON" {
+    // The shape curl actually lands on, checked against the live endpoint when
+    // this was written: …/releases/latest -> …/releases/tag/v0.0.9.
+    try std.testing.expectEqualStrings(
+        "v0.0.9",
+        tagFromLatestUrl("https://github.com/zoxy-io/zoxy/releases/tag/v0.0.9").?,
+    );
+    // Never followed anywhere — the un-redirected URL is not a tag, and neither
+    // is a rate-limit or error page served with a 200.
+    try std.testing.expect(tagFromLatestUrl("https://github.com/zoxy-io/zoxy/releases/latest") == null);
+    try std.testing.expect(tagFromLatestUrl("https://github.com/zoxy-io/zoxy/releases/tag/") == null);
+    try std.testing.expect(tagFromLatestUrl("") == null);
+}
+
+test "a release tag is accepted, GitHub's error pages are not" {
+    // `isReleaseTag` guards a string that becomes part of a download URL and a
+    // docker tag, so the shapes that must fail are the ones that would smuggle
+    // structure into either.
+    try std.testing.expect(isReleaseTag("v0.0.9"));
+    try std.testing.expect(isReleaseTag("v1.2.3-rc1"));
+    try std.testing.expect(!isReleaseTag("release")); // the unresolved request
+    try std.testing.expect(!isReleaseTag("v")); // no version at all
+    try std.testing.expect(!isReleaseTag("main"));
+    try std.testing.expect(!isReleaseTag("v0.0.9/../../etc"));
+    try std.testing.expect(!isReleaseTag("v0.0.9 && rm -rf /"));
+    try std.testing.expect(!isReleaseTag(""));
 }
 
 test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
@@ -1743,7 +1963,7 @@ test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const s = try envPrefix(arena, profile.c1k, test_fleet, null);
+    const s = try envPrefix(arena, profile.c1k, test_fleet, test_zoxy_src, null);
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT") == null);
 }
 

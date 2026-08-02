@@ -257,14 +257,21 @@ services:
     build:
       context: ./proxies/zoxy
       args:
-        # `bench` passes ZOXY_REF explicitly; the default here is what a bare
-        # `docker compose build` gets. Both are `main` on purpose — see
-        # bench/src/profile.zig's zoxy_ref.
+        # `bench` passes all three explicitly; the defaults here are what a bare
+        # `docker compose build` gets — a source build of main, which is what
+        # this file meant before there was a choice.
+        #
+        # `release` fetches the published tarball for the tag in ZOXY_REF
+        # instead of compiling; `bench` resolves profile.zig's `zoxy_ref` into
+        # the pair and never passes the word `release` as a ref.
+        ZOXY_FLAVOUR: ${ZOXY_FLAVOUR:-source}
         ZOXY_REF: ${ZOXY_REF:-main}
         ZOXY_OPTIMIZE: ${ZOXY_OPTIMIZE:-ReleaseFast}
         # SIMD on: zoxy ships SIMD-enabled binaries, so a baseline build would
         # measure something no user runs. Pin to a concrete model for a build
-        # reproducible off this host.
+        # reproducible off this host. The release flavour is upstream's
+        # x86_64_v3 whatever this says — `bench` passes that value so the tag
+        # below stays true, and /etc/zoxy/build-info is the authority either way.
         ZOXY_CPU: ${ZOXY_CPU:-native}
     # Ref, optimize mode and cpu model are the inputs that change the binary, so
     # they are the whole tag — a native build on one host must not be mistaken
@@ -272,7 +279,7 @@ services:
     # zoxy's source at build time and encoded in the tag; they are runtime config
     # now (entrypoint.sh writes conn_slots/upstream_slots), so the same image
     # serves c1k and c10k.
-    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_OPTIMIZE:-ReleaseFast}-${ZOXY_CPU:-native}
+    image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_FLAVOUR:-source}-${ZOXY_OPTIMIZE:-ReleaseFast}-${ZOXY_CPU:-native}
     container_name: zoxy
     profiles: [zoxy]
     # Docker's default seccomp profile denies io_uring_* since engine 25.0.
