@@ -131,12 +131,12 @@ const deadline = struct {
     const teardown: u64 = 90 * std.time.ns_per_s;
     const inspect: u64 = 30 * std.time.ns_per_s;
 
-    /// Bounds the warm-probe LOOP, because a single connect cannot be bounded:
-    /// `Io.Threaded` panics outright on `netConnectIp` with a timeout ("TODO
-    /// implement netConnectIpPosix with timeout"), so the per-attempt timeout has
-    /// to be `.none` and a black-holed peer costs the OS SYN timeout — minutes,
-    /// not seconds. Counting attempts alone would then let a wedged host hold the
-    /// suite for the better part of an hour.
+    /// Bounds the warm-probe LOOP. `probeOnce`'s own connect() now carries
+    /// `cadvisor.scrape_connect_timeout` (5s), so a single attempt can no
+    /// longer hang indefinitely the way an unbounded connect() did — but
+    /// `warm_probe_attempts` alone still has no wall-clock ceiling (30
+    /// attempts at ~5s apiece plus the read and the retry sleep add up), so
+    /// this stays as the belt to that suspenders.
     const warm_probe: u64 = 90 * std.time.ns_per_s;
 
     /// Bounds `cadvisor.waitUntilFound`'s poll, giving cAdvisor a head start
@@ -1335,7 +1335,7 @@ fn runOne(
     // its own 300s sampling window. See cadvisor.waitUntilFound's doc
     // comment for why — a miss here just gets logged, never fails the turn.
     if (cadvisor_addr) |addr| {
-        if (!cadvisor.waitUntilFound(io, addr, name, deadline.cadvisor_warm)) {
+        if (!cadvisor.waitUntilFound(io, addr, name, deadline.cadvisor_warm, cadvisor.scrape_connect_timeout)) {
             redact.log(
                 "bench: [{s}] cadvisor had not reported this container after {d}s; CPU/mem may be absent for this ramp",
                 .{ name, deadline.cadvisor_warm / std.time.ns_per_s },
@@ -1569,7 +1569,13 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
 }
 
 fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    // Bounded the same way and for the same reason as cadvisor.scrape's
+    // connect: `warmProbe`'s own elapsed-vs-`deadline.warm_probe` check above
+    // only runs BETWEEN attempts, so an unbounded connect() here could wedge
+    // this proxy's whole turn on a single hung attempt, same class of failure
+    // that cost entire nightly runs before cadvisor.zig's fix. Reusing
+    // cadvisor's constant rather than a second magic number for the same bound.
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = cadvisor.scrape_connect_timeout });
     defer stream.close(io);
 
     var wbuf: [512]u8 = undefined;

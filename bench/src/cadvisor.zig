@@ -94,11 +94,23 @@ pub fn scrape(
     addr: net.IpAddress,
     proxy: []const u8,
     fd_slot: ?*std.atomic.Value(i32),
+    connect_timeout: Io.Timeout,
 ) !Observation {
-    // No connect timeout: Io.Threaded panics on one, and a scrape that stalls
-    // costs a sample rather than the run — the poller retries every second and
-    // records the failure count.
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    // `connect_timeout` is caller-supplied, not hardcoded here: `Io.Threaded`
+    // panics outright on any non-`.none` timeout ("TODO implement
+    // netConnectIpPosix with timeout" — see suite.zig's `deadline.warm_probe`),
+    // so callers under test pass `.none` and production callers (zio's real
+    // Runtime, which has supported this since zio#230) pass a real bound.
+    //
+    // Bounding it at all matters: `active_fd`/`interrupt()` below can only
+    // unblock a scrape stuck in a READ (the fd is published after connect()
+    // returns), not one stuck IN connect() itself — and a cAdvisor that never
+    // resolves, rather than one that answers slowly, hangs there. That gap
+    // cost entire nightly runs (envoy, intermittently): `interrupt()` is a
+    // no-op while `fd_slot` still reads -1, so `poll_group.cancel` in
+    // ramp.run waited on a connect() that would never return, until the
+    // whole-process `ProxyWatchdog` killed the run ~30 minutes later.
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = connect_timeout });
     defer stream.close(io);
     // Publish the socket so `interrupt` can unblock a read that never returns.
     // Declared after the close defer so it runs BEFORE it: the fd is cleared
@@ -242,16 +254,36 @@ fn nameLabel(labels: []const u8) ?[]const u8 {
 /// and every proxy in that same night's later c1k profile — worked fine. On
 /// a healthy run this returns on its first scrape, so the cost here is one
 /// HTTP round trip; the bound only matters on the run it exists for.
-pub fn waitUntilFound(io: Io, addr: net.IpAddress, proxy: []const u8, timeout_ns: u64) bool {
+///
+/// `connect_timeout` is forwarded to `scrape` as-is (`.none` under
+/// `Io.Threaded` in tests, a real bound in production) — this loop's own
+/// `timeout_ns` bounds attempts BETWEEN scrapes, not a scrape stuck inside
+/// one, so without it a single wedged connect() could hold this past
+/// `timeout_ns` indefinitely, same as `Poller.run`'s.
+pub fn waitUntilFound(
+    io: Io,
+    addr: net.IpAddress,
+    proxy: []const u8,
+    timeout_ns: u64,
+    connect_timeout: Io.Timeout,
+) bool {
     const started = Io.Timestamp.now(io, .awake);
     while (true) {
-        if (scrape(io, addr, proxy, null)) |obs| {
+        if (scrape(io, addr, proxy, null, connect_timeout)) |obs| {
             if (obs.found) return true;
         } else |_| {}
         if (started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds >= timeout_ns) return false;
         io.sleep(.fromNanoseconds(std.time.ns_per_s), .awake) catch return false;
     }
 }
+
+/// Bounds a single scrape's connect() (see `scrape`'s doc comment) — generous
+/// for what should be an instant local Docker-network HTTP GET, short enough
+/// that a black-holed peer now costs seconds instead of the ~30 minutes an
+/// unbounded connect() cost before this existed.
+pub const scrape_connect_timeout: Io.Timeout = .{
+    .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake },
+};
 
 /// Samples one container for the length of a ramp, appending to `out`.
 ///
@@ -310,7 +342,7 @@ pub const Poller = struct {
             const now = Io.Timestamp.now(self.io, .awake);
             const t = @as(f64, @floatFromInt(self.t0.durationTo(now).nanoseconds)) / std.time.ns_per_s;
 
-            if (scrape(self.io, self.addr, self.proxy, &self.active_fd)) |obs| {
+            if (scrape(self.io, self.addr, self.proxy, &self.active_fd, scrape_connect_timeout)) |obs| {
                 if (obs.intruder) |other| {
                     // A container for a DIFFERENT proxy is live while this one
                     // is being measured. Whatever is answering :8080 may not be
@@ -600,9 +632,11 @@ test "waitUntilFound gives up after its bound against an address nothing answers
 
     // A closed local port: connect() fails immediately (ECONNREFUSED), so
     // this exercises the "never found, must eventually give up" path without
-    // actually waiting out a long timeout.
+    // actually waiting out a long timeout. `.none`: `Io.Threaded` panics
+    // outright on any other value (see `scrape`'s doc comment) and a fast
+    // ECONNREFUSED never needs the bound anyway.
     const addr = try net.IpAddress.parse("127.0.0.1", 1);
-    const found = waitUntilFound(io, addr, "zoxy", 300 * std.time.ns_per_ms);
+    const found = waitUntilFound(io, addr, "zoxy", 300 * std.time.ns_per_ms, .none);
     try std.testing.expect(!found);
 }
 
