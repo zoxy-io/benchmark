@@ -23,6 +23,7 @@ const profile = @import("profile.zig");
 const ramp = @import("ramp.zig");
 const redact = @import("redact.zig");
 const remote = @import("remote.zig");
+const zio = @import("zio");
 
 const Allocator = std.mem.Allocator;
 
@@ -1324,22 +1325,37 @@ fn runOne(
     }
 
     enter(stage, .warm, name);
-    try warmProbe(io, target, name);
 
     // Unconditional now: every proxy in the comparison runs in a container on
     // the proxy host. It used to be optional because `direct` had no container
     // to sample.
     const cadvisor_addr: ?net.IpAddress = try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
 
-    // Best-effort: give cAdvisor a bounded head start before the ramp opens
-    // its own 300s sampling window. See cadvisor.waitUntilFound's doc
-    // comment for why — a miss here just gets logged, never fails the turn.
-    if (cadvisor_addr) |addr| {
-        if (!cadvisor.waitUntilFound(io, addr, name, deadline.cadvisor_warm, cadvisor.scrape_connect_timeout)) {
-            redact.log(
-                "bench: [{s}] cadvisor had not reported this container after {d}s; CPU/mem may be absent for this ramp",
-                .{ name, deadline.cadvisor_warm / std.time.ns_per_s },
-            );
+    {
+        // warmProbe (via probeOnce) and cadvisor.waitUntilFound both hand a
+        // real `cadvisor.scrape_connect_timeout` down to `addr.connect`. `io`
+        // here is this suite's top-level `Io.Threaded` (from process.Init),
+        // which panics outright on any connect timeout but `.none` — see
+        // cadvisor.scrape's doc comment. Only zio's real Runtime supports
+        // one, so give these two probes their own, scoped tightly so its
+        // executor thread doesn't outlive them.
+        var probe_rt = try zio.Runtime.init(arena, .{});
+        defer probe_rt.deinit();
+        const probe_io = probe_rt.io();
+
+        try warmProbe(probe_io, target, name);
+
+        // Best-effort: give cAdvisor a bounded head start before the ramp
+        // opens its own 300s sampling window. See cadvisor.waitUntilFound's
+        // doc comment for why — a miss here just gets logged, never fails
+        // the turn.
+        if (cadvisor_addr) |addr| {
+            if (!cadvisor.waitUntilFound(probe_io, addr, name, deadline.cadvisor_warm, cadvisor.scrape_connect_timeout)) {
+                redact.log(
+                    "bench: [{s}] cadvisor had not reported this container after {d}s; CPU/mem may be absent for this ramp",
+                    .{ name, deadline.cadvisor_warm / std.time.ns_per_s },
+                );
+            }
         }
     }
 
