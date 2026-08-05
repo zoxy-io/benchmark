@@ -157,7 +157,7 @@ x-healthcheck-bash: &healthcheck-bash
 # over the compose network, which needs no mapping. In cloud, `ports:` is reset
 # by the overlay anyway.
 x-backend: &backend
-  image: nginx:1.27-alpine
+  image: nginx:1.31-alpine
   # 2, matching cloud/variables.tf's backend_cores — it becomes nginx's
   # worker_processes, so a mismatch means the origin is running more or fewer
   # workers than the box has cores.
@@ -326,7 +326,7 @@ services:
 
   haproxy:
     <<: *proxy-common
-    image: haproxy:3.0-alpine
+    image: haproxy:3.4-alpine
     container_name: haproxy
     profiles: [haproxy]
     environment:
@@ -371,7 +371,7 @@ services:
 
   envoy:
     <<: *proxy-common
-    image: envoyproxy/envoy:v1.33-latest
+    image: envoyproxy/envoy:v1.36-latest
     container_name: envoy
     profiles: [envoy]
     # --concurrency 1: envoy sizes its worker threads from the visible CPU count,
@@ -403,7 +403,7 @@ services:
     # build. The image's envsubst hook renders the template into /etc/nginx at
     # start; worker_processes is hardcoded to 1 (1 CPU) and the listener port
     # comes from PROXY_PORT below.
-    image: nginx:1.27-alpine
+    image: nginx:1.31-alpine
     container_name: nginx
     profiles: [nginx]
     environment:
