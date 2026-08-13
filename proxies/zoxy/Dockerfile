@@ -47,6 +47,25 @@ WORKDIR /dl
 # copies of a build argument would agree by construction rather than by fact.
 # For a tag these are the same answer twice; a tag that MOVED between the two
 # calls is the case this still catches.
+#
+# The OPTIMIZE MODE is read the same way, and for the same reason. This line
+# used to assert `ReleaseFast` unconditionally, which was true of every release
+# until zoxy's release.yml moved to ReleaseSafe (zoxy 1573c16, first shipped in
+# v0.2.0) — after which every night published a ReleaseSafe binary labelled
+# ReleaseFast, while the ~13% it costs showed up in the numbers with nothing to
+# attribute it to. zoxy reports no build mode of its own (`--version` and
+# `--help` are silent), so the artifact is the only witness: Zig emits panic
+# messages for its safety checks under ReleaseSafe and strips them under
+# ReleaseFast. Measured across six builds spanning both flavours and both
+# versions — zero hits on every ReleaseFast, two or three on every ReleaseSafe.
+#
+# `tr` first because busybox grep is not to be trusted with a 16 MB single
+# "line"; this is `strings` without depending on `strings`. The range is
+# spelled out rather than written `[:print:]` because busybox `tr` takes that
+# class under `-c` and matches NOTHING — silently, so the probe answers
+# "ReleaseFast" for every input. That is exactly the failure this whole block
+# exists to stop being possible, so it is verified against both tags rather
+# than assumed: v0.1.0 must read ReleaseFast and v0.2.1 ReleaseSafe.
 RUN set -eu; \
     v="${ZOXY_REF#v}"; \
     case "$TARGETARCH" in \
@@ -64,7 +83,14 @@ RUN set -eu; \
     tar xzf "$tgz" -C /out zoxy; \
     wget -qO /out/zoxy-commit --header 'Accept: application/vnd.github.sha' \
         "https://api.github.com/repos/zoxy-io/zoxy/commits/v$v"; \
-    echo "upstream release v$v $zarch-linux ReleaseFast cpu=x86_64_v3 (SIMD, sha256-verified)" \
+    if tr -c '\040-\176' '\n' < /out/zoxy \
+        | grep -q -e 'index out of bounds' -e 'reached unreachable code' \
+                  -e 'integer overflow'; then \
+        mode=ReleaseSafe; \
+    else \
+        mode=ReleaseFast; \
+    fi; \
+    echo "upstream release v$v $zarch-linux $mode cpu=x86_64_v3 (SIMD, sha256-verified, mode read from the artifact)" \
         > /out/build-info
 
 # ------------------------------------------------------------------- source --
@@ -102,11 +128,24 @@ RUN git clone https://github.com/zoxy-io/zoxy /src \
     && echo "built zoxy $ZOXY_REF -> $(cat /zoxy-commit)"
 
 WORKDIR /src
-# Optimize mode. Default ReleaseFast, which is BOTH what upstream's release
-# workflow ships and what the other proxies here are (pingora `cargo build
-# --release`, haproxy/nginx/envoy release builds). ReleaseSafe keeps Zig's
-# bounds/overflow/alignment checks on the hot path, a per-op CPU tax the others
-# don't pay; set ZOXY_OPTIMIZE=ReleaseSafe to measure that deliberately.
+# Optimize mode. Default ReleaseFast, which is what the other proxies here are
+# (pingora `cargo build --release`, haproxy/nginx/envoy release builds) — but it
+# is NO LONGER what upstream ships. zoxy's release.yml builds ReleaseSafe as of
+# 1573c16, deliberately and for the foreseeable future, so that a report from
+# the field carries a real panic instead of undefined behaviour. ReleaseSafe
+# keeps Zig's bounds/overflow/unreachable checks on the hot path, a per-op CPU
+# tax the other four do not pay: measured at -12.6%/-12.9% sustained on c1k in a
+# 2x2 over {v0.1.0, v0.2.1} x {ReleaseFast, ReleaseSafe}, where the version axis
+# moved +1.1%/+1.4% — i.e. essentially all of the 0.1.0 -> 0.2.x throughput drop
+# is this flag and none of it is the TLS work.
+#
+# So the default here no longer matches the release flavour, and that is a
+# deliberate split: this flavour exists to bench a branch or a commit, and
+# holding it at ReleaseFast is what makes `ZOXY_OPTIMIZE=ReleaseSafe` a
+# controlled A/B against it rather than the only thing on offer. What must not
+# happen again is either one being ASSERTED — the release stage above reads its
+# mode off the binary, and this one is recorded from the argument that produced
+# it.
 ARG ZOXY_OPTIMIZE=ReleaseFast
 # Same-arch: plain native build (native CPU features — what the cloud fleet
 # gets). Cross: baseline target — fine for the local smoke tier, not for

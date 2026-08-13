@@ -1342,6 +1342,22 @@ fn runOne(
                         .{info},
                     ));
                 }
+                // The asymmetry that runs the OTHER way, and the reason both
+                // belong here rather than only the flattering one. zoxy ships
+                // ReleaseSafe on purpose (upstream 1573c16) so a field report
+                // carries a real panic rather than undefined behaviour; the
+                // other four proxies are release builds with no equivalent
+                // checks. It is a priced trade, not a defect — but the price
+                // lands in this profile's throughput, so a reader comparing the
+                // rows has to be told it was paid.
+                if (std.mem.indexOf(u8, info, "ReleaseSafe") != null) {
+                    try notes.append(
+                        arena,
+                        "built ReleaseSafe: Zig's bounds/overflow/unreachable checks stay on in the hot path, " ++
+                            "which measured -12.7% sustained against the same code at ReleaseFast (c1k, 2x2 over " ++
+                            "v0.1.0/v0.2.1); the other proxies here are built without equivalent checks",
+                    );
+                }
             } else {
                 // Stock upstream image rather than one built here. Those are
                 // compiled for a generic x86-64 baseline so they run anywhere —
