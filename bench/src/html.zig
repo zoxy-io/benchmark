@@ -36,6 +36,9 @@ pub const Options = struct {
     ref_rate: f64,
     connections: u32,
     deadline_ms: u64,
+    /// The load was offered over TLS, terminated by each proxy. Changes what
+    /// every number on the page is a measurement OF, so the page says so.
+    tls: bool = false,
     /// Absolute prefix for `.hgrm` download links, so the same file works both
     /// as a Discord attachment (where a relative link 404s) and on Pages.
     base_url: []const u8 = "",
@@ -101,6 +104,24 @@ pub fn render(
             \\would miss it is shed before being sent and never recorded, so p99 is the distribution of requests
             \\served <em>within the SLO</em> and overload shows up as a bounded error rate instead of an unbounded tail.
         , .{opts.deadline_ms});
+    }
+    if (opts.tls) {
+        // Everything a reader needs to know before comparing this page's
+        // numbers to a plaintext profile's, in the place they will actually
+        // read it. The resumption line is the one that matters most: zoxy 0.2.0
+        // ships session tickets, and nothing here exercises them.
+        try out.writeAll(
+            \\ <b>The load is offered over TLS 1.3</b>, terminated by the proxy; every proxy's
+            \\upstream leg stays plaintext, as zoxy terminates inbound only. All five load the same
+            \\self-signed <b>ECDSA P-256</b> certificate — the key type is part of the measurement, since
+            \\the signature is per handshake. The generator offers <b>no ALPN</b> (so this is HTTP/1.1,
+            \\like every other profile) and <b>never resumes a session</b>, so each connection pays a full
+            \\handshake at connect time and the steady state read below is record-layer crypto on
+            \\kept-alive connections, not handshake throughput. The <b>cipher suite is each proxy's own
+            \\choice</b> from what the generator offers — AES-GCM and ChaCha20-Poly1305 do not cost the
+            \\same per byte, and only some of these proxies expose a knob for it, so it is recorded as
+            \\part of "the proxy as it ships" rather than pinned.
+        );
     }
     try out.writeAll("</p>");
 

@@ -2,8 +2,10 @@
 # reverse-proxy) binary on it (src/main.rs). Pinned Rust for reproducibility;
 # the Pingora version lives in Cargo.toml. Build deps cover both TLS backends
 # pingora may pull (openssl via libssl-dev/pkg-config, boringssl via
-# cmake/clang) so the crate resolves regardless of the default feature — even
-# though this proxy never does TLS.
+# cmake/clang) so the crate resolves regardless of the default feature. That
+# backend is load-bearing now rather than incidental: main.rs binds a TLS
+# listener with `add_tls`, so a build that resolved to no TLS backend fails
+# here — at build time, on every run — instead of at the first TLS ramp.
 FROM rust:1.85-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

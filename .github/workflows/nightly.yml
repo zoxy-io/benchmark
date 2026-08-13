@@ -62,7 +62,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k
+        default: c1k,c1k-tls
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -92,9 +92,12 @@ jobs:
     runs-on: ubuntu-24.04
 
     # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
-    # pingora a cargo build), then 1 profile x 5 proxies x ~350 s ~= 29 min,
-    # plus fetch/report/publish. 150 leaves real headroom without letting a
-    # wedged run bill for hours. `bench wait` runs as two chunked steps (each
+    # pingora a cargo build), then 2 profiles (c1k, c1k-tls) x 5 proxies x
+    # ~350 s ~= 58 min, plus fetch/report/publish. 150 still leaves real
+    # headroom without letting a wedged run bill for hours — and the two ~55
+    # minute `wait` chunks below are what a run that legitimately outlives one
+    # IAM token lands in, which two profiles now makes the normal case rather
+    # than the worst one. `bench wait` runs as two chunked steps (each
     # with its own, tighter step timeout — see "Wait chunk 1"/"Wait chunk 2"
     # below) so that a loadgen which never writes DONE fails a STEP, leaving
     # the teardown steps to run normally instead of being raced by a job-level
@@ -113,11 +116,19 @@ jobs:
 
       # `inputs` is null on a scheduled run, so every consumer needs the same
       # fallback the dispatch form defaults to.
+      #
+      # c1k-tls is c1k with the transport swapped and nothing else changed (see
+      # profile.zig), and it is on the schedule because the pair is only worth
+      # anything measured on the same night, on the same fleet: "TLS costs X" is
+      # the difference between two rows, and comparing tonight's TLS run against
+      # last week's plaintext one would fold every other night-to-night
+      # difference into that number.
+      #
       # c10k stays defined in profile.zig (its tuning history and the open
       # start-failure investigation from run #25 are worth keeping) — it is
       # just not in the default nightly set while that investigation is open.
-      # Pass `profiles: c1k,c10k` on a manual dispatch to run it anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k' }}
+      # Pass `profiles: c1k,c1k-tls,c10k` on a manual dispatch to run it anyway.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}

@@ -89,6 +89,46 @@ x-proxy-common: &proxy-common
 # Local mode never sets this (see runOne's `isLocal` branch) — bridge
 # networking already tears down and rebinds through Docker's own NAT layer,
 # not a raw app bind(), and never reproduced the failure either.
+#
+# PROXY_TLS_PORT: the TLS listener's port for the turn, resolved per proxy the
+# same way and for the same reason — with one difference that shapes every
+# proxy's config below. `bench` sets it ONLY FOR A TLS PROFILE (profile.zig's
+# `tls`; today, c1k-tls) and leaves it EMPTY otherwise, and an empty value means
+# the proxy renders no TLS listener at all rather than binding one on a default
+# port.
+#
+# That conditional is deliberate, and it was measured rather than assumed. An
+# always-bound TLS listener would be simpler here, but zoxy PREALLOCATES its TLS
+# session pool at boot: 35 MiB with no TLS listener against 283 MiB with one at
+# the stock 1024 engines (v0.2.0, ~136 KiB + a 64 KiB plaintext buffer each). A
+# quarter of a gigabyte added to a published memory number, on profiles that
+# never send a handshake, is not an acceptable price for uniform config. So a
+# plaintext turn renders exactly the configuration it rendered before TLS
+# existed here, and the c1k/c1k-tls pair stays a subtraction.
+#
+# Each proxy expresses the condition in whatever mechanism it has — the same
+# split PROXY_PORT already lives with: zoxy's entrypoint appends a listener to
+# the JSON, haproxy has native `.if !streq(...)`, nginx and envoy carry
+# @TLS_BEGIN@/@TLS_END@ markers that a line-range delete removes (25-tls.sh in
+# nginx's /docker-entrypoint.d, a sed in envoy's `command`), and pingora simply
+# does not call `add_tls` when TLS_LISTEN is empty.
+#
+# The CONTAINER HEALTHCHECK stays on the plaintext listener in every profile,
+# TLS included, which is also why the plaintext listener is never replaced. The
+# probe has to already exist inside each image (see x-healthcheck-wget/-bash
+# below): three of the five carry neither curl nor openssl, and bash's /dev/tcp
+# cannot handshake at all. Nothing is being installed into a container whose
+# memory footprint is a published number just to probe it. What DOES prove the
+# TLS listener serves is `bench`'s own warm probe, which handshakes through
+# zrk's TLS client from the loadgen before the ramp starts.
+#
+# The certificate is NOT in this repo. `bench suite` generates one ECDSA P-256
+# self-signed cert per run on the proxy host, into ./proxies/tls, which every
+# proxy below mounts read-only at /etc/bench/tls (bench.crt + bench.key, plus
+# bench.pem — the concatenation haproxy's `crt` requires). P-256 because zoxy
+# accepts nothing else, and one cert for all five because the signature is per
+# handshake and an RSA key would charge one proxy CPU the others never pay.
+# See suite.zig's `ensureTlsMaterial`.
 
 # Every proxy is healthchecked, and the check is a real request THROUGH it to
 # the backend's /1k — the very body the benchmark asks for. Without one,
@@ -315,13 +355,27 @@ services:
       ZOXY_WORKERS: 1
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
       ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
-      # entrypoint.sh renders this into config.template.json's @PORT@ — see
-      # x-proxy-common for why the cloud overlay varies it per turn.
+      # The TLS session pool, set by the TLS profiles only. It is the largest
+      # object zoxy holds — ~136 KiB plus a 64 KiB plaintext buffer each,
+      # preallocated at boot — so it is both why the TLS listener is not left
+      # bound on plaintext turns (35 MiB against 283 MiB, measured on v0.2.0)
+      # and why the profile has to size it: one engine is held per admitted
+      # connection, so anything under conn_slots sheds by admission policy.
+      ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
+      # entrypoint.sh renders these into config.template.json — see
+      # x-proxy-common for why the cloud overlay varies them per turn.
+      # PROXY_TLS_PORT is empty on a plaintext turn, and that is what leaves
+      # the TLS listener out of the rendered config entirely.
       PROXY_PORT: ${PROXY_PORT:-8080}
+      PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
+      # The run's own ECDSA P-256 cert, generated on this host before any proxy
+      # starts. zoxy's tls block wants the chain and the key as separate files.
+      - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
+      - "8443:8443"
     healthcheck: *healthcheck-bash
 
   haproxy:
@@ -339,10 +393,13 @@ services:
       BACKEND1_ADDR: backend1:9000
       BACKEND2_ADDR: backend2:9000
       BACKEND3_ADDR: backend3:9000
-      # haproxy.cfg's `bind` reads this via its OWN native env-var expansion
-      # (same mechanism BACKENDn_ADDR already uses) — haproxy.cfg is a static
-      # mounted file, so compose's `${}` interpolation never reaches it.
+      # haproxy.cfg's two `bind` lines read these via its OWN native env-var
+      # expansion (same mechanism BACKENDn_ADDR already uses) — haproxy.cfg is a
+      # static mounted file, so compose's `${}` interpolation never reaches it.
       PROXY_PORT: ${PROXY_PORT:-8080}
+      # Empty on a plaintext turn; haproxy.cfg's `.if !streq(...)` leaves the
+      # whole TLS frontend out when it is.
+      PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
     # haproxy is the only proxy here that cannot be told to log to a PATH — its
     # log targets are syslog, a socket, a ring or a file descriptor, and
     # haproxy.cfg's `log stdout` is its alias for fd 1. So the file sink every
@@ -362,8 +419,12 @@ services:
       - exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg >> /tmp/access.log
     volumes:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      # haproxy's `crt` takes ONE file holding the chain and the key, which is
+      # why the generator writes bench.pem alongside the split pair.
+      - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
+      - "8443:8443"
     healthcheck: *healthcheck-wget
 
 
@@ -385,15 +446,26 @@ services:
     # PARSE time (this string lives in compose.yaml itself), which bakes the
     # literal port into the sed command before the container ever starts —
     # see x-proxy-common for why the port varies per turn at all.
+    #
+    # On a plaintext turn PROXY_TLS_PORT is empty and the template's
+    # @TLS_BEGIN@..@TLS_END@ range — the whole TLS listener — is deleted, so
+    # envoy parses exactly the configuration it parsed before TLS existed here.
+    # On a TLS turn the range is kept and its @TLS_PORT@ substituted. `$$` is
+    # compose's escape for a dollar the SHELL should see, not compose.
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        sed 's/@PORT@/${PROXY_PORT:-8080}/' /etc/envoy/envoy.yaml.template > /tmp/envoy.yaml &&
+        tls='/@TLS_BEGIN@/,/@TLS_END@/d';
+        [ -n "${PROXY_TLS_PORT:-}" ] && tls='s/@TLS_PORT@/${PROXY_TLS_PORT}/';
+        sed -e 's/@PORT@/${PROXY_PORT:-8080}/' -e "$$tls"
+        /etc/envoy/envoy.yaml.template > /tmp/envoy.yaml &&
         exec envoy -c /tmp/envoy.yaml --concurrency 1
     volumes:
       - ./proxies/envoy/envoy.yaml.template:/etc/envoy/envoy.yaml.template:ro
+      - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
+      - "8443:8443"
     healthcheck: *healthcheck-bash
 
   nginx:
@@ -409,12 +481,25 @@ services:
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
       # Read by envsubst when it renders the template, NOT by compose
-      # interpolation into the mounted file — see the `listen` line there.
+      # interpolation into the mounted file — see the `listen` lines there.
       PROXY_PORT: ${PROXY_PORT:-8080}
+      # Empty on a plaintext turn, which is what 25-tls.sh keys off to delete
+      # the TLS server block from the rendered config.
+      PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
     volumes:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      # The `location` both server blocks include, so the plaintext and TLS
+      # listeners cannot drift into proxying differently. Mounted straight into
+      # /etc/nginx rather than through templates/ — it has nothing to
+      # substitute.
+      - ./proxies/nginx/origin-location.conf:/etc/nginx/origin-location.conf:ro
+      # Runs after the image's own envsubst hook (name order) and strips the TLS
+      # server block unless this is a TLS turn.
+      - ./proxies/nginx/25-tls.sh:/docker-entrypoint.d/25-tls.sh:ro
+      - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
+      - "8443:8443"
     healthcheck: *healthcheck-wget
 
   pingora:
@@ -436,11 +521,23 @@ services:
       # reads LISTEN once at its own startup, so the resolved literal is all it
       # ever needs. See x-proxy-common for why the port varies per turn.
       LISTEN: 0.0.0.0:${PROXY_PORT:-8080}
+      # The TLS listener, added with the same `add_tls` pingora's own docs use;
+      # the cert and key are the mount below, and the one HTTP proxy service
+      # serves both listeners, so nothing about the request path differs.
+      #
+      # EMPTY on a plaintext turn, and main.rs adds no TLS endpoint at all when
+      # it is — the port half of this string is `${PROXY_TLS_PORT}`, so the
+      # whole value collapses to nothing rather than to a bind on a default
+      # port. See x-proxy-common for why a plaintext turn must not carry one.
+      TLS_LISTEN: ${PROXY_TLS_PORT:+0.0.0.0:}${PROXY_TLS_PORT:-}
       # Comma-separated pool; main.rs resolves each once at startup and
       # round-robins across them with an atomic counter.
       UPSTREAMS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
+    volumes:
+      - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
+      - "8443:8443"
     healthcheck: *healthcheck-bash
 
   # ------------------------------------------- per-host exporters (all roles) --

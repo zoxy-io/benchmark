@@ -1,4 +1,6 @@
-# L7 HTTP reverse proxy :8080 -> the backend0..backend3 pool (parity with every
+# L7 HTTP reverse proxy :8080 -> the backend0..backend3 pool, plus a TLS
+# listener on :8443 for the TLS profiles only (see the bottom of this file, and
+# tls-server.conf.template) (parity with every
 # other proxy here — parse HTTP/1.1, pick an origin, reverse-proxy the request,
 # keeping both the client and the pooled upstream connection alive). This is an
 # envsubst template (official-image mechanism): worker count is hardcoded to 1
@@ -99,12 +101,53 @@ http {
         # it. Same mechanism the backend origin's template already uses for
         # BACKEND_CPUS.
         listen ${PROXY_PORT};
-        location / {
-            proxy_pass http://origin;
-            # keep-alive to the upstream requires HTTP/1.1 with the per-hop
-            # Connection header cleared (nginx defaults to HTTP/1.0 + close).
-            proxy_http_version 1.1;
-            proxy_set_header Connection "";
-        }
+        include /etc/nginx/origin-location.conf;
     }
+
+    # @TLS_BEGIN@
+    # The TLS listener, for the TLS profiles.
+    #
+    # EVERYTHING FROM THE MARKER ABOVE TO THE ONE BELOW IS DELETED from the
+    # rendered config on a plaintext turn, by 25-tls.sh in this image's
+    # /docker-entrypoint.d — the image's template hook substitutes variables, it
+    # cannot leave a block out, and a plaintext turn has to run the
+    # configuration it ran before TLS existed here rather than one with an extra
+    # listener and a loaded certificate in it. envoy's template carries the same
+    # markers for the same reason.
+    #
+    # NOTHING ELSE IN THIS FILE MAY SPELL EITHER MARKER, this comment included:
+    # sed's range ends at the first line matching the end marker, so naming it
+    # in the prose here closed the range early and left the block behind —
+    # nginx then died with `host not found in "ssl" of the "listen" directive`,
+    # which is what an unset port renders to.
+    #
+    # nginx terminates here and the upstream leg stays plaintext: the `origin`
+    # upstream above is the one both servers proxy to. Every proxy in the
+    # comparison does it that way, because zoxy terminates inbound only.
+    #
+    # The certificate is the run's own self-signed ECDSA P-256 pair, generated
+    # on the proxy host before any container starts and mounted read-only at
+    # /etc/bench/tls. All five load the same key material: a signature is per
+    # handshake, so an RSA key would charge one proxy CPU the others never pay —
+    # and zoxy would refuse it outright.
+    server {
+        listen ${PROXY_TLS_PORT} ssl;
+        # TLS 1.3 only. The generator offers nothing else, so this changes no
+        # handshake — it pins what is being measured, identically across the
+        # five, instead of leaving each proxy's own default version range to
+        # decide it.
+        ssl_protocols TLSv1.3;
+        ssl_certificate     /etc/bench/tls/bench.crt;
+        ssl_certificate_key /etc/bench/tls/bench.key;
+        # No `http2 on;`, which is nginx's default and is stated here because
+        # the other two proxies had to state the same thing: haproxy's TLS bind
+        # advertises h2 by default and negotiated HTTP/2 with an ALPN-offering
+        # client while this listener stayed on HTTP/1.1. Every number this
+        # benchmark publishes is HTTP/1.1, on all five proxies.
+        # Session tickets are nginx's default and are left alone: the generator
+        # never presents one (Zig's TLS client does not resume), so every
+        # connection here is a full handshake whatever this says.
+        include /etc/nginx/origin-location.conf;
+    }
+    # @TLS_END@
 }

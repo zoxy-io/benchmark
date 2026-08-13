@@ -1,5 +1,7 @@
 {
-  "listeners": [{ "bind": "0.0.0.0:@PORT@", "cluster": "origin", "protocol": "http" }],
+  "listeners": [
+    { "bind": "0.0.0.0:@PORT@", "cluster": "origin", "protocol": "http" }@TLS_LISTENER@
+  ],
   "clusters": {
     "origin": { "endpoints": [@BACKEND_ADDRS@], "pick": "rr" }
   },

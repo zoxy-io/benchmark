@@ -19,8 +19,9 @@ Every proxy is an **HTTP/1.1 reverse proxy** doing the same job — HAProxy
 ~90-line Rust binary on Cloudflare's framework, zoxy's phase-1 `http`
 listener: parse each request,
 **pick an origin from a four-node pool**, forward it over a pooled keep-alive
-upstream, stream the response back. The generator speaks HTTP end-to-end and
-the origins are nginx.
+upstream, stream the response back. The generator speaks HTTP/1.1 end-to-end —
+over TLS to the proxy on the `c1k-tls` profile, plaintext onward to the origins
+in every profile — and the origins are nginx.
 
 The pool is what makes the job the one a production proxy actually does: a
 single origin measures forwarding, and forwarding alone. Balancing across a set
@@ -74,14 +75,16 @@ federation, the results bucket — is in [docs/SETUP.md](docs/SETUP.md); after
 that, use `workflow_dispatch` to trigger a run by hand.
 
 Ramp profiles are compiled into [`bench/src/profile.zig`](bench/src/profile.zig)
-and run across `zoxy, haproxy, nginx, pingora, envoy`. Only `c1k` runs on the
-schedule; pass `profiles: c1k,c10k` on a manual dispatch to run `c10k` too:
+and run across `zoxy, haproxy, nginx, pingora, envoy`. `c1k` and `c1k-tls` run
+on the schedule; pass `profiles: c1k,c1k-tls,c10k` on a manual dispatch to run
+`c10k` too:
 
-| profile | connections | deadline | runs nightly? | what it answers |
-|---|---|---|---|---|
-| `c100` | 100 | — | manual only | cheap smoke profile, zoxy's shipped defaults |
-| `c1k` | 1 000 | — | yes (default) | how fast is each proxy at a healthy concurrency |
-| `c10k` | 10 000 | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
+| profile | connections | transport | deadline | runs nightly? | what it answers |
+|---|---|---|---|---|---|
+| `c100` | 100 | plaintext | — | manual only | cheap smoke profile, zoxy's shipped defaults |
+| `c1k` | 1 000 | plaintext | — | yes (default) | how fast is each proxy at a healthy concurrency |
+| `c1k-tls` | 1 000 | TLS 1.3 | — | yes (default) | what terminating TLS costs each proxy — `c1k` with TLS on and nothing else changed |
+| `c10k` | 10 000 | plaintext | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
 
 Locally you can work on everything except the load generation itself:
 
@@ -152,6 +155,52 @@ noticed.
     admin endpoint after every ramp into `access_log_dropped` in the run
     record; nonzero puts a note on that proxy's row saying how much logging
     work was skipped there and not elsewhere.
+- **TLS is a profile, not a proxy setting.** Every proxy binds **both** a
+  plaintext and a TLS listener on every run, and the profile decides which one
+  the ramp connects to — so `c1k-tls` is `c1k` with the transport swapped and
+  nothing else changed, and the pair is a subtraction rather than two
+  experiments. What travels with those numbers:
+  - **One certificate for all five**, generated per run on the proxy host:
+    self-signed **ECDSA P-256**. The key type is part of the measurement — a
+    signature is per handshake, and an RSA-2048 key would charge a proxy CPU
+    that P-256 does not. It is also the only choice available: zoxy accepts
+    ECDSA P-256/P-384 and rejects RSA outright, because an RSA signature would
+    stall its single event loop.
+  - **TLS 1.3, and HTTP/1.1 underneath it.** Every listener is pinned to 1.3,
+    and the generator offers **no ALPN**, so nothing here is HTTP/2 and the
+    protocol being proxied is the same one every other profile measures. The
+    ALPN list is pinned to `http/1.1` where it can be (haproxy, envoy) rather
+    than left at each proxy's default: haproxy's TLS bind advertises `h2` by
+    default and was measured negotiating HTTP/2 against an ALPN-offering client
+    while the others stayed on HTTP/1.1.
+  - **The cipher suite is not pinned**, because it cannot be for all five —
+    zoxy exposes no knob for it. Each proxy picks from what the generator
+    offers, AES-GCM and ChaCha20-Poly1305 do not cost the same per byte, and
+    that difference is part of what "this proxy as it ships" means here.
+  - **zoxy's TLS session pool is a hard ceiling the others do not have.** It
+    preallocates one engine per admitted TLS connection and sheds past the
+    pool; `c1k-tls` pins `tls_engines` to 1024, which is both v0.2.0's default
+    and its maximum (2048 and 4096 are rejected at startup), against 1 000
+    offered connections. `bench` reads `zoxy_shed_tls_engines` off the admin
+    endpoint after every TLS ramp and puts a note on the row if it is nonzero —
+    a shed connection means the number is partly about that ceiling.
+  - **No session resumption, ever.** The generator (zrk, on Zig's std TLS
+    client) never presents a ticket, so every connection is a full handshake.
+    Two consequences: handshakes are paid at *connect* time — all 1 000 in the
+    first seconds of the ramp — and the p50/p99 read at the 2 000 req/s
+    reference rate is record-layer crypto on kept-alive connections, not
+    handshake throughput. **zoxy 0.2.0's ticket support is therefore not
+    exercised by this profile at all.**
+  - **Inbound only.** Every proxy terminates TLS and talks plaintext to the
+    origin pool, because zoxy terminates inbound only; letting the other four
+    also encrypt upstream would measure a job zoxy cannot do.
+  - **The plaintext profiles are untouched**: no proxy renders a TLS listener
+    at all unless the profile terminates TLS, so `c1k` runs the configuration it
+    ran before this existed and its trend is continuous across the commit. That
+    is not tidiness — zoxy preallocates its TLS engine pool at boot, so an
+    always-bound listener would have added ~250 MiB (35 MiB → 283 MiB, measured
+    on v0.2.0) to a published memory number for a socket that never sees a
+    handshake.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).

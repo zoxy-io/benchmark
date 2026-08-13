@@ -388,6 +388,7 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         .ref_rate = prof.ref_rate,
         .connections = prof.connections,
         .deadline_ms = prof.deadline_ms,
+        .tls = prof.tls,
         .base_url = base_url,
         .origin = origin,
     });

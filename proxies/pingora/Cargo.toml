@@ -13,8 +13,22 @@ path = "src/main.rs"
 # reverse-proxy state machine and upstream connection pool); pingora-core
 # carries Server / ServerConf / HttpPeer. Pin the minor here; bump to bench a
 # newer Pingora.
-pingora-core = "0.8"
-pingora-proxy = "0.8"
+#
+# The `openssl` FEATURE is not optional decoration, and it was found the
+# expensive way: without a TLS feature, pingora-core 0.8 still compiles
+# `add_tls` and still accepts the certificate paths — and then panics at the
+# first handshake, inside `protocols/tls/noop_tls`, with "not implemented: No
+# tls feature was specified". A TLS listener that binds, accepts a connection,
+# reads the ClientHello and closes without answering is exactly the failure a
+# benchmark cannot afford to discover from a row of zeroes.
+#
+# openssl rather than boringssl or rustls: the Dockerfile already installs
+# libssl-dev to build against and libssl3 to run against, and it puts pingora in
+# the same company as nginx and haproxy here (envoy links BoringSSL, zoxy its
+# own libcrypto), so the comparison spans the stacks these proxies actually
+# ship with.
+pingora-core = { version = "0.8", features = ["openssl"] }
+pingora-proxy = { version = "0.8", features = ["openssl"] }
 async-trait = "0.1"
 # Access-log timestamps. Already in the tree as a pingora-core dependency, so
 # this pulls in no new crate — it only makes the dependency direct, since

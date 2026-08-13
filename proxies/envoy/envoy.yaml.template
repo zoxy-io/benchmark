@@ -12,10 +12,11 @@
 # rather than a change — but it now decides something, so it is not left
 # implicit.
 #
-# @PORT@ is rendered by compose.yaml's `command` (a sed pass before envoy
-# starts) rather than left at a fixed 8080 — see x-proxy-common there for why
-# the listener port varies per turn. The admin port below stays fixed: it is
-# loopback-only and not implicated in the port-reuse issue this addresses.
+# @PORT@ and @TLS_PORT@ are rendered by compose.yaml's `command` (a sed pass
+# before envoy starts) rather than left at a fixed 8080/8443 — see
+# x-proxy-common there for why the listener ports vary per turn. The admin port
+# below stays fixed: it is loopback-only and not implicated in the port-reuse
+# issue this addresses.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9902 }
@@ -26,7 +27,14 @@ static_resources:
       address:
         socket_address: { address: 0.0.0.0, port_value: @PORT@ }
       filter_chains:
-        - filters:
+        # ANCHORED, and aliased by the TLS listener below. Envoy parses this as
+        # YAML before turning it into protobuf, so the alias is resolved by the
+        # parser and both listeners are guaranteed the identical HTTP filter
+        # chain — same router, same access log, same timeouts. Copying the block
+        # would let the plaintext and TLS listeners drift into proxying
+        # differently, which is precisely what the c1k/c1k-tls pair is supposed
+        # to hold constant.
+        - filters: &http_chain
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
@@ -75,6 +83,61 @@ static_resources:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # @TLS_BEGIN@
+    # The TLS listener: the same filter chain as `plain`, behind a TLS
+    # transport socket.
+    #
+    # EVERYTHING FROM THE MARKER ABOVE TO THE ONE BELOW IS DELETED on a
+    # plaintext turn, by the sed in compose.yaml's `command` — the markers are
+    # YAML comments, so the TLS turn needs no substitution at all and simply
+    # keeps them. envoy has no conditionals and this file is a static mount, so
+    # a line-range delete is the mechanism available; the alternative, a second
+    # always-bound listener, would have moved the plaintext profiles' numbers
+    # for a socket they never use.
+    #
+    # NOTHING ELSE IN THIS FILE MAY SPELL EITHER MARKER, this comment included:
+    # sed's range ends at the first line matching the end marker, so naming it
+    # in the prose here closed the range four lines in and left the listener
+    # behind — which is how the plaintext turn first came up with a TLS
+    # listener bound and an unrendered port in it.
+    #
+    # Envoy terminates here and the upstream leg stays plaintext (the `origin`
+    # cluster below is shared, and has no transport_socket of its own), which is
+    # what every proxy in the comparison does: zoxy's TLS is inbound-only.
+    #
+    # The certificate is the run's own self-signed ECDSA P-256 pair, generated
+    # on the proxy host before any container starts and mounted read-only at
+    # /etc/bench/tls — the same key material all five load.
+    #
+    # `alpn_protocols: [http/1.1]`, stated rather than left to the default, for
+    # the same reason haproxy's bind pins it: haproxy's TLS default advertises
+    # h2 and duly negotiated HTTP/2 when something offering ALPN connected,
+    # while envoy and nginx stayed on HTTP/1.1. The generator offers no ALPN, so
+    # every proxy speaks HTTP/1.1 today — but the protocol under test should be
+    # a property of this file, not of each proxy's defaults. Every number this
+    # benchmark has published is HTTP/1.1.
+    - name: tls
+      address:
+        socket_address: { address: 0.0.0.0, port_value: @TLS_PORT@ }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["http/1.1"]
+                # TLS 1.3 only, pinned for the same reason the other proxies pin
+                # it: the version in play should be a stated property of the
+                # run, not each proxy's own default range.
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                tls_certificates:
+                  - certificate_chain: { filename: /etc/bench/tls/bench.crt }
+                    private_key: { filename: /etc/bench/tls/bench.key }
+          filters: *http_chain
+    # @TLS_END@
 
   clusters:
     - name: origin

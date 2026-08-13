@@ -24,6 +24,7 @@ const ramp = @import("ramp.zig");
 const redact = @import("redact.zig");
 const remote = @import("remote.zig");
 const zio = @import("zio");
+const zrk = @import("zrk");
 
 const Allocator = std.mem.Allocator;
 
@@ -393,18 +394,42 @@ fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "docker inspect -f '{{{{.Config.Image}}}}' {s} 2>/dev/null", .{name});
 }
 
-/// How many access-log lines zoxy threw away while serving the ramp.
+/// What zoxy silently did LESS of than the other four while serving the ramp.
 ///
-/// Every proxy in the comparison access-logs every request, and they do not
-/// agree about what happens when the sink cannot keep up. nginx, haproxy and
-/// pingora write once per request and wear the cost. envoy buffers and flushes
-/// on a timer. zoxy does neither: it DROPS the line and counts it, rather than
-/// let logging stall its event loop.
-///
-/// That is a legitimate design choice and not a cheat — but it is also work
-/// zoxy did not do and the other four did, so left unmeasured it arrives as
-/// throughput. This is the only proxy here whose logging can silently do less,
-/// which is why it is the only one probed.
+/// Both counters are read in ONE scrape, deliberately. `deadline.turn` budgets
+/// a fixed number of `deadline.inspect`-bounded probes per turn and its comment
+/// is explicit that adding one without bumping that sum re-introduces the run
+/// #24 watchdog inversion — so a second counter arrives as a second grep
+/// pattern, not as a second probe.
+const ZoxyCounters = struct {
+    /// Access-log lines dropped.
+    ///
+    /// Every proxy in the comparison access-logs every request, and they do not
+    /// agree about what happens when the sink cannot keep up. nginx, haproxy and
+    /// pingora write once per request and wear the cost. envoy buffers and
+    /// flushes on a timer. zoxy does neither: it DROPS the line and counts it,
+    /// rather than let logging stall its event loop.
+    ///
+    /// That is a legitimate design choice and not a cheat — but it is also work
+    /// zoxy did not do and the other four did, so left unmeasured it arrives as
+    /// throughput.
+    access_log_dropped: ?u64 = null,
+
+    /// Connections refused for want of a TLS session slot.
+    ///
+    /// zoxy holds one preallocated TLS engine per admitted connection and sheds
+    /// past the pool's size, where the other four allocate per connection and
+    /// have no such ceiling. The TLS profiles size the pool to `conn_slots` for
+    /// exactly that reason (profile.zig's `ZOXY_TLS_ENGINES`); a nonzero value
+    /// here means the pool was reached anyway and the ramp measured zoxy's
+    /// admission cap rather than its TLS.
+    ///
+    /// Always null on a plaintext profile — zoxy has no TLS listener then, and
+    /// the metric is absent rather than zero.
+    shed_tls_engines: ?u64 = null,
+};
+
+/// Scrape zoxy's admin endpoint for both counters.
 ///
 /// Asked over zoxy's admin listener, which answers the same Prometheus text for
 /// any path (`admin.bind` in config.template.json). Reached from INSIDE the
@@ -412,24 +437,45 @@ fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
 /// uses against this image — because the admin port is published in neither
 /// mode and the runtime image carries no curl.
 ///
-/// Best-effort: null on any failure, which the caller reports as an unread
-/// counter rather than as a clean zero.
-fn accessLogDropped(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) ?u64 {
+/// Best-effort: nulls on any failure, which the caller reports as unread
+/// counters rather than as clean zeroes.
+fn zoxyCounters(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) ZoxyCounters {
     const res = remote.check(
         gpa,
         arena,
         io,
         fleet.proxyHost(),
-        "zoxy access-log drops",
-        // `|| true`: grep exits 1 when the counter is absent, which is a
+        "zoxy counters",
+        // `|| true`: grep exits 1 when neither counter is present, which is a
         // question answered ("no such metric"), not a transport failure.
         "docker exec zoxy bash -c 'exec 3<>/dev/tcp/127.0.0.1/9101 && " ++
             "printf \"GET /metrics HTTP/1.1\\r\\nHost: admin\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && " ++
-            "cat <&3' 2>/dev/null | grep access_log_dropped || true",
+            "cat <&3' 2>/dev/null | grep -E 'access_log_dropped|shed_tls_engines' || true",
         deadline.inspect,
-    ) catch return null;
+    ) catch return .{};
 
-    return counterValue(res.stdout);
+    return .{
+        .access_log_dropped = counterNamed(res.stdout, "access_log_dropped"),
+        .shed_tls_engines = counterNamed(res.stdout, "shed_tls_engines"),
+    };
+}
+
+/// The value of the first real sample line whose metric name contains `needle`.
+///
+/// One scrape carries both counters now, so the name has to be matched here as
+/// well as in the shell's grep — taking the first sample line would give
+/// whichever counter zoxy happened to render first.
+fn counterNamed(text: []const u8, needle: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        // The name is everything up to a label brace or the value's space.
+        const name_end = std.mem.indexOfAny(u8, line, " \t{") orelse line.len;
+        if (std.mem.indexOf(u8, line[0..name_end], needle) == null) continue;
+        return counterValue(line);
+    }
+    return null;
 }
 
 /// The value of the first real sample line in a scrap of Prometheus text.
@@ -661,6 +707,58 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
         try flush.write();
         return .{ .records = try records.toOwnedSlice(arena), .aborted = true };
+    };
+
+    // --- the certificate every proxy terminates TLS with, on a TLS profile.
+    //
+    // ONE certificate for all five, made before anything starts, because the key
+    // is part of what is being measured: a signature is per handshake, and an
+    // RSA-2048 key would charge one proxy several hundred microseconds of CPU
+    // per connection that a P-256 key does not. Five self-signed certs, or five
+    // proxies each shipping its own, would be five different experiments.
+    //
+    // P-256 specifically. zoxy accepts nothing else (its config docs: "ECDSA
+    // P-256 or P-384", because an RSA signature would stall its single event
+    // loop for milliseconds), so it is the only curve on which the comparison
+    // can be like-for-like at all.
+    //
+    // Made on the PROXY HOST rather than committed to the repo: a private key in
+    // a public repository is a permanent secret-scanner alarm for something that
+    // exists for one night, and the fleet is ephemeral, so "generate if absent"
+    // is once per run in cloud and once ever in a local checkout.
+    //
+    // The KEY PAIR is made only for a profile that terminates TLS, and its
+    // failure is fatal for that profile: every proxy's TLS listener loads these
+    // files, so without them nothing starts, and five identical start failures
+    // are much harder to read than one message saying the certificate could not
+    // be made. A plaintext profile never asks for the pair, and so cannot be
+    // failed by a missing `openssl`.
+    //
+    // The DIRECTORY is made on every profile, and that is not tidiness. Every
+    // proxy bind-mounts ./proxies/tls in every profile (compose cannot mount a
+    // path conditionally), and dockerd CREATES A MISSING BIND SOURCE ITSELF, as
+    // root. A plaintext profile running first would therefore leave a
+    // root-owned directory that the TLS profile's `openssl`, running as the
+    // unprivileged run user on the same host, cannot write into — a failure
+    // that would only ever appear in a dispatch that ran both profiles, in that
+    // order, which is exactly the nightly.
+    ensureTlsMaterial(gpa, arena, io, opts.fleet, p.tls) catch |e| {
+        if (p.tls) {
+            redact.log("bench: could not make the proxies' TLS certificate: {s}", .{@errorName(e)});
+            for (opts.proxies) |name| {
+                try records.append(arena, .{
+                    .name = name,
+                    .status = .skipped,
+                    .stage = .start,
+                    .err = "the proxies' TLS certificate could not be generated on the proxy host",
+                });
+            }
+            try flush.write();
+            return .{ .records = try records.toOwnedSlice(arena), .aborted = true };
+        }
+        // Nothing on a plaintext profile depends on the directory existing yet;
+        // the TLS profile that does will report it.
+        redact.log("bench: could not prepare {s}: {s}", .{ tls_dir, @errorName(e) });
     };
 
     // --- cAdvisor: the measurement's CPU/memory source and its identity witness.
@@ -1089,13 +1187,8 @@ fn runOne(
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
     const p = opts.prof;
-    // Local mode never varies the port — bridge networking already tears down
-    // and rebinds cleanly (Docker's own NAT layer, not a raw app bind()), and
-    // varying it there would also mean varying compose.yaml's static
-    // `ports: "8080:8080"` mapping for no reason. 8080 stays correct for a
-    // local run purely because `PROXY_PORT` is then left unset and every
-    // proxy's own default is 8080 — see `envPrefix`.
-    const port: u16 = if (opts.fleet.isLocal()) 8080 else proxyPort(p, proxy_idx);
+    const ports = portsFor(p, opts.fleet, proxy_idx);
+    const port = ports.target(p);
 
     var notes: std.ArrayList([]const u8) = .empty;
     var zoxy_commit: ?[]const u8 = null;
@@ -1106,7 +1199,19 @@ fn runOne(
     // some other commit than the one the report will name.
     var stale_build = false;
 
-    const target = try std.fmt.allocPrint(arena, "http://{s}:{d}{s}", .{ opts.fleet.proxy_ip, port, p.req_path });
+    // `https` on a TLS profile — the scheme is what zrk's URL parser turns into
+    // a TLS connection, and what `ramp.run` reads back to decide whether to skip
+    // verification. The host is an IP literal either way (zoxy does no DNS, and
+    // a hostname would drag zrk's untimed resolver into the measurement), so
+    // there is no name to verify and no SNI to send: the certificate is
+    // self-signed and the generator is run with verification off. See
+    // `ensureTlsMaterial`.
+    const target = try std.fmt.allocPrint(arena, "{s}://{s}:{d}{s}", .{
+        if (p.tls) "https" else "http",
+        opts.fleet.proxy_ip,
+        port,
+        p.req_path,
+    });
 
     {
         // What the PREVIOUS proxy left behind on the proxy host, before this one
@@ -1142,7 +1247,7 @@ fn runOne(
         const start_label = try std.fmt.allocPrint(arena, "start {s}", .{name});
         const start_cmd = try std.fmt.allocPrint(arena, "cd {s} && {s} {s} --profile {s} up -d --wait {s}", .{
             opts.fleet.remote_dir,
-            try envPrefix(arena, p, opts.fleet, zoxy_src, if (opts.fleet.isLocal()) null else port),
+            try envPrefix(arena, p, opts.fleet, zoxy_src, ports),
             opts.fleet.composeCmd(),
             name,
             name,
@@ -1343,7 +1448,7 @@ fn runOne(
         defer probe_rt.deinit();
         const probe_io = probe_rt.io();
 
-        try warmProbe(probe_io, target, name);
+        try warmProbe(gpa, probe_io, target, name);
 
         // Best-effort: give cAdvisor a bounded head start before the ramp
         // opens its own 300s sampling window. See cadvisor.waitUntilFound's
@@ -1427,10 +1532,11 @@ fn runOne(
     // container: the counter is cumulative over the process's life, so it has
     // to be read while that process is still alive, and reading it before the
     // ramp would only ever report zero.
-    const access_log_dropped: ?u64 = if (std.mem.eql(u8, name, "zoxy"))
-        accessLogDropped(gpa, arena, io, opts.fleet)
+    const counters: ZoxyCounters = if (std.mem.eql(u8, name, "zoxy"))
+        zoxyCounters(gpa, arena, io, opts.fleet)
     else
-        null;
+        .{};
+    const access_log_dropped = counters.access_log_dropped;
 
     // --- classify.
     //
@@ -1513,6 +1619,35 @@ fn runOne(
                 "could not read zoxy's access-log drop counter; whether logging was lossy here is unknown, not zero",
             );
         }
+
+        // The TLS admission cap, on a TLS profile. Nonzero means the profile
+        // sized `tls_engines` too small for the offered connections and the
+        // ramp measured that ceiling rather than zoxy's TLS — the same failure
+        // mode `zoxy_shed_upstream_slots` describes for the upstream pool, and
+        // the fix is the same: raise it in profile.zig, or accept that the
+        // number is about the cap.
+        //
+        // Not degraded, on the access-log precedent: the ramp measured the
+        // proxy it says it did, and degrading zoxy routinely would cost it its
+        // regression baseline in index.zig's previousSustained.
+        if (p.tls) {
+            if (counters.shed_tls_engines) |shed| {
+                if (shed > 0) {
+                    try notes.insert(arena, 0, try std.fmt.allocPrint(
+                        arena,
+                        "shed {d} connection(s) for want of a TLS session slot: this profile's " ++
+                            "tls_engines pool was too small for {d} offered connections, so part of " ++
+                            "this number is zoxy's admission cap rather than its TLS",
+                        .{ shed, p.connections },
+                    ));
+                }
+            } else {
+                try notes.append(
+                    arena,
+                    "could not read zoxy's TLS session shed counter; whether connections were refused for want of a session slot is unknown, not zero",
+                );
+            }
+        }
     }
     if (stale_build) {
         // The ramp itself is fine — some zoxy really was measured — so this is
@@ -1549,6 +1684,7 @@ fn runOne(
         .zoxy_ref_sha = if (std.mem.eql(u8, name, "zoxy")) zoxy_ref_sha else null,
         .build_info = build_info,
         .access_log_dropped = access_log_dropped,
+        .shed_tls_engines = counters.shed_tls_engines,
         .notes = try notes.toOwnedSlice(arena),
     };
 }
@@ -1556,13 +1692,22 @@ fn runOne(
 /// Poll the target until it serves. Runs from the loadgen so it exercises the
 /// real path, and reports only the proxy name and attempt count — never the
 /// target URL, which carries a private address.
-fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
+///
+/// "The real path" is why this speaks TLS on a TLS profile rather than probing
+/// the plaintext listener that is also up. The container healthcheck already
+/// proves the proxy forwards; what only this can prove is that the listener the
+/// ramp is about to hammer completes a handshake. A proxy whose cert failed to
+/// load usually does not start at all — but one that starts and then rejects
+/// every handshake would otherwise reach the ramp and be recorded as a proxy
+/// that served nothing.
+fn warmProbe(gpa: Allocator, io: Io, target: []const u8, name: []const u8) !void {
     const url = try std.Uri.parse(target);
+    const use_tls = std.mem.eql(u8, url.scheme, "https");
     const host = switch (url.host orelse return error.InvalidTarget) {
         .raw => |h| h,
         .percent_encoded => |h| h,
     };
-    const addr = try net.IpAddress.parse(host, url.port orelse 80);
+    const addr = try net.IpAddress.parse(host, url.port orelse @as(u16, if (use_tls) 443 else 80));
     const path = if (url.path.isEmpty()) "/" else switch (url.path) {
         .raw => |s| s,
         .percent_encoded => |s| s,
@@ -1571,7 +1716,7 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
     const started = Io.Timestamp.now(io, .awake);
     var attempt: usize = 0;
     while (attempt < warm_probe_attempts) : (attempt += 1) {
-        if (probeOnce(io, addr, path)) |_| return else |_| {}
+        if (probeOnce(gpa, io, addr, path, use_tls)) |_| return else |_| {}
 
         const elapsed = started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
         if (elapsed >= deadline.warm_probe) {
@@ -1584,7 +1729,7 @@ fn warmProbe(io: Io, target: []const u8, name: []const u8) !void {
     return error.WarmProbeFailed;
 }
 
-fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
+fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_tls: bool) !void {
     // Bounded the same way and for the same reason as cadvisor.scrape's
     // connect: `warmProbe`'s own elapsed-vs-`deadline.warm_probe` check above
     // only runs BETWEEN attempts, so an unbounded connect() here could wedge
@@ -1594,14 +1739,47 @@ fn probeOnce(io: Io, addr: net.IpAddress, path: []const u8) !void {
     var stream = try addr.connect(io, .{ .mode = .stream, .timeout = cadvisor.scrape_connect_timeout });
     defer stream.close(io);
 
-    var wbuf: [512]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    try w.interface.print("GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n", .{path});
-    try w.interface.flush();
+    if (!use_tls) {
+        var wbuf: [512]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        return probeExchange(&w.interface, &r.interface, path);
+    }
 
-    var rbuf: [1024]u8 = undefined;
-    var r = stream.reader(io, &rbuf);
-    const line = try r.interface.takeDelimiterInclusive('\n');
+    // zrk's own TLS transport, not a second implementation of one: the ramp
+    // that follows this probe handshakes through exactly this code, so a
+    // handshake this accepts is one the measurement will accept too.
+    //
+    // HEAP, and not a stack local: the state is ~56 KiB of record buffers, and
+    // `tls.Client` stores pointers into them and into the stream adapters
+    // beside them, so it cannot be moved once `handshake` has run.
+    const st = try gpa.create(zrk.tls.State);
+    defer gpa.destroy(st);
+    st.* = .{};
+    // `insecure`: the certificate is self-signed and generated per run (see
+    // `ensureTlsMaterial`), and the target is an IP literal, so there is neither
+    // a chain to trust nor a name to match. This is the same setting the ramp
+    // runs under — `ramp.run` sets `cfg.insecure` from the profile — so the
+    // probe cannot accept a handshake the measurement would reject.
+    try st.handshake(io, gpa, stream, tls_probe_host, true, null);
+    return probeExchange(st.writer(), st.reader(), path);
+}
+
+/// The name offered as SNI, and never verified.
+///
+/// Zig's TLS client sends no SNI at all when verification is off, so this is
+/// only what the API requires to be handed something. It is not a hostname any
+/// proxy here is configured for, and no proxy here selects a certificate by
+/// name — each has exactly one.
+const tls_probe_host = "bench";
+
+/// One request/response over whichever transport the caller opened.
+fn probeExchange(w: *Io.Writer, r: *Io.Reader, path: []const u8) !void {
+    try w.print("GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n", .{path});
+    try w.flush();
+
+    const line = try r.takeDelimiterInclusive('\n');
     // Only a 2xx counts. A proxy that is up but whose origin is dead answers
     // 502, and treating that as ready would ramp against an error page.
     if (std.mem.indexOf(u8, line, " 2") == null) return error.NotServing;
@@ -1673,6 +1851,83 @@ fn isKnownProxy(name: []const u8) bool {
     return false;
 }
 
+/// Where the proxies' certificate and key live, relative to the payload root —
+/// the directory compose bind-mounts into every proxy at /etc/bench/tls.
+const tls_dir = "proxies/tls";
+
+/// Make the certificate and key every proxy's TLS listener loads, if they are
+/// not there already.
+///
+/// Three files, because the five proxies disagree about packaging and none of
+/// them can be talked out of it: haproxy wants ONE pem holding the chain and the
+/// key (`crt`), everyone else wants them separate. Generating both forms here is
+/// cheaper than a per-image conversion step, and keeps every proxy loading
+/// byte-identical key material.
+///
+/// `genpkey` and not `ecparam -genkey`, which is the older spelling of the same
+/// thing: `ecparam` writes SEC1 (`BEGIN EC PRIVATE KEY`) and `genpkey` writes
+/// PKCS#8 (`BEGIN PRIVATE KEY`). Every stack in this comparison reads PKCS#8;
+/// SEC1 is the one a rustls-based proxy would reject outright, and a key format
+/// that works on four proxies and not the fifth is not a fair certificate.
+/// Both invocations are old enough to work under LibreSSL too, which is what
+/// `openssl` is on a developer's Mac running `--local`.
+///
+/// `ec_param_enc:named_curve` is load-bearing and was found by running it. Left
+/// off, LibreSSL writes the curve as EXPLICIT PARAMETERS rather than as the
+/// prime256v1 OID, and two of the five proxies then refuse the certificate
+/// outright — zoxy with `CertificateFieldHasWrongDataType`, envoy with "Failed
+/// to load certificate chain" — while nginx, haproxy and pingora accept it. The
+/// fleet's OpenSSL 3 defaults to named_curve and would never have shown this;
+/// a laptop `--local` run is where it surfaces, which is exactly the kind of
+/// difference that makes a local run worth having.
+///
+/// The certificate is never verified by anything — self-signed, an IP-literal
+/// target, and the generator runs with verification off (see `probeOnce` and
+/// `ramp.run`) — so its subject and 10-year lifetime are only there to keep
+/// every proxy's own parser happy.
+fn ensureTlsMaterial(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    fleet: Fleet,
+    want_cert: bool,
+) !void {
+    // Always: the directory, owned by whoever runs this rather than by dockerd.
+    // Only when asked: the key pair inside it.
+    const mkdir = try std.fmt.allocPrint(arena, "cd {s} && mkdir -p {s}", .{ fleet.remote_dir, tls_dir });
+    const cmd = if (!want_cert) mkdir else try std.fmt.allocPrint(
+        arena,
+        "{s} && if [ ! -s {s}/bench.pem ]; then " ++
+            "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 " ++
+            "-pkeyopt ec_param_enc:named_curve -out {s}/bench.key && " ++
+            "openssl req -new -x509 -key {s}/bench.key -out {s}/bench.crt " ++
+            "-days 3650 -subj /CN=bench-proxy -batch && " ++
+            "cat {s}/bench.crt {s}/bench.key > {s}/bench.pem && " ++
+            // World-readable on purpose: envoy and haproxy run as non-root
+            // inside their containers and have to read this mount.
+            "chmod 0644 {s}/bench.key {s}/bench.crt {s}/bench.pem; fi && " ++
+            // The post-condition, not the exit status of the `if`: an empty
+            // or half-written pem must fail HERE, with this message, rather
+            // than as five proxies that mysteriously refuse to start.
+            "test -s {s}/bench.pem && test -s {s}/bench.key && test -s {s}/bench.crt",
+        .{
+            mkdir,   tls_dir, tls_dir, tls_dir, tls_dir,
+            tls_dir, tls_dir, tls_dir, tls_dir, tls_dir,
+            tls_dir, tls_dir, tls_dir, tls_dir,
+        },
+    );
+
+    _ = try remote.check(
+        gpa,
+        arena,
+        io,
+        fleet.proxyHost(),
+        if (want_cert) "tls material" else "tls dir",
+        cmd,
+        deadline.inspect,
+    );
+}
+
 /// Remove every known proxy container from the proxy host.
 fn sweepProxyHost(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) !void {
     var cmd: std.ArrayList(u8) = .empty;
@@ -1735,6 +1990,55 @@ const proxy_port_base: u16 = 18080;
 /// slightly longer proxy list still cannot spill into the next profile's
 /// block.
 const proxy_port_slots: u16 = 8;
+/// The same scheme, one block further up, for the TLS listener every proxy also
+/// carries. Separate from the plaintext base rather than interleaved with it, so
+/// the two ranges cannot collide however many profiles or proxies are added: a
+/// profile's plaintext block and its TLS block grow in parallel, and `19080` is
+/// far enough above `18080 + profiles * slots` to stay clear for any plausible
+/// number of either. The test below is what actually holds that.
+const proxy_tls_port_base: u16 = 19080;
+
+/// The ports a proxy listens on for one turn.
+///
+/// The plaintext one is always there: it carries the container healthcheck in
+/// every profile, TLS included, because three of the five images have neither
+/// curl nor openssl and bash's /dev/tcp cannot handshake. The TLS one is
+/// `null` on a plaintext profile and no proxy renders a TLS listener at all
+/// then — see compose.yaml's x-proxy-common for the measurement that decided
+/// that (zoxy preallocates its TLS session pool: 35 MiB against 283 MiB).
+const Ports = struct {
+    plain: u16,
+    tls: ?u16,
+
+    /// Where this profile's load goes.
+    ///
+    /// The `orelse` cannot be reached — `portsFor` assigns a TLS port for
+    /// exactly the profiles that ask for one, and the test below pins that —
+    /// but it fails loudly rather than being `unreachable`: the warm probe
+    /// would then handshake against a plaintext listener and `ramp.run` would
+    /// refuse the mismatched transport, either of which costs one proxy its
+    /// turn with a message. `unreachable` in a ReleaseFast build costs the run.
+    fn target(self: Ports, p: profile.Profile) u16 {
+        return if (p.tls) (self.tls orelse self.plain) else self.plain;
+    }
+};
+
+/// Local mode never varies either port: bridge networking rebinds cleanly
+/// (Docker's own NAT layer, not a raw app bind()), and compose.yaml publishes
+/// exactly these two on the host, so varying them would mean varying a static
+/// mapping for no reason.
+const local_plain_port: u16 = 8080;
+const local_tls_port: u16 = 8443;
+
+fn portsFor(p: profile.Profile, fleet: Fleet, proxy_idx: usize) Ports {
+    if (fleet.isLocal()) {
+        return .{ .plain = local_plain_port, .tls = if (p.tls) local_tls_port else null };
+    }
+    return .{
+        .plain = proxyPort(p, proxy_idx),
+        .tls = if (p.tls) proxyTlsPort(p, proxy_idx) else null,
+    };
+}
 
 /// A host port for this (profile, proxy) turn, distinct from every other
 /// turn `bench suite` could run in one dispatch — including this SAME
@@ -1758,6 +2062,18 @@ const proxy_port_slots: u16 = 8;
 /// that never runs it, so re-enabling it later cannot collide with tonight's
 /// ports by coincidence.
 fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
+    return proxy_port_base + slot(p, proxy_idx);
+}
+
+/// The TLS listener's port for the same turn. Distinct from every plaintext
+/// port and from every other turn's TLS port, for exactly the reasons
+/// `proxyPort` is: this listener is bound on every turn too, so it burns and
+/// releases a host port on the same schedule.
+fn proxyTlsPort(p: profile.Profile, proxy_idx: usize) u16 {
+    return proxy_tls_port_base + slot(p, proxy_idx);
+}
+
+fn slot(p: profile.Profile, proxy_idx: usize) u16 {
     var profile_idx: u16 = 0;
     for (profile.all, 0..) |candidate, i| {
         if (std.mem.eql(u8, candidate.name, p.name)) {
@@ -1765,10 +2081,10 @@ fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
             break;
         }
     }
-    return proxy_port_base + profile_idx * proxy_port_slots + @as(u16, @intCast(proxy_idx));
+    return profile_idx * proxy_port_slots + @as(u16, @intCast(proxy_idx));
 }
 
-fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySource, port: ?u16) ![]const u8 {
+fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySource, ports: ?Ports) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     // Only the cloud overlay interpolates BACKENDn_IP; locally the proxies reach
     // the pool by compose service name over docker DNS. One variable per member
@@ -1791,7 +2107,16 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySour
     // Only for the `start` call — `build` has no listener to bind and no
     // meaningful per-turn port, so it passes null and every proxy's config
     // falls back to its own compose-level `${PROXY_PORT:-8080}` default.
-    if (port) |pt| try buf.print(arena, "PROXY_PORT={d} ", .{pt});
+    //
+    // PROXY_TLS_PORT is emitted ONLY for a TLS profile, and its absence is what
+    // makes every proxy render no TLS listener at all: compose turns an unset
+    // variable into an empty one (`${PROXY_TLS_PORT:-}`), and each proxy's
+    // config treats empty as off. See compose.yaml's x-proxy-common for why a
+    // plaintext turn must not carry a TLS listener it never uses.
+    if (ports) |pt| {
+        try buf.print(arena, "PROXY_PORT={d} ", .{pt.plain});
+        if (pt.tls) |tls_port| try buf.print(arena, "PROXY_TLS_PORT={d} ", .{tls_port});
+    }
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
     }
@@ -1910,7 +2235,7 @@ test "envPrefix carries EVERY backend address as well as the profile's tuning" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const s = try envPrefix(arena, profile.c10k, test_fleet, test_zoxy_src, 18096);
+    const s = try envPrefix(arena, profile.c10k, test_fleet, test_zoxy_src, .{ .plain = 18096, .tls = null });
 
     // Miss one and that proxy starts with extra_hosts "backendN:" — which does
     // not fail its warm probe, because the other three still answer. It just
@@ -1921,6 +2246,9 @@ test "envPrefix carries EVERY backend address as well as the profile's tuning" {
     try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND2_IP=10.10.0.15") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "BACKEND3_IP=10.10.0.16") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT=18096") != null);
+    // c10k is plaintext, so no TLS port travels and every proxy renders no TLS
+    // listener at all.
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT") == null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11464") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11464") != null);
 }
@@ -1987,6 +2315,48 @@ test "envPrefix omits PROXY_PORT for the build step, which has no listener" {
 
     const s = try envPrefix(arena, profile.c1k, test_fleet, test_zoxy_src, null);
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT") == null);
+}
+
+test "a TLS profile gets a TLS listener and a plaintext one gets none" {
+    // The plaintext profiles must come out with NO TLS port at all: that is
+    // what leaves the listener out of every proxy's rendered config, which is
+    // what keeps their numbers — zoxy's memory above all — comparable to every
+    // night before TLS existed here.
+    const plain = portsFor(profile.c1k, test_fleet, 1);
+    try std.testing.expectEqual(@as(u16, proxy_port_base + 1 * proxy_port_slots + 1), plain.plain);
+    try std.testing.expect(plain.tls == null);
+    try std.testing.expectEqual(plain.plain, plain.target(profile.c1k));
+
+    const tls = portsFor(profile.c1k_tls, test_fleet, 1);
+    try std.testing.expect(tls.tls != null);
+    try std.testing.expectEqual(tls.tls.?, tls.target(profile.c1k_tls));
+    try std.testing.expect(tls.tls.? != tls.plain);
+
+    // Local mode publishes exactly the two ports compose.yaml maps on the host,
+    // and still only asks for the TLS one when the profile terminates TLS.
+    const local: Fleet = .{ .proxy_ip = "127.0.0.1", .backend_ips = &.{"127.0.0.1"}, .ssh = null };
+    try std.testing.expectEqual(@as(u16, 8080), portsFor(profile.c1k, local, 3).plain);
+    try std.testing.expect(portsFor(profile.c1k, local, 3).tls == null);
+    try std.testing.expectEqual(@as(u16, 8443), portsFor(profile.c1k_tls, local, 3).tls.?);
+}
+
+test "the TLS turn carries both ports, and the profile's TLS engine pool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ports = portsFor(profile.c1k_tls, test_fleet, 0);
+    const s = try envPrefix(arena, profile.c1k_tls, test_fleet, test_zoxy_src, ports);
+
+    // The plaintext listener stays — it is what the container healthcheck
+    // probes on every profile, TLS included.
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_PORT=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT=") != null);
+    // The TLS session pool the profile pinned. Without it zoxy takes its own
+    // default, which is unstated in the run record and free to move between
+    // releases — and it is the pool this profile's connections have to fit in.
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_TLS_ENGINES=1024") != null);
 }
 
 test "backendProfile starts one member per VM in cloud, the whole pool locally" {
@@ -2011,12 +2381,19 @@ test "proxyPort never repeats within one suite dispatch, including a proxy's own
     for (profile.all) |p| {
         // Generous upper bound — comfortably above today's 5-proxy set.
         for (0..proxy_port_slots) |proxy_idx| {
-            const port = proxyPort(p, proxy_idx);
-            try std.testing.expect(!seen.contains(port));
-            try seen.put(port, {});
+            // BOTH listeners, in one namespace: every turn binds a plaintext
+            // and a TLS socket, so a collision between the two ranges would be
+            // exactly the port reuse this scheme exists to make impossible —
+            // and it would show up as a proxy that cannot start, one turn after
+            // the range grew past 19080.
+            for ([_]u16{ proxyPort(p, proxy_idx), proxyTlsPort(p, proxy_idx) }) |port| {
+                try std.testing.expect(!seen.contains(port));
+                try seen.put(port, {});
+            }
         }
     }
 }
+
 
 test "nowIso produces a sortable UTC stamp" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

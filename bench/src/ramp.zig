@@ -221,6 +221,18 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         .deadline_ns = p.deadlineNs(),
         .deadline_abort = false,
         .record_timeouts = false,
+        // TLS verification off, and only ever reachable on a TLS profile: the
+        // target is an IP literal (so there is no name to match) and the
+        // certificate is the self-signed one this run generated on the proxy
+        // host (so there is no chain to trust). Verifying would mean shipping a
+        // trust store to the loadgen to authenticate a proxy that cannot be
+        // anything else — the connection is inside the VPC, to an address
+        // terraform pinned.
+        //
+        // Set from the profile rather than left true always, so a plaintext
+        // profile that somehow acquired an https target fails instead of
+        // quietly measuring an unverified one.
+        .insecure = p.tls,
         // zrk's own whole-run JSON is deliberately NOT written: it embeds the
         // target URL, i.e. the proxy's private address, in a file that would
         // then be published. The summary below carries the same numbers without
@@ -232,6 +244,15 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         .timeseries_histogram = true,
         .url = cli.parseUrl(opts.target) catch return error.InvalidTarget,
     };
+
+    // The profile and the URL must agree about the transport. They are built in
+    // different places — the profile is compiled in, the target is assembled by
+    // `suite.runOne` and handed to this process on a command line — and a
+    // disagreement is silent in both directions: an https target under a
+    // plaintext profile would run with verification on and fail every
+    // connection, and an http target under a TLS profile would publish
+    // plaintext numbers in the TLS profile's directory.
+    if (cfg.url.isTls() != p.tls) return error.TransportMismatch;
 
     const nd_file = try Io.Dir.cwd().createFile(io, nd_path, .{});
     defer nd_file.close(io);

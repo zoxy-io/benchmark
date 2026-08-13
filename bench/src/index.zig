@@ -179,6 +179,11 @@ pub const ProfileSummary = struct {
     failed: usize,
     connections: u32,
     deadline_ms: u64,
+    /// Load offered over TLS, terminated by the proxy. A column of its own on
+    /// the landing page rather than something to be inferred from the profile's
+    /// name — the trend chart plots these series side by side, and a reader
+    /// comparing two lines has to be able to see that one of them is encrypted.
+    tls: bool = false,
 };
 
 /// The landing page: what ran, how it went, and the trend.
@@ -206,9 +211,10 @@ pub fn renderIndex(
         "every run's raw data is kept as a workflow artifact.</p>", .{finished});
 
     try out.writeAll("<div class=\"tablewrap\"><table><tr><th>profile</th><th>connections</th>" ++
-        "<th>deadline</th><th>result</th><th></th></tr>");
+        "<th>transport</th><th>deadline</th><th>result</th><th></th></tr>");
     for (profiles) |p| {
         try out.print("<tr><td>{s}</td><td>{d}</td>", .{ p.name, p.connections });
+        try out.writeAll(if (p.tls) "<td>TLS 1.3</td>" else "<td>plaintext</td>");
         if (p.deadline_ms > 0) {
             try out.print("<td>{d}ms</td>", .{p.deadline_ms});
         } else {

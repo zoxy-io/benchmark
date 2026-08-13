@@ -30,8 +30,25 @@
 //!
 //!   ACCESS_LOG  where that file goes (default /tmp/access.log)
 //!
+//! On a TLS profile it listens TWICE: plaintext on LISTEN and TLS on
+//! TLS_LISTEN, both served by the same `http_proxy_service`, so the request
+//! path is identical and the only difference is the transport. TLS_LISTEN is
+//! empty on a plaintext turn and no TLS endpoint is added at all then — see
+//! compose.yaml's x-proxy-common for why a plaintext profile must not carry
+//! one. TLS is terminated here and the upstream leg stays plaintext
+//! (`HttpPeer::new(.., false, ..)` below), which is what every proxy in this
+//! comparison does: zoxy terminates inbound only, so an encrypted upstream
+//! would be a job it cannot do.
+//!
 //! Knobs via env (set by compose, matching the other proxies):
-//!   LISTEN     downstream bind (default 0.0.0.0:8080)
+//!   LISTEN      downstream bind (default 0.0.0.0:8080)
+//!   TLS_LISTEN  downstream TLS bind; unset or empty = no TLS listener
+//!   TLS_CERT / TLS_KEY  PEM paths for that listener (default /etc/bench/tls/
+//!               bench.crt and bench.key — the run's own ECDSA P-256
+//!               self-signed pair, generated on the proxy host and mounted
+//!               read-only; all five proxies load the same key material,
+//!               because the signature is per handshake and an RSA key would
+//!               charge one proxy CPU the others never pay)
 //!   UPSTREAMS  comma-separated host:port pool (default backend0..backend3:9000),
 //!              each resolved ONCE at startup with retry (parity with zoxy's
 //!              no-runtime-DNS model).
@@ -245,6 +262,18 @@ fn resolve_with_retry(host_port: &str) -> SocketAddr {
 
 fn main() {
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    // Unset OR EMPTY means "no TLS listener": compose renders this from
+    // PROXY_TLS_PORT, which `bench` sets only for a TLS profile, and an empty
+    // string has to mean the same as absent or a plaintext turn would bind one
+    // anyway. A plaintext turn must be the same process it was before TLS
+    // existed here — see compose.yaml's x-proxy-common.
+    let tls_listen = std::env::var("TLS_LISTEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let tls_cert =
+        std::env::var("TLS_CERT").unwrap_or_else(|_| "/etc/bench/tls/bench.crt".to_string());
+    let tls_key =
+        std::env::var("TLS_KEY").unwrap_or_else(|_| "/etc/bench/tls/bench.key".to_string());
     let upstreams = std::env::var("UPSTREAMS")
         .unwrap_or_else(|_| "backend0:9000,backend1:9000,backend2:9000,backend3:9000".to_string());
     // Same path every proxy in this benchmark logs to; see access_log for why
@@ -276,7 +305,8 @@ fn main() {
         .unwrap_or_else(|e| panic!("pingora-http: cannot open {access_log_path}: {e}"));
 
     eprintln!(
-        "pingora-http: listen={listen} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1, access_log={access_log_path}",
+        "pingora-http: listen={listen} tls_listen={} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1, access_log={access_log_path}",
+        tls_listen.as_deref().unwrap_or("none"),
         addrs.len()
     );
 
@@ -316,6 +346,20 @@ fn main() {
         },
     );
     svc.add_tcp(&listen);
+    // The TLS endpoint on the SAME service, so both transports run through one
+    // ProxyHttp, one upstream pool and one access log.
+    //
+    // Unwrapped for the same reason the access log is opened before the server
+    // starts: a pingora that came up without the listener the run is about to
+    // ramp against would answer nothing at all on that port, and the harness
+    // would record it as a proxy that served zero rather than as one that was
+    // never configured. Failing here makes it a start failure, which reports
+    // the reason (`docker logs` via reportStartFailure).
+    if let Some(addr) = &tls_listen {
+        svc.add_tls(addr, &tls_cert, &tls_key).unwrap_or_else(|e| {
+            panic!("pingora-http: cannot serve TLS on {addr} with {tls_cert}/{tls_key}: {e}")
+        });
+    }
     server.add_service(svc);
 
     server.run_forever();

@@ -53,6 +53,37 @@ pub const Profile = struct {
 
     req_path: []const u8,
 
+    /// Offer the load over TLS, terminated by the proxy under test.
+    ///
+    /// INBOUND ONLY. Every proxy's upstream leg stays plaintext, because zoxy's
+    /// 0.2.0 TLS is inbound-only by design ("the upstream leg stays plaintext"),
+    /// and letting the other four also encrypt to the origin would measure a job
+    /// zoxy cannot do rather than the one they share.
+    ///
+    /// Each proxy carries BOTH listeners at all times — plaintext on
+    /// `PROXY_PORT`, TLS on `PROXY_TLS_PORT` (see compose.yaml) — and this flag
+    /// only decides which one the ramp is pointed at. That is what keeps the
+    /// container healthcheck on the plaintext port for every profile: three of
+    /// the five images have neither curl nor openssl, and bash's /dev/tcp cannot
+    /// speak TLS at all, so a healthcheck through the TLS listener is not
+    /// available in the images this comparison is allowed to use.
+    ///
+    /// What the generator is, and is not, exercising — zrk drives Zig's std TLS
+    /// client, so all three of these travel with any number this profile
+    /// produces:
+    ///
+    ///   * TLS 1.3 ONLY. Nothing here measures 1.2, and every proxy's listener
+    ///     is pinned to 1.3 so the negotiation cannot silently differ.
+    ///   * NO ALPN is offered, so every proxy falls back to HTTP/1.1 — the same
+    ///     protocol the plaintext profiles measure. Nothing here is HTTP/2.
+    ///   * NO SESSION RESUMPTION. The client never presents a ticket, so every
+    ///     connection is a full handshake and zoxy's 0.2.0 ticket support is
+    ///     never exercised. Handshakes are paid at CONNECT time — all
+    ///     `connections` of them in the first seconds of the ramp — and the
+    ///     steady state that `ref_rate` reads is record-layer crypto on a
+    ///     kept-alive connection, not handshake throughput.
+    tls: bool = false,
+
     /// SUMMARY-latency reference offered rate: a shared, light, sub-knee load
     /// where a single per-proxy latency number is actually fair, because it
     /// reflects per-request COST rather than standing-queue wait.
@@ -195,6 +226,63 @@ pub const c1k: Profile = .{
     },
 };
 
+/// c1k with TLS on the client leg, and NOTHING else changed.
+///
+/// Derived from `c1k` rather than spelled out, which is the whole design of it:
+/// same ramp, same connection count, same reference rate, same zoxy slot
+/// tuning, so the pair isolates the cost of terminating TLS instead of
+/// measuring two different experiments. A field that has to be tuned differently
+/// here (it has not been needed yet) should be set below, visibly, as a
+/// deliberate divergence.
+///
+/// `ref_rate` is inherited at 2000 rps deliberately. Reading both profiles'
+/// summary latency at the same offered rate is what makes "TLS costs X" a
+/// subtraction rather than a comparison of two unrelated points, and 2000 rps of
+/// 1 KiB bodies is ~2.6 MB/s of AEAD — nowhere near a bulk-crypto ceiling on any
+/// of these proxies, so it stays the sub-knee reference it is at c1k.
+///
+/// The name carries a dash, like nothing else here: it is a directory under the
+/// run, a path segment on the published site and a series in the trend chart, so
+/// `c1k-tls` sorts and reads next to `c1k` in all three.
+pub const c1k_tls: Profile = blk: {
+    var p = c1k;
+    p.name = "c1k-tls";
+    p.tls = true;
+    // c1k's tuning, plus the one knob that only exists when a listener
+    // terminates TLS.
+    //
+    // ZOXY_TLS_ENGINES is 1024 because that is ALL v0.2.0 ALLOWS: it is both the
+    // shipped default and the comptime ceiling — 2048 and 4096 are rejected at
+    // startup with `LimitTlsEnginesOutOfRange`, measured against the v0.2.0
+    // release binary. So unlike conn_slots and upstream_slots, this is not a
+    // number this profile gets to choose, and it is pinned rather than left
+    // implicit for the same reason c1k pins conn_slots to ITS default: the run
+    // record should state the pool the numbers came from.
+    //
+    // zoxy holds one preallocated engine per admitted TLS connection and sheds
+    // past the pool, where the other four allocate per connection with no such
+    // ceiling. 1024 against this profile's 1000 offered connections is 2.4%
+    // headroom — the same too-close-to-call margin that made c1k widen the
+    // upstream pool, except here there is nothing to widen. It holds because zrk
+    // opens exactly `connections` and keeps them; churn is what would break it.
+    // `bench` reads `zoxy_shed_tls_engines` off the admin endpoint after every
+    // TLS ramp, and a nonzero value means this ramp measured zoxy's admission
+    // cap rather than its TLS — which is a finding about zoxy's ceiling, not a
+    // number to publish as its TLS throughput.
+    //
+    // It is also most of zoxy's memory here: ~136 KiB plus a 64 KiB plaintext
+    // buffer per engine, preallocated at boot, so ~283 MiB against 35 MiB for
+    // the same proxy with no TLS listener (measured, v0.2.0). That is a real
+    // property of terminating TLS this way, and it is why the TLS listener is
+    // not left bound on the plaintext profiles — see compose.yaml.
+    p.proxy_env = &.{
+        .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
+        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
+        .{ .key = "ZOXY_TLS_ENGINES", .value = "1024" },
+    };
+    break :blk p;
+};
+
 pub const c100: Profile = .{
     .name = "c100",
     .connections = 100,
@@ -290,7 +378,13 @@ pub const c10k: Profile = .{
     },
 };
 
-pub const all = [_]Profile{ c100, c1k, c10k };
+/// APPEND-ONLY, and the reason is `suite.proxyPort`: it keys each profile's
+/// block of per-turn host ports off this array's index, so inserting a profile
+/// anywhere but the end renumbers every profile after it. Ports are per
+/// (profile, proxy) turn precisely so no turn ever rebinds a port a previous
+/// turn used (runs #25/#26), and a renumbering would hand tonight's turns ports
+/// that an earlier turn in the same dispatch had already served load on.
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -307,8 +401,89 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c100") != null);
     try std.testing.expect(byName("c1k") != null);
     try std.testing.expect(byName("c10k") != null);
+    try std.testing.expect(byName("c1k-tls") != null);
     try std.testing.expect(byName("") == null);
     try std.testing.expect(byName("c100k") == null);
+}
+
+test "c1k-tls is c1k with TLS on, and nothing else" {
+    // The point of the profile is the subtraction: anything that differs beyond
+    // the name and the transport makes "TLS costs X" a comparison of two
+    // unrelated experiments instead.
+    try std.testing.expect(c1k_tls.tls);
+    try std.testing.expect(!c1k.tls);
+
+    try std.testing.expectEqual(c1k.connections, c1k_tls.connections);
+    try std.testing.expectEqual(c1k.threads, c1k_tls.threads);
+    try std.testing.expectEqual(c1k.start_rate, c1k_tls.start_rate);
+    try std.testing.expectEqual(c1k.max_rate, c1k_tls.max_rate);
+    try std.testing.expectEqual(c1k.ramp_seconds, c1k_tls.ramp_seconds);
+    try std.testing.expectEqual(c1k.timeout_s, c1k_tls.timeout_s);
+    try std.testing.expectEqual(c1k.deadline_ms, c1k_tls.deadline_ms);
+    try std.testing.expectEqual(c1k.ref_rate, c1k_tls.ref_rate);
+    try std.testing.expectEqual(c1k.ref_band, c1k_tls.ref_band);
+    try std.testing.expectEqual(c1k.cooldown_s, c1k_tls.cooldown_s);
+    try std.testing.expectEqualStrings(c1k.req_path, c1k_tls.req_path);
+
+    // Same zoxy admission/pool tuning — the TLS row must not be measuring a
+    // different slot configuration as well as a different transport — plus
+    // exactly one knob that has no meaning without a TLS listener.
+    for (c1k.proxy_env) |want| {
+        for (c1k_tls.proxy_env) |got| {
+            if (std.mem.eql(u8, want.key, got.key)) {
+                try std.testing.expectEqualStrings(want.value, got.value);
+                break;
+            }
+        } else return error.MissingTuning;
+    }
+    try std.testing.expectEqual(c1k.proxy_env.len + 1, c1k_tls.proxy_env.len);
+
+    // And the engine pool covers the load this profile offers: one engine is
+    // held per admitted TLS connection, so a pool smaller than `connections`
+    // sheds by policy and the ramp measures zoxy's admission cap instead of its
+    // TLS. Derived from the profile rather than hardcoded, so raising
+    // `connections` past the pool fails HERE rather than in a night's numbers.
+    var tls_engines: u32 = 0;
+    for (c1k_tls.proxy_env) |kv| {
+        if (std.mem.eql(u8, kv.key, "ZOXY_TLS_ENGINES")) {
+            tls_engines = try std.fmt.parseInt(u32, kv.value, 10);
+        }
+    }
+    try std.testing.expect(tls_engines >= c1k_tls.connections);
+    // v0.2.0 rejects anything above this at startup (LimitTlsEnginesOutOfRange),
+    // so a profile that needs more headroom needs a zoxy that allows it.
+    try std.testing.expect(tls_engines <= 1024);
+}
+
+test "only a TLS profile sizes the TLS session pool" {
+    // `tls_engines` is "zero exactly when no listener terminates TLS" — setting
+    // it on a plaintext profile would preallocate ~136 KiB per engine for a
+    // listener that does not exist, and put a quarter of a gigabyte on a
+    // published memory number.
+    for (all) |p| {
+        if (p.tls) continue;
+        for (p.proxy_env) |kv| {
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_TLS_ENGINES"));
+        }
+    }
+}
+
+test "the plaintext profiles stay plaintext" {
+    // A profile silently acquiring TLS would change what every historical
+    // trend point means without changing its name.
+    try std.testing.expect(!c100.tls);
+    try std.testing.expect(!c1k.tls);
+    try std.testing.expect(!c10k.tls);
+}
+
+test "profile.all is append-only, because proxyPort keys off its index" {
+    // Renumbering a profile's port block would hand a turn the port an earlier
+    // turn in the same dispatch had already served load on — the exact
+    // condition runs #25/#26 died of.
+    try std.testing.expectEqualStrings("c100", all[0].name);
+    try std.testing.expectEqualStrings("c1k", all[1].name);
+    try std.testing.expectEqualStrings("c10k", all[2].name);
+    try std.testing.expectEqualStrings("c1k-tls", all[3].name);
 }
 
 test "validate rejects the misconfigurations the env plumbing used to allow" {

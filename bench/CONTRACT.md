@@ -63,6 +63,10 @@ provider block, NOT a `gce-http-token` metadata key.
 ```
 s3://$BENCH_BUCKET/runs/<runid>/
   payload.tar          uploaded by the runner BEFORE apply; bench + compose + proxy configs
+                       (`bench suite` also WRITES into the unpacked copy: proxies/tls/
+                       holds the run's own self-signed ECDSA P-256 cert, generated on the
+                       proxy host before any container starts and mounted into every
+                       proxy. Nothing uploads it; it dies with the fleet.)
   boot-ok.<role>       written by each VM once cloud-init finishes (diagnoses a boot failure);
                        <role> is loadgen | proxy | backend0..backend3, one object per VM
   log                  the suite's running log, re-uploaded every ~30s
@@ -97,8 +101,18 @@ Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
     <proxy>.ndjson                   zrk timeseries, byte-identical to the CLI's
     <proxy>.hgrm                     whole-run percentile distribution
     <proxy>.cadvisor.ndjson          {"t":..,"cpu_seconds_total":..,"mem_ws":..,"cadvisor_ms":..} @1Hz
+  c1k-tls/ ...
   c10k/ ...
 ```
+
+One directory per profile, named by the profile — so a profile name is also a
+path segment on the published site and a series key in the trend chart.
+`profile.json`'s `ramp` object carries `"tls"`, which is what says whether the
+load in that directory was offered over TLS; the profile's name is a convention,
+that field is the record. Each proxy record also gains `shed_tls_engines` — how
+many connections zoxy refused for want of a preallocated TLS session slot, null
+for every other proxy and on every plaintext profile. Both fields are additive,
+so `schema` stays at 2.
 
 No IP address appears in any of these. `bench` refuses to write an artifact
 containing one (see `redact.assertNoIps`).

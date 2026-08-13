@@ -8,6 +8,13 @@ cloud/terraform.tfvars
 cloud/sa-key.json
 .DS_Store
 
+# The proxies' TLS certificate and key, generated per run on the proxy host by
+# `bench suite` (suite.zig's ensureTlsMaterial) and mounted into every proxy.
+# Never committed: it is a throwaway self-signed pair for a fleet that lives
+# about an hour, and a private key in a public repo is a permanent alarm for
+# something with no secret in it. A local run writes it here.
+proxies/tls/
+
 # devenv
 .devenv*
 devenv.local.nix

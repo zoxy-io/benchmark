@@ -690,6 +690,7 @@ pub fn buildIndex(
             .failed = view.failed,
             .connections = p.connections,
             .deadline_ms = p.deadline_ms,
+            .tls = p.tls,
         });
 
         // A local run contributes NOTHING to history. Its numbers are not

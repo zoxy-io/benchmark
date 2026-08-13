@@ -12,9 +12,13 @@
 #   make up / down   local: start/stop the backend origin pool (all four)
 #
 # Ramp parameters are NOT knobs any more — they are compiled into
-# bench/src/profile.zig as the c1k and c10k profiles, because eleven env vars
-# with silent fallbacks is how a real run ended up with TIMEOUT_S=0 against a
-# documented 1 and nothing noticed.
+# bench/src/profile.zig as the c100, c1k, c1k-tls and c10k profiles, because
+# eleven env vars with silent fallbacks is how a real run ended up with
+# TIMEOUT_S=0 against a documented 1 and nothing noticed.
+#
+# `make local PROFILE=c1k-tls` runs the TLS profile: the suite generates the
+# proxies' certificate into ./proxies/tls (gitignored) on first use and every
+# proxy grows a TLS listener for that profile only.
 
 SHELL := bash
 .ONESHELL:

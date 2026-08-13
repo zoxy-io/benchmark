@@ -41,6 +41,18 @@ fi
 if [ -n "${ZOXY_UPSTREAM_SLOTS:-}" ]; then
     fields="${fields}, \"upstream_slots\": ${ZOXY_UPSTREAM_SLOTS}"
 fi
+# The TLS session pool, set only on a TLS turn and sized by the profile
+# (bench passes ZOXY_TLS_ENGINES=conn_slots — one engine is held for every
+# admitted connection on a TLS listener, so anything less sheds by admission
+# policy and measures the cap instead of the proxy; watch
+# `zoxy_shed_tls_engines`, which bench reads off the admin endpoint after every
+# ramp). It is also the largest object zoxy holds — ~136 KiB plus a 64 KiB
+# plaintext buffer per engine, so this line is most of a TLS deployment's
+# memory: 35 MiB with no TLS listener, 283 MiB with one at the stock 1024
+# engines, measured on v0.2.0.
+if [ -n "${ZOXY_TLS_ENGINES:-}" ]; then
+    fields="${fields}, \"tls_engines\": ${ZOXY_TLS_ENGINES}"
+fi
 LIMITS="{${fields}}"
 
 # Every member, in the order given: a JSON array of "ip:port" string literals.
@@ -72,12 +84,42 @@ done
 # compose.yaml's x-proxy-common for why — always set by compose (defaulting
 # to 8080), never literally unset.
 #
+# PROXY_TLS_PORT is the same, with one difference that decides the shape of
+# this block: it is set only on a TLS TURN, and empty otherwise. So a TLS
+# listener is APPENDED to the listener array for the c1k-tls profile and the
+# rendered config on a plaintext profile is byte-for-byte what it was before
+# TLS existed here. That matters more for zoxy than for any other proxy in the
+# comparison: the TLS engine pool is preallocated at boot, so an always-present
+# TLS listener would have added ~250 MiB to zoxy's published memory number on
+# profiles that never send it a handshake.
+#
+# The listener is otherwise identical to the plaintext one — same cluster, same
+# protocol — because zoxy terminates TLS inbound only and the upstream leg
+# stays plaintext either way. That is what makes c1k vs c1k-tls a measurement
+# of TLS rather than of two different configurations.
+#
+# The cert is the run's own ECDSA P-256 self-signed pair, generated on the
+# proxy host before any container starts (bench's ensureTlsMaterial) and
+# mounted read-only at /etc/bench/tls. zoxy rejects an RSA key outright, so the
+# curve is not a preference.
+#
+# ONE LINE, deliberately: this becomes a sed replacement, and sed rejects a raw
+# newline in one. JSON does not care, and the rendered config is only ever read
+# by zoxy and by whoever is debugging a start failure.
+if [ -n "${PROXY_TLS_PORT:-}" ]; then
+    TLS_LISTENER=", { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"cluster\": \"origin\", \"protocol\": \"http\", \"tls\": { \"cert\": \"/etc/bench/tls/bench.crt\", \"key\": \"/etc/bench/tls/bench.key\" } }"
+else
+    TLS_LISTENER=""
+fi
+
+#
 # `|` as the sed delimiter for the address list: the replacement contains `/`
 # in neither the IPs nor the quotes, but it is a comma-joined list that will
 # grow if the pool does, and a `/` sneaking in would turn a config error into a
 # sed syntax error. The other two stay on `/` — they are a bare integer and a
 # brace-delimited JSON object.
-sed -e "s|@BACKEND_ADDRS@|$addrs|" -e "s/@LIMITS@/$LIMITS/" -e "s/@PORT@/${PROXY_PORT:-8080}/" \
+sed -e "s|@BACKEND_ADDRS@|$addrs|" -e "s/@LIMITS@/$LIMITS/" \
+    -e "s/@PORT@/${PROXY_PORT:-8080}/" -e "s|@TLS_LISTENER@|$TLS_LISTENER|" \
     /etc/zoxy/config.template.json > /etc/zoxy/config.json
 
 # One event loop per PROCESS (no thread/worker knob), capped to 1 CPU and pinned

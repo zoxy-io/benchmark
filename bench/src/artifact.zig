@@ -132,6 +132,18 @@ pub const ProxyRecord = struct {
     /// earn. This is the count that makes that visible; zero means the
     /// comparison is clean.
     access_log_dropped: ?u64 = null,
+    /// Connections zoxy REFUSED for want of a TLS session slot, on a TLS
+    /// profile. `null` for every other proxy, on every plaintext profile (zoxy
+    /// has no TLS listener then, so the metric is absent rather than zero), and
+    /// when the counter could not be read.
+    ///
+    /// zoxy preallocates one TLS engine per admitted connection and sheds past
+    /// the pool; the other four allocate per connection and have no such
+    /// ceiling. The TLS profiles size the pool to `conn_slots` so this stays
+    /// zero — a nonzero value means the ramp measured that cap rather than
+    /// zoxy's TLS, the same way `zoxy_shed_upstream_slots` would mean it
+    /// measured the upstream pool.
+    shed_tls_engines: ?u64 = null,
     notes: []const []const u8 = &.{},
 };
 
@@ -230,6 +242,12 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.int(@intCast(p.prof.deadline_ms));
     try j.key("req_path");
     try j.string(p.prof.req_path);
+    // The transport the load was offered over. Additive, and recorded for the
+    // same reason every other ramp parameter is: two runs whose numbers differ
+    // by a factor should not require reading the profile's NAME to find out
+    // that one of them terminated TLS.
+    try j.key("tls");
+    try j.boolean(p.prof.tls);
     try j.key("ref_rate");
     try j.float(p.prof.ref_rate, 1);
     try j.key("ref_band");
@@ -296,6 +314,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
         if (r.build_info) |b| try j.string(b) else try j.nullValue();
         try j.key("access_log_dropped");
         if (r.access_log_dropped) |d| try j.int(@intCast(d)) else try j.nullValue();
+        try j.key("shed_tls_engines");
+        if (r.shed_tls_engines) |d| try j.int(@intCast(d)) else try j.nullValue();
 
         try j.key("notes");
         try j.beginArray();
