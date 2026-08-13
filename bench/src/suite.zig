@@ -1744,7 +1744,7 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
         var w = stream.writer(io, &wbuf);
         var rbuf: [1024]u8 = undefined;
         var r = stream.reader(io, &rbuf);
-        return probeExchange(&w.interface, &r.interface, path);
+        return probeExchange(&w.interface, &r.interface, path, null);
     }
 
     // zrk's own TLS transport, not a second implementation of one: the ramp
@@ -1763,7 +1763,7 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
     // runs under — `ramp.run` sets `cfg.insecure` from the profile — so the
     // probe cannot accept a handshake the measurement would reject.
     try st.handshake(io, gpa, stream, tls_probe_host, true, null);
-    return probeExchange(st.writer(), st.reader(), path);
+    return probeExchange(st.writer(), st.reader(), path, st);
 }
 
 /// The name offered as SNI, and never verified.
@@ -1775,9 +1775,21 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
 const tls_probe_host = "bench";
 
 /// One request/response over whichever transport the caller opened.
-fn probeExchange(w: *Io.Writer, r: *Io.Reader, path: []const u8) !void {
+///
+/// `tls` is the state behind `w` when the transport is TLS, and it is passed
+/// for one reason: TWO writers have to be flushed, not one. Flushing the TLS
+/// writer only ENCRYPTS the request into the socket writer's buffer — the
+/// ciphertext does not reach the wire until that writer is flushed as well.
+/// Miss the second flush and the handshake still completes, so everything looks
+/// healthy right up until nothing arrives: four of the five proxies close the
+/// connection and haproxy answers `408 Request Time-out`, which is exactly what
+/// this probe did to every proxy in the first c1k-tls run. zrk's own
+/// connection.zig does both flushes for the same reason (its comment: "the
+/// underlying stream writer must be flushed to actually send the ciphertext").
+fn probeExchange(w: *Io.Writer, r: *Io.Reader, path: []const u8, tls: ?*zrk.tls.State) !void {
     try w.print("GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n", .{path});
     try w.flush();
+    if (tls) |st| try st.swriter.interface.flush();
 
     const line = try r.takeDelimiterInclusive('\n');
     // Only a 2xx counts. A proxy that is up but whose origin is dead answers
