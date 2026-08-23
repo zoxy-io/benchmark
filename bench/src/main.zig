@@ -26,6 +26,7 @@ pub const ramp = @import("ramp.zig");
 pub const remote = @import("remote.zig");
 pub const artifact = @import("artifact.zig");
 pub const suite = @import("suite.zig");
+pub const http = @import("http.zig");
 pub const ycs = @import("ycs.zig");
 pub const svg = @import("svg.zig");
 pub const html = @import("html.zig");

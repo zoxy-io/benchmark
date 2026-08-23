@@ -19,105 +19,12 @@
 const std = @import("std");
 const Io = std.Io;
 
+const http = @import("http.zig");
+
 const Allocator = std.mem.Allocator;
 
 pub const storage_host = "storage.yandexcloud.net";
 pub const compute_host = "compute.api.cloud.yandex.net";
-
-/// How long a single request gets before it is abandoned as failed.
-///
-/// Nothing in `std.http.Client.fetch` bounds a stalled connect or a response
-/// that arrives a byte at a time forever. `bench wait` polls `exists` for the
-/// DONE/FAILED markers every 30s over up to 110 minutes with no deadline of
-/// its own other than counting elapsed time BETWEEN calls — so one hung
-/// request used to freeze the whole poll loop silently until the workflow's
-/// own step timeout. Nightly run #9 burned 71 minutes that way. Same shape as
-/// `discord.zig`'s `attemptOnce`: run the call on its own thread, poll an
-/// atomic flag, give up on the wall clock if it never flips.
-const fetch_deadline_ns: u64 = 30 * std.time.ns_per_s;
-
-const FetchTask = struct {
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
-    result: ?(std.http.Client.FetchError!std.http.Client.FetchResult) = null,
-    done: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *FetchTask) void {
-        self.result = self.client.fetch(self.options);
-        self.done.store(true, .release);
-    }
-};
-
-/// Run one bounded request on a throwaway client and thread of its own.
-/// A `null` return means it never came back within `fetch_deadline_ns`.
-///
-/// Each call gets its OWN `std.http.Client` — deliberately not `Client`'s own
-/// long-lived one — because `bench wait` calls this every 30s for up to 110
-/// minutes, and a request that times out is ABANDONED rather than torn down:
-/// nothing here can force a thread blocked in a syscall to unwind, and calling
-/// `deinit` out from under it would race its connection pool. A shared,
-/// reused client would mean every LATER poll racing that same zombie thread;
-/// a throwaway one confines the damage to itself and is simply never freed.
-///
-/// For the same reason, `options.response_writer`'s backing buffer must stay
-/// valid forever if this returns null — see `newSink`'s doc comment for the
-/// discard-buffer case, and `get`/`listInstances` for why their arena-backed
-/// writers need no special handling at all.
-fn fetchBounded(gpa: Allocator, io: Io, options: std.http.Client.FetchOptions) !?std.http.Client.FetchResult {
-    const client = try gpa.create(std.http.Client);
-    client.* = .{ .allocator = gpa, .io = io };
-
-    const task = try gpa.create(FetchTask);
-    task.* = .{ .client = client, .options = options };
-
-    const thread = try std.Thread.spawn(.{}, FetchTask.run, .{task});
-
-    const step_ns: u64 = 100 * std.time.ns_per_ms;
-    var waited: u64 = 0;
-    while (!task.done.load(.acquire) and waited < fetch_deadline_ns) {
-        io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
-        waited += step_ns;
-    }
-    if (!task.done.load(.acquire)) return null; // abandoned; see doc comment above
-
-    thread.join();
-    const result = task.result.?;
-    client.deinit();
-    gpa.destroy(client);
-    gpa.destroy(task);
-    return try result;
-}
-
-/// A throwaway sink for a response body nobody reads (HEAD/PUT/DELETE all
-/// discard theirs). Heap-allocated rather than a caller's stack buffer,
-/// because it must stay valid if `fetchBounded` abandons the request on
-/// timeout: `exists` in particular is called every 30s in a loop, and a stack
-/// buffer would be reused by the NEXT call while an earlier abandoned thread
-/// might still be writing through the OLD one — corrupting whichever call's
-/// struct happens to land there, not merely wasting a few bytes. Freed by the
-/// caller only when the request did NOT time out; see `freeSink`.
-///
-/// The response_writer itself is still mandatory even though the body is
-/// discarded: without one, std.http.Client takes an internal discard path
-/// that segfaults in `Reader.discardRemaining`. It does not reproduce in a
-/// Debug build against glibc — only in the ReleaseFast static-musl binary CI
-/// actually ships, which is how it reached a real run: the first `bench wait`
-/// died two seconds in, on a HEAD, immediately after tofu had brought up the
-/// whole fleet. `keep_alive = false` matters too: it is what keeps a reply
-/// whose body has no discoverable end (a HEAD's `content-length` with no
-/// body, or Discord's 204) from hanging forever waiting for bytes that will
-/// never come — see discord.zig's identical note.
-fn newSink(gpa: Allocator) !*std.Io.Writer.Discarding {
-    const buf = try gpa.alloc(u8, 1024);
-    const d = try gpa.create(std.Io.Writer.Discarding);
-    d.* = .init(buf);
-    return d;
-}
-
-fn freeSink(gpa: Allocator, d: *std.Io.Writer.Discarding) void {
-    gpa.free(d.writer.buffer);
-    gpa.destroy(d);
-}
 
 pub const Client = struct {
     gpa: Allocator,
@@ -129,7 +36,7 @@ pub const Client = struct {
     }
 
     /// No-op: every request now builds and tears down its own throwaway
-    /// client (see `fetchBounded`), so there is no longer any persistent
+    /// client (see `http.fetch`), so there is no longer any persistent
     /// connection state for `Client` itself to hold. Kept so call sites that
     /// pair `init`/`defer deinit()` need no change.
     pub fn deinit(self: *Client) void {
@@ -164,26 +71,14 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        var extra: std.ArrayList(std.http.Header) = .empty;
-        defer extra.deinit(self.gpa);
-        if (opts.content_type) |ct| {
-            try extra.append(self.gpa, .{ .name = "content-type", .value = ct });
-        }
-
-        const discard = try newSink(self.gpa);
-        const res = try fetchBounded(self.gpa, self.io, .{
-            .location = .{ .url = url },
+        const res = try http.fetch(self.gpa, self.io, .{
+            .url = url,
             .method = .PUT,
             .payload = body,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .extra_headers = extra.items,
-            .response_writer = &discard.writer,
-            .keep_alive = false,
-        }) orelse {
-            std.debug.print("bench: PUT {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
-            return error.RequestTimedOut;
-        };
-        freeSink(self.gpa, discard);
+            .authorization = auth,
+            .content_type = opts.content_type,
+            .what = key,
+        }) orelse return error.RequestTimedOut;
         if (res.status != .ok and res.status != .created) {
             std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
             return error.ObjectPutFailed;
@@ -203,21 +98,20 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // Arena-backed, unlike the discard sinks above: `wait`'s arena lives
-        // for the whole poll loop and is never reset mid-loop, so an
-        // abandoned thread writing into it on timeout has nothing to corrupt
-        // — the memory is simply never reused before the process exits.
-        var body: std.Io.Writer.Allocating = .init(arena);
-        const res = try fetchBounded(self.gpa, self.io, .{
-            .location = .{ .url = url },
-            .method = .GET,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .response_writer = &body.writer,
-            .keep_alive = false,
-        }) orelse {
-            std.debug.print("bench: GET {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
-            return error.RequestTimedOut;
-        };
+        // The `Allocating` itself is arena-ALLOCATED, not a stack local whose
+        // buffer happens to come from the arena. `http.fetch` hands this
+        // pointer to a thread it may abandon, and a stack local would leave
+        // that thread writing into `get`'s dead frame. `wait`'s arena lives
+        // for the whole poll loop and is never reset mid-loop, so the memory
+        // is simply never reused before the process exits.
+        const body = try arena.create(std.Io.Writer.Allocating);
+        body.* = .init(arena);
+        const res = try http.fetch(self.gpa, self.io, .{
+            .url = url,
+            .authorization = auth,
+            .sink = .{ .collect = body },
+            .what = key,
+        }) orelse return error.RequestTimedOut;
         if (res.status == .not_found) return null;
         if (res.status != .ok) {
             std.debug.print("bench: GET {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
@@ -237,21 +131,15 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        const discard = try newSink(self.gpa);
-        const res = try fetchBounded(self.gpa, self.io, .{
-            .location = .{ .url = url },
+        // A timeout here is not fatal: `wait`'s loop treats a failed `exists`
+        // as `false` and polls again next tick, which is exactly right for one
+        // stalled HEAD in a 110-minute loop — see `wait`'s own catch sites.
+        const res = try http.fetch(self.gpa, self.io, .{
+            .url = url,
             .method = .HEAD,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .response_writer = &discard.writer,
-            .keep_alive = false,
-        }) orelse {
-            // Not fatal: `wait`'s loop treats a failed `exists` as `false` and
-            // polls again next tick, which is exactly right for one stalled
-            // HEAD in a 110-minute loop — see `wait`'s own catch sites.
-            std.debug.print("bench: HEAD {s} timed out after {d}s\n", .{ key, fetch_deadline_ns / std.time.ns_per_s });
-            return error.RequestTimedOut;
-        };
-        freeSink(self.gpa, discard);
+            .authorization = auth,
+            .what = key,
+        }) orelse return error.RequestTimedOut;
         return res.status == .ok;
     }
 
@@ -267,14 +155,14 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // Arena-backed; see the comment in `get` above.
-        var body: std.Io.Writer.Allocating = .init(arena);
-        const res = try fetchBounded(self.gpa, self.io, .{
-            .location = .{ .url = url },
-            .method = .GET,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .response_writer = &body.writer,
-            .keep_alive = false,
+        // Arena-ALLOCATED, not a stack local; see the comment in `get` above.
+        const body = try arena.create(std.Io.Writer.Allocating);
+        body.* = .init(arena);
+        const res = try http.fetch(self.gpa, self.io, .{
+            .url = url,
+            .authorization = auth,
+            .sink = .{ .collect = body },
+            .what = "list instances",
         }) orelse return error.RequestTimedOut;
         if (res.status != .ok) return error.ListInstancesFailed;
 
@@ -292,15 +180,12 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        const discard = try newSink(self.gpa);
-        const res = try fetchBounded(self.gpa, self.io, .{
-            .location = .{ .url = url },
+        const res = try http.fetch(self.gpa, self.io, .{
+            .url = url,
             .method = .DELETE,
-            .headers = .{ .authorization = .{ .override = auth } },
-            .response_writer = &discard.writer,
-            .keep_alive = false,
+            .authorization = auth,
+            .what = "delete instance",
         }) orelse return error.RequestTimedOut;
-        freeSink(self.gpa, discard);
         if (res.status != .ok) return error.DeleteInstanceFailed;
     }
 };

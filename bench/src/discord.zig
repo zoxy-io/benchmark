@@ -16,6 +16,7 @@ const std = @import("std");
 
 const analysis = @import("analysis.zig");
 const artifact = @import("artifact.zig");
+const http = @import("http.zig");
 const jsonw = @import("jsonw.zig");
 const redact = @import("redact.zig");
 const svg = @import("svg.zig");
@@ -365,7 +366,13 @@ pub fn post(
 
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
-        const outcome = attemptOnce(gpa, arena, io, url, ctype, body) catch |e| {
+        const outcome = http.fetch(gpa, io, .{
+            .url = url,
+            .method = .POST,
+            .payload = body,
+            .content_type = ctype,
+            .what = "Discord POST",
+        }) catch |e| {
             // A transport-level failure — DNS, connection refused/reset, a TLS
             // handshake failure. This used to be a bare `try` on the fetch,
             // which skipped this whole loop: the ONLY retried failure mode was
@@ -376,10 +383,10 @@ pub fn post(
             io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
             continue;
         };
+        // `http.fetch` has already printed what timed out; this only adds
+        // which attempt it was.
         const res = outcome orelse {
-            std.debug.print("bench: Discord POST timed out after {d}s (attempt {d}/3)\n", .{
-                fetch_deadline_ns / std.time.ns_per_s, attempt + 1,
-            });
+            std.debug.print("bench: ...that was attempt {d}/3\n", .{attempt + 1});
             io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
             continue;
         };
@@ -399,95 +406,6 @@ pub fn post(
         }
     }
     return error.DiscordPostFailed;
-}
-
-/// How long a single attempt gets before it is abandoned as failed.
-///
-/// `std.http.Client.fetch` has no deadline of its own — nothing here bounds a
-/// stalled connect, or a server that accepts the connection and then drips the
-/// response forever. This borrows `remote.zig`'s `Waiter` shape: run the call
-/// on its own thread, poll an atomic flag, give up on the wall clock if it
-/// never flips. A webhook body here is a few KB of JSON with no attachment
-/// (see `renderPayload`'s `files` — always empty on the real call path, see
-/// `commands.zig`), so 30s is generous even on a slow connection.
-const fetch_deadline_ns: u64 = 30 * std.time.ns_per_s;
-
-const FetchTask = struct {
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
-    result: ?(std.http.Client.FetchError!std.http.Client.FetchResult) = null,
-    done: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *FetchTask) void {
-        self.result = self.client.fetch(self.options);
-        self.done.store(true, .release);
-    }
-};
-
-/// One attempt: a fresh client, on its own thread, bounded by `fetch_deadline_ns`.
-/// A `null` return means the attempt never came back in time.
-///
-/// The client and its thread are then ABANDONED rather than torn down —
-/// nothing here can force an OS thread blocked in a syscall to unwind, and
-/// calling `client.deinit()` out from under a thread still using it would race
-/// its connection pool. Everything the abandoned thread can still touch is
-/// allocated from `arena` for exactly that reason: never reused, so there is
-/// nothing for it to corrupt. `bench notify` is a short-lived one-shot
-/// process, so the leak is bounded by the process's own remaining lifetime —
-/// the same trade `ProxyWatchdog` makes with the whole process elsewhere in
-/// this codebase.
-fn attemptOnce(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    url: []const u8,
-    ctype: []const u8,
-    body: []const u8,
-) !?std.http.Client.FetchResult {
-    const client = try arena.create(std.http.Client);
-    client.* = .{ .allocator = gpa, .io = io };
-
-    // The response body is of no interest, but a `response_writer` is still
-    // mandatory: without one std.http.Client segfaults in its own discard
-    // path, and only in a ReleaseFast musl build.
-    const discard_buf = try arena.alloc(u8, 1024);
-    const discard = try arena.create(std.Io.Writer.Discarding);
-    discard.* = .init(discard_buf);
-
-    const task = try arena.create(FetchTask);
-    task.* = .{
-        .client = client,
-        .options = .{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
-            .response_writer = &discard.writer,
-            // Ask the server to close after replying. This is what actually
-            // makes a 204 safe: that reply has no body and no `content-length`,
-            // and `std.http.Client` then waits for a body that never comes —
-            // forever, if the connection stays open. `Connection: close` gives
-            // the read an end. Verified against httpbingo.org/status/204, which
-            // hangs without it and returns immediately with it.
-            //
-            // One request per attempt, so pooling buys nothing anyway.
-            .keep_alive = false,
-        },
-    };
-
-    const thread = try std.Thread.spawn(.{}, FetchTask.run, .{task});
-
-    const step_ns: u64 = 100 * std.time.ns_per_ms;
-    var waited: u64 = 0;
-    while (!task.done.load(.acquire) and waited < fetch_deadline_ns) {
-        io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
-        waited += step_ns;
-    }
-    if (!task.done.load(.acquire)) return null; // abandoned; see doc comment above
-
-    thread.join();
-    defer client.deinit(); // safe now: joined, so nothing else touches it
-    return try task.result.?;
 }
 
 test "the table shows a failed proxy as FAILED, never as zeros" {

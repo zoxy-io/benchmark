@@ -292,6 +292,7 @@ bench/src/ramp.zig        one ramp, embedding zrk's runner.run in-process
 bench/src/cadvisor.zig    1Hz container sampling + the identity witness
 bench/src/analysis.zig    the measurement math (ported from the old report.py)
 bench/src/{svg,html}.zig  inline-SVG charts -> a self-contained report.html
+bench/src/http.zig        the one bounded HTTP client (std.http.Client has no deadline)
 bench/src/{ycs,commands}  Object Storage, the compute sweep, the CLI
 compose.yaml              every service, proxies behind profiles, limits enforced
 compose.cloud.yaml        host networking + cpuset + peer-IP overlay
