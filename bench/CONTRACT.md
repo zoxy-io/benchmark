@@ -148,3 +148,16 @@ shortened label: shortening is a presentation choice, and anything that wants
 once dropped. `null` where the probe failed or the run predates it — a legacy
 run dir with no profile.json reports every version as null rather than failing.
 The field is additive, so `schema` stays at 1.
+
+`status` is repeated the same way, and for a sharper reason. report.json
+publishes `sustained` as a number for every proxy it lists, so a turn that died
+at `start` appears as a plain `0` — indistinguishable from a proxy that ran and
+sustained nothing. Every other surface already separates the two: the HTML
+table renders an em-dash, history.ndjson carries `status` (which is what keeps
+a failure out of the trend line and out of the vs-last-night delta), and the
+Discord table refuses to print a zero for a failed proxy at all. This was the
+one machine-readable artifact where a crash and a real zero read alike, which
+is exactly the "absent, not zero" distinction the rest of the harness insists
+on. Values are the `artifact.Status` names — `ok`, `degraded`, `failed`,
+`skipped` — or `null` for a run dir with no profile.json. Additive, so `schema`
+stays at 1.

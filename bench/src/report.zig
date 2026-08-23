@@ -400,6 +400,28 @@ fn versionOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const 
     return null;
 }
 
+/// The suite's own verdict on this proxy's turn — `ok`, `degraded`, `failed`,
+/// `skipped` — or null when the record is missing entirely.
+///
+/// report.json publishes `sustained` as a NUMBER for every proxy it lists, and
+/// a turn that died at `start` lands there as a plain `0`. Every other surface
+/// distinguishes the two: the HTML table renders an em-dash, history.ndjson
+/// carries `status` (which is what keeps a failure out of the trend and out of
+/// the vs-last-night delta), and the Discord table refuses to print a zero for
+/// a failed proxy at all. This is the one machine-readable artifact where a
+/// crash and a genuine zero read the same, and "absent, not zero" is a
+/// distinction this harness makes everywhere else.
+///
+/// Found the night zoxy v0.6.0's TLS listener segfaulted at boot
+/// (zoxy-io/zoxy#283): report.json said `"sustained":0`, which reads as a
+/// proxy that is catastrophically slow rather than one that never started.
+fn statusOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const u8 {
+    for (statuses) |s| {
+        if (std.mem.eql(u8, s.name, name)) return @tagName(s.status);
+    }
+    return null;
+}
+
 /// Write report.json. Key order and number formatting are chosen to match
 /// report.py's `json.dumps(..., separators=(",", ":"))` exactly — see jsonw.zig.
 pub fn writeJson(
@@ -510,6 +532,11 @@ pub fn writeJson(
         // version 3.0.7-...", but nothing can recover the rest once dropped.
         try j.key("version");
         if (versionOf(statuses, p.name)) |v| try j.string(v) else try j.nullValue();
+
+        // Before `sustained`, deliberately: a reader scanning this object hits
+        // the verdict before the number it qualifies.
+        try j.key("status");
+        if (statusOf(statuses, p.name)) |s| try j.string(s) else try j.nullValue();
 
         try j.key("sustained");
         try j.int(jsonw.pyRoundToInt(p.sustained));
