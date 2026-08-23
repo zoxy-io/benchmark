@@ -121,8 +121,26 @@ pub fn scrape(
     {
         var wbuf: [512]u8 = undefined;
         var w = stream.writer(io, &wbuf);
+        // HTTP/1.0, deliberately, and not a style choice. Under HTTP/1.1 Go
+        // answers this with `Transfer-Encoding: chunked` in 2 KiB chunks, and
+        // the loop below reads the body as raw text — it has no chunk
+        // decoder. Every 2048th byte therefore splices a hex chunk-size line
+        // into whatever metric line straddles that offset, and that series is
+        // destroyed. Measured against cAdvisor v0.52.1: 523 chunk markers and
+        // 67 of 78 CPU series intact under 1.1, versus 0 markers and 78 of 78
+        // under 1.0.
+        //
+        // Which series is lost depends only on its byte offset, so it is
+        // stable for the life of one exposition layout and shifts between
+        // runs. That is exactly the failure this file used to blame on
+        // cAdvisor being slow to discover a container: on a GitHub runner it
+        // cost roughly half of all turns their CPU and memory, with cAdvisor
+        // publishing the container correctly the whole time.
+        //
+        // HTTP/1.0 has no chunked encoding, so the body runs to the close —
+        // which is the framing this reader already assumes.
         try w.interface.print(
-            "GET /metrics HTTP/1.1\r\nHost: cadvisor\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
+            "GET /metrics HTTP/1.0\r\nHost: cadvisor\r\nAccept: text/plain\r\n\r\n",
             .{},
         );
         try w.interface.flush();
@@ -134,6 +152,25 @@ pub fn scrape(
 
     var obs: Observation = .{};
     var seen_expected: usize = 0;
+
+    // Response headers, consumed explicitly rather than left for the metric
+    // parser to ignore, so the guard below has somewhere to live. A server
+    // that chunks anyway must fail LOUDLY: silent corruption of a fraction of
+    // the series is what made the original bug survive a nightly run, a doc
+    // comment blaming cAdvisor, and two proxies' worth of missing memory.
+    while (true) {
+        const h = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return error.ShortResponse,
+            else => return err,
+        };
+        const t = std.mem.trim(u8, h, " \t\r\n");
+        if (t.len == 0) break;
+        if (std.ascii.indexOfIgnoreCase(t, "transfer-encoding:") != null and
+            std.ascii.indexOfIgnoreCase(t, "chunked") != null)
+        {
+            return error.ChunkedResponse;
+        }
+    }
 
     // Stream line by line into a fixed buffer; nothing is accumulated, so a
     // 200 KB exposition is parsed with zero allocation.
@@ -247,13 +284,20 @@ fn nameLabel(labels: []const u8) ?[]const u8 {
 /// cAdvisor that never catches up should cost the CPU/mem chart, not the
 /// throughput measurement.
 ///
-/// Exists because cAdvisor's own container discovery can lag well behind the
-/// container actually starting. Nightly run #28: cAdvisor answered every
+/// Nightly run #28 is what this was written for: cAdvisor answered every
 /// scrape correctly (zero failures) for the WHOLE 300s ramp without once
 /// reporting c100's zoxy or haproxy, while the very next proxy (pingora) —
-/// and every proxy in that same night's later c1k profile — worked fine. On
-/// a healthy run this returns on its first scrape, so the cost here is one
-/// HTTP round trip; the bound only matters on the run it exists for.
+/// and every proxy in that same night's later c1k profile — worked fine. That
+/// was read at the time as cAdvisor's discovery lagging the container.
+///
+/// It was not. `scrape` was requesting HTTP/1.1 and reading the chunked body
+/// as raw text, so a fixed fraction of series was destroyed by chunk framing,
+/// and WHICH ones depended on byte offsets that hold still for the life of an
+/// exposition layout — a container could therefore be invisible for an entire
+/// ramp while `docker` and `curl` both showed it. See `scrape`'s request.
+///
+/// The wait is kept anyway: discovery genuinely is asynchronous, and one HTTP
+/// round trip on a healthy run is the whole cost.
 ///
 /// `connect_timeout` is forwarded to `scrape` as-is (`.none` under
 /// `Io.Threaded` in tests, a real bound in production) — this loop's own
@@ -656,4 +700,53 @@ test "isKnownProxy covers the comparison set" {
     // named here only so a leftover reference to it stays a plain unknown.
     try std.testing.expect(!isKnownProxy("direct"));
     try std.testing.expect(!isKnownProxy("cadvisor"));
+}
+
+test "a chunked response is rejected, not silently mis-parsed" {
+    // The bug this guards: `scrape` has no chunk decoder, so a chunked body
+    // splices a hex chunk-size line into whatever metric line straddles each
+    // 2 KiB boundary. Against cAdvisor v0.52.1 that destroyed 11 of 78 CPU
+    // series per scrape, and the series lost stayed lost for as long as the
+    // exposition's byte layout held — which read from outside as "cAdvisor
+    // never reported this container".
+    //
+    // The request is HTTP/1.0 precisely so this cannot happen. This test
+    // proves the guard fires if a server chunks regardless, because the
+    // failure mode it replaces was silent.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const listen_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    // Port 0 plus getsockname: `listen` resolves the bound address, so this
+    // needs no fixed port to collide on.
+    const bound = server.socket.address;
+
+    const Serve = struct {
+        fn run(srv: *net.Server, sio: Io) void {
+            var stream = srv.accept(sio) catch return;
+            defer stream.close(sio);
+            var wbuf: [1024]u8 = undefined;
+            var w = stream.writer(sio, &wbuf);
+            w.interface.print(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: text/plain\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\n" ++
+                    "1a\r\ncontainer_cpu_usage_secon\r\n0\r\n\r\n",
+                .{},
+            ) catch return;
+            w.interface.flush() catch return;
+        }
+    };
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, Serve.run, .{ &server, io });
+
+    try std.testing.expectError(
+        error.ChunkedResponse,
+        scrape(io, bound, "zoxy", null, .none),
+    );
 }
