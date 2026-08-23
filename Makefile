@@ -5,12 +5,12 @@
 # drives itself, results come back through Object Storage, and the fleet is
 # destroyed. These targets are the local/manual half of that.
 #
-#   make build       build the bench binary (static musl)
-#   make test        bench unit tests
-#   make smoke       the CI gate: a ~90s local run of the whole suite
-#   make local       run the benchmark on THIS machine (see the caveat below)
-#   make report      render results/latest -> report.json + report.html
-#   make up / down   local: start/stop the backend origin pool (all four)
+#>  make build       build the bench binary (static musl)
+#>  make test        bench unit tests
+#>  make smoke       the CI gate: a ~90s local run of the whole suite
+#>  make local       run the benchmark on THIS machine (see the caveat below)
+#>  make report      render results/latest -> report.json + report.html
+#>  make up / down   local: start/stop the backend origin pool (all four)
 #
 # Ramp parameters are NOT knobs any more — they are compiled into
 # bench/src/profile.zig as the c100, c1k, c1k-tls, c10k and smoke profiles,
@@ -24,6 +24,12 @@
 SHELL := bash
 .ONESHELL:
 .SHELLFLAGS := -euo pipefail -c
+
+# These targets run the SAME zig invocations as .github/workflows/ci.yml and
+# nightly.yml, deliberately. They used to pass `--system zig-pkg` while CI did
+# not — two build paths, one of them untested, pointing at a directory that is
+# gitignored and that nothing in the repo ever created. Zig quietly fell back
+# to the global cache, which is why nobody noticed the flag did nothing.
 
 ZIG ?= zig
 ZIG_TARGET ?= x86_64-linux-musl
@@ -42,23 +48,24 @@ ZIG_TARGET ?= x86_64-linux-musl
 # Genoa does not, so raising this is a deliberate bet on the platform the VMs
 # land on, not a free upgrade.
 ZIG_CPU ?= x86_64_v3
-# The vendored copies of the pinned zrk/zio packages, so a build needs no network.
-ZIG_PKG ?= zig-pkg
 PROFILE ?= c1k
 RUN ?= results/latest
 LOCAL_PROXIES ?= zoxy
 
 .PHONY: help build test smoke local report up down clean
 
+# Keyed off the `#>` marker rather than a line range: `sed -n '8,13p'` printed
+# whatever happened to be on those lines, so adding a comment anywhere above
+# silently turned `make help` into something else.
 help:
-	@sed -n '8,13p' $(MAKEFILE_LIST)
+	@grep '^#>' $(MAKEFILE_LIST) | cut -c4-
 
 build:
-	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) -Dcpu=$(ZIG_CPU) --system $(ZIG_PKG)
+	cd bench && $(ZIG) build -Doptimize=ReleaseFast -Dtarget=$(ZIG_TARGET) -Dcpu=$(ZIG_CPU)
 	@echo "built bench/zig-out/bin/bench ($(ZIG_TARGET) cpu=$(ZIG_CPU))"
 
 test:
-	cd bench && $(ZIG) build test --system $(ZIG_PKG) --summary all
+	cd bench && $(ZIG) build test --summary all
 
 
 # A whole run against this machine's docker daemon — no cloud, no ssh, ~6 min
@@ -73,18 +80,19 @@ local: build
 	bench/zig-out/bin/bench suite --local --profile $(PROFILE) \
 	  --proxies $(LOCAL_PROXIES) --runid local-$$(date -u +%Y%m%d-%H%M%S)
 
-# A real ramp (30s, 200 -> 5000 req/s) sized for a machine that is also hosting
-# the proxy and the origin pool it measures. nginx and haproxy only: both are
-# stock images, so nothing is compiled. It exercises the HARNESS, not the
-# proxies — bring-up, the warm probe, the ramp, cAdvisor identity, teardown,
-# report. It is NOT a measurement, and profile.zig has a test asserting it can
-# never quietly become one.
+# What .github/workflows/ci.yml's `smoke` job runs, so a failure there can be
+# reproduced here in one command. The `smoke` profile is a real ramp (30s,
+# 200 -> 5000 req/s) sized for a machine that is also hosting the proxy and the
+# origin pool. nginx and haproxy only: both are stock images, so nothing is
+# compiled. It exercises the harness, not the proxies — bring-up, the warm
+# probe, the ramp, cAdvisor identity, teardown, report. It is NOT a measurement
+# and profile.zig has a test asserting it can never become one.
 smoke: build
 	bench/zig-out/bin/bench suite --local --profile smoke \
 	  --proxies nginx,haproxy --runid smoke-$$(date -u +%Y%m%d-%H%M%S)
 
 report:
-	cd bench && $(ZIG) build --system $(ZIG_PKG)
+	cd bench && $(ZIG) build
 	bench/zig-out/bin/bench report $(RUN) --profile $(PROFILE)
 
 # The origin alone — enough to poke at a proxy by hand. There is no monitoring
