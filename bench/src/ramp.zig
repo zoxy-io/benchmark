@@ -289,10 +289,13 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
     }
     defer {
         poll_stop.store(true, .monotonic);
-        // Unblock a scrape already in flight before waiting on the task, or this
-        // cancel waits for a read that will never return. `stop` first, so the
-        // poller exits rather than reconnecting.
-        if (opts.cadvisor_addr != null) poller.interrupt();
+        // `stop` first, so the poller exits rather than starting another scrape.
+        //
+        // There used to be a `poller.interrupt()` here, shutting the in-flight
+        // socket down from outside so that this cancel did not wait forever on
+        // a read that would never return. Each scrape now carries its own
+        // whole-request deadline and `Io.Group.cancel` unwinds a blocked one
+        // directly, so there is nothing left to rescue.
         poll_group.cancel(io);
     }
 
