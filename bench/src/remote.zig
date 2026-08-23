@@ -300,15 +300,24 @@ pub const Ssh = struct {
         var list: std.ArrayList([]const u8) = .empty;
         try list.appendSlice(arena, &.{
             "ssh",
-            "-i",                            self.key_path,
-            "-o",                            "IdentitiesOnly=yes",
-            "-o",                            "BatchMode=yes",
-            "-o",                            "StrictHostKeyChecking=yes",
-            "-o",                            try std.fmt.allocPrint(arena, "UserKnownHostsFile={s}", .{self.known_hosts}),
-            "-o",                            "ConnectTimeout=10",
-            "-o",                            "ServerAliveInterval=15",
-            "-o",                            "ServerAliveCountMax=8",
-            "-o",                            "LogLevel=ERROR",
+            "-i",
+            self.key_path,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            try std.fmt.allocPrint(arena, "UserKnownHostsFile={s}", .{self.known_hosts}),
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=8",
+            "-o",
+            "LogLevel=ERROR",
             try std.fmt.allocPrint(arena, "{s}@{s}", .{ self.user, host }),
             remote_cmd,
         });
@@ -341,7 +350,7 @@ pub const Host = union(enum) {
 fn printTail(arena: Allocator, label: []const u8, stream: []const u8) !void {
     if (stream.len == 0) return;
     const keep = 16 * 1024;
-    const tail = stream[stream.len -| keep ..];
+    const tail = stream[stream.len -| keep..];
     // Heap, not a stack array: `scrub` silently stops at the end of its output
     // buffer, so a buffer smaller than the slice would trade the truncation
     // above for the same truncation one layer down. Every registered address is
