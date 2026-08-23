@@ -98,6 +98,12 @@ make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1
 make up/down   # the backend origin pool, for poking at a proxy by hand
 ```
 
+Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+`zig fmt`, the unit tests, the nightly's exact cross-compile, `docker compose
+config` for every profile, `tofu validate`, `actionlint`, and then `make smoke`'s
+run end-to-end. Before it existed the only thing that ever compiled `bench` was
+the nightly — so a broken push cost a night and six VMs to discover.
+
 `make local` drives the same suite against your own docker daemon, with no
 cloud and no ssh — a ~6 minute loop for working on the harness, a proxy config
 or the report. **It is not a benchmark result**: the load generator shares CPU,
@@ -293,5 +299,5 @@ proxies/<p>/              one static config per proxy (upstream is the backend0.
 backend/                  nginx origin, canned bodies generated at start (x4)
 cloud/                    terraform: VPC + 6 ephemeral VMs, no public IPs
 docs/SETUP.md             the one-time cloud setup CI cannot do for you
-.github/workflows/        the nightly
+.github/workflows/        ci.yml (every push) + the nightly
 ```
