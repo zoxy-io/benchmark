@@ -607,6 +607,50 @@ fn resolveZoxySource(
     return .{ .flavour = "release", .ref = arena.dupe(u8, tag) catch return null, .cpu = "x86_64_v3" };
 }
 
+/// The resolved release tag for THIS RUN, shared by every profile in it.
+///
+/// `release` means "whatever is latest right now", and the fleet runs one
+/// `bench suite` per profile (cloud-init's loop) — so a release published
+/// between two profiles makes one night measure two different zoxy versions.
+/// That is not hypothetical: the 2026-08-23 06:43 nightly measured c1k on
+/// v0.5.1 and c1k-tls on v0.6.0, because v0.6.0 published at 07:04 in the gap.
+/// The numbers then sit in one report, under one runid, with nothing saying
+/// they are not the same binary.
+///
+/// So the first profile of a run writes the tag it resolved next to the run's
+/// results, and every later profile reads it back instead of asking GitHub
+/// again. Keyed on the run directory rather than on a flag, so it needs no
+/// change to cloud-init's loop, works identically under `--local`, and cannot
+/// leak between runs.
+///
+/// Only the `release` flavour needs this. A source ref is whatever the profile
+/// asked for and does not move between profiles; the commit it points at can
+/// still drift mid-run, which is what `zoxy_ref_sha`'s freshness check is for.
+const zoxy_pin_name = "zoxy-release.pin";
+
+fn zoxyPinPath(arena: Allocator, out_dir: []const u8) ?[]const u8 {
+    // out_dir is `results/<runid>/<profile>`; the pin belongs to the run.
+    const run_dir = std.fs.path.dirname(out_dir) orelse return null;
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ run_dir, zoxy_pin_name }) catch null;
+}
+
+fn readZoxyPin(arena: Allocator, io: Io, out_dir: []const u8) ?[]const u8 {
+    const path = zoxyPinPath(arena, out_dir) orelse return null;
+    const raw = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64)) catch return null;
+    const tag = std.mem.trim(u8, raw, " \n\r\t");
+    // Re-validated on the way in: a truncated or hand-edited pin must not
+    // become an image tag.
+    return if (isReleaseTag(tag)) tag else null;
+}
+
+fn writeZoxyPin(io: Io, out_dir: []const u8, tag: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const path = zoxyPinPath(fba.allocator(), out_dir) orelse return;
+    // Best-effort: losing the pin costs a second resolve, not the run.
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tag }) catch {};
+}
+
 /// The tag out of the URL `…/releases/latest` redirects to.
 ///
 /// Null on anything else, which covers the interesting failure: GitHub serves
@@ -851,10 +895,19 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     const wants_zoxy = for (opts.proxies) |name| {
         if (std.mem.eql(u8, name, "zoxy")) break true;
     } else false;
-    const zoxy_src = if (wants_zoxy)
-        resolveZoxySource(gpa, arena, io, opts.fleet, deadline.inspect)
-    else
-        null;
+    const zoxy_src = if (wants_zoxy) blk: {
+        // A tag already pinned by an earlier profile of this run wins, and
+        // skips the round trip entirely. See `zoxy_pin_name`.
+        if (readZoxyPin(arena, io, opts.out_dir)) |tag| {
+            redact.log("bench: [zoxy] release pinned by this run: {s}", .{tag});
+            break :blk ZoxySource{ .flavour = "release", .ref = tag, .cpu = "x86_64_v3" };
+        }
+        const src = resolveZoxySource(gpa, arena, io, opts.fleet, deadline.inspect);
+        if (src) |s| {
+            if (std.mem.eql(u8, s.flavour, "release")) writeZoxyPin(io, opts.out_dir, s.ref);
+        }
+        break :blk src;
+    } else null;
     if (wants_zoxy) {
         if (zoxy_src) |z| {
             redact.log("bench: [zoxy] {s} build at {s} (cpu {s})", .{ z.flavour, z.ref, z.cpu });
@@ -2530,4 +2583,44 @@ test "the version probe asks the container, and falls back to the image tag" {
     const ping = try versionProbe(arena, "pingora");
     try std.testing.expect(std.mem.indexOf(u8, ping, "docker inspect") != null);
     try std.testing.expect(std.mem.indexOf(u8, ping, "{{.Config.Image}}") != null);
+}
+
+test "the release pin is scoped to a run and survives between profiles" {
+    // The bug: cloud-init runs one `bench suite` per profile, each resolving
+    // `release` independently, so a release published mid-run splits a night
+    // across two zoxy versions (2026-08-23 06:43: c1k on v0.5.1, c1k-tls on
+    // v0.6.0). The pin is what makes the second profile agree with the first.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root = ".zig-cache/tmp/pin-test";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const run_dir = try std.fmt.allocPrint(arena, "{s}/results/run-1", .{root});
+    const c1k = try std.fmt.allocPrint(arena, "{s}/c1k", .{run_dir});
+    const c1k_tls = try std.fmt.allocPrint(arena, "{s}/c1k-tls", .{run_dir});
+    try Io.Dir.cwd().createDirPath(io, c1k);
+
+    // Nothing pinned yet: the first profile has to resolve for itself.
+    try std.testing.expect(readZoxyPin(arena, io, c1k) == null);
+
+    writeZoxyPin(io, c1k, "v0.5.1");
+
+    // A DIFFERENT profile of the SAME run sees it, which is the whole point.
+    try std.testing.expectEqualStrings("v0.5.1", readZoxyPin(arena, io, c1k_tls).?);
+
+    // A different run does not.
+    const other = try std.fmt.allocPrint(arena, "{s}/results/run-2/c1k", .{root});
+    try std.testing.expect(readZoxyPin(arena, io, other) == null);
+
+    // A corrupted pin is refused rather than becoming an image tag.
+    const pin_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ run_dir, zoxy_pin_name });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = pin_path, .data = "v1.0.0; rm -rf /" });
+    try std.testing.expect(readZoxyPin(arena, io, c1k) == null);
 }
