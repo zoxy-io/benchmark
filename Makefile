@@ -7,13 +7,14 @@
 #
 #   make build       build the bench binary (static musl)
 #   make test        bench unit tests
+#   make smoke       the CI gate: a ~90s local run of the whole suite
 #   make local       run the benchmark on THIS machine (see the caveat below)
 #   make report      render results/latest -> report.json + report.html
 #   make up / down   local: start/stop the backend origin pool (all four)
 #
 # Ramp parameters are NOT knobs any more — they are compiled into
-# bench/src/profile.zig as the c100, c1k, c1k-tls and c10k profiles, because
-# eleven env vars with silent fallbacks is how a real run ended up with
+# bench/src/profile.zig as the c100, c1k, c1k-tls, c10k and smoke profiles,
+# because eleven env vars with silent fallbacks is how a real run ended up with
 # TIMEOUT_S=0 against a documented 1 and nothing noticed.
 #
 # `make local PROFILE=c1k-tls` runs the TLS profile: the suite generates the
@@ -47,7 +48,7 @@ PROFILE ?= c1k
 RUN ?= results/latest
 LOCAL_PROXIES ?= zoxy
 
-.PHONY: help build test local report up down clean
+.PHONY: help build test smoke local report up down clean
 
 help:
 	@sed -n '8,13p' $(MAKEFILE_LIST)
@@ -71,6 +72,16 @@ test:
 local: build
 	bench/zig-out/bin/bench suite --local --profile $(PROFILE) \
 	  --proxies $(LOCAL_PROXIES) --runid local-$$(date -u +%Y%m%d-%H%M%S)
+
+# A real ramp (30s, 200 -> 5000 req/s) sized for a machine that is also hosting
+# the proxy and the origin pool it measures. nginx and haproxy only: both are
+# stock images, so nothing is compiled. It exercises the HARNESS, not the
+# proxies — bring-up, the warm probe, the ramp, cAdvisor identity, teardown,
+# report. It is NOT a measurement, and profile.zig has a test asserting it can
+# never quietly become one.
+smoke: build
+	bench/zig-out/bin/bench suite --local --profile smoke \
+	  --proxies nginx,haproxy --runid smoke-$$(date -u +%Y%m%d-%H%M%S)
 
 report:
 	cd bench && $(ZIG) build --system $(ZIG_PKG)
