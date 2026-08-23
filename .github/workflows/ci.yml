@@ -223,28 +223,57 @@ jobs:
           ./bin/bench notify "results/ci-${{ github.run_id }}" --dry-run
 
       # A report that renders is not the same as a report with numbers in it. A
-      # proxy that never served a request still produces a file.
+      # proxy that never served a request still produces a file — and a turn
+      # that served every request but lost its CPU/memory still produces a
+      # report with a dash in the memory column.
+      #
+      # Both are checked, and both are fatal. `status: degraded` is the
+      # suite's own verdict on a turn whose record is incomplete; letting it
+      # pass here would mean this job's comment claims to cover "cAdvisor
+      # identity" while a run with zero cAdvisor samples goes green. That is
+      # precisely how the chunked-body bug survived: recorded honestly every
+      # time, and never once failing anything.
       - name: The run actually measured something
         run: |
           set -euo pipefail
-          rj="results/ci-${{ github.run_id }}/smoke/report.json"
-          test -s "$rj" || { echo "::error::no report.json"; exit 1; }
-          test -s "results/ci-${{ github.run_id }}/smoke/report.html"
-          python3 - "$rj" <<'PY'
-          import json, sys
-          d = json.load(open(sys.argv[1]))
+          d="results/ci-${{ github.run_id }}/smoke"
+          test -s "$d/report.json" || { echo "::error::no report.json"; exit 1; }
+          test -s "$d/report.html"
+          test -s "$d/profile.json" || { echo "::error::no profile.json"; exit 1; }
+          python3 - "$d" <<'PY'
+          import json, pathlib, sys
+          d = pathlib.Path(sys.argv[1])
+          report = json.loads((d / "report.json").read_text())
+          profile = json.loads((d / "profile.json").read_text())
+
+          bad = []
+
           # report.json lists only proxies that produced artifacts, so a missing
           # name here means that proxy's turn never got as far as a ramp.
-          proxies = d.get("proxies") or []
+          proxies = report.get("proxies") or []
           names = sorted(p.get("name") for p in proxies)
           print("proxies in report:", names)
           if names != ["haproxy", "nginx"]:
-              sys.exit(f"expected both proxies, got {names}")
+              bad.append(f"expected both proxies, got {names}")
+
           for p in proxies:
               print(f"  {p['name']}: sustained={p.get('sustained')} "
-                    f"p50={p.get('latency_ms', {}).get('p50')}")
+                    f"p50={p.get('latency_ms', {}).get('p50')} mem={p.get('mem')}")
               if not p.get("sustained"):
-                  sys.exit(f"{p['name']} sustained no load — the ramp did not run")
+                  bad.append(f"{p['name']} sustained no load — the ramp did not run")
+
+          # The suite's own per-turn verdict. `notes` says what it objected to.
+          for name, t in sorted((profile.get("proxies") or {}).items()):
+              print(f"  {name}: status={t.get('status')} "
+                    f"cadvisor_samples={t.get('cadvisor_samples')} notes={t.get('notes')}")
+              if t.get("status") != "ok":
+                  bad.append(f"{name} turn is {t.get('status')}: {t.get('notes')}")
+
+          if bad:
+              for b in bad:
+                  print(f"::error::{b}")
+              sys.exit(1)
+          print("all turns ok")
           PY
 
       # The artifacts are the whole point of a failure here: profile.json says
