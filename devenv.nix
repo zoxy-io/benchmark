@@ -1,19 +1,20 @@
 { pkgs, ... }:
 
 {
-  # The project's .env is sourced by scripts/*.sh and auto-loaded by docker
-  # compose, and the ramp parameters are compiled into bench/src/profile.zig —
-  # so we deliberately do NOT pre-load it into the shell (just quiet the hint).
+  # Nothing here reads a .env any more: the ramp parameters are compiled into
+  # bench/src/profile.zig, and the shell scripts that used to source one were
+  # deleted with the bash driver (750f679). The hint is quieted rather than the
+  # file being honoured.
   dotenv.disableHint = true;
 
-  # Toolchain the Makefile and scripts/ shell out to. Docker itself is left to
-  # the host (it needs a running daemon); everything else is pinned here so a
-  # fresh checkout can `make cloud-bench` / `make report` without manual installs.
+  # Toolchain the Makefile shells out to. Docker itself is left to the host (it
+  # needs a running daemon); everything else is pinned here so a fresh checkout
+  # can `make build` / `make test` / `make report` without manual installs.
   packages = [
     pkgs.gnumake      # make — the entrypoint for every workflow
     pkgs.opentofu     # `tofu` — cloud/ terraform (Makefile TF ?= tofu)
     pkgs.openssh      # ssh/scp to the cloud fleet
-    pkgs.curl         # health checks in scripts/*.sh
+    pkgs.curl         # poking at a proxy by hand behind `make up`
     pkgs.zig_0_16     # bench cross-compiles to a static
                       # musl binary every run (it embeds zrk's runner.run as a
                       # library, see its main.zig); pin the exact attr, not

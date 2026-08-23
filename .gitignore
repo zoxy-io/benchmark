@@ -22,11 +22,14 @@ devenv.local.nix
 # direnv
 .direnv
 
-# zig build artifacts — build.zig.zon pins the zrk/zio deps, so no committed
-# lockfile-equivalent is needed beyond that. zig-pkg/ is a local `--system`
-# package dir (vendored copies of the pinned deps), not source.
+# zig build artifacts — build.zig.zon pins the zrk/zio deps by url AND hash, so
+# no committed lockfile-equivalent is needed beyond that.
 bench/.zig-cache/
 bench/zig-out/
+# Vestigial. Nothing builds against this any more: the Makefile used to pass
+# `--system zig-pkg` while CI did not, and no target or doc ever created it, so
+# zig silently fell back to the global cache. Still ignored because the
+# directory exists on machines that hand-populated it once; safe to delete.
 bench/zig-pkg/
 
 # rust build artifacts (proxies/pingora) — Cargo.toml floats on "0.8", no
