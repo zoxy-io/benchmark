@@ -20,17 +20,27 @@
     // timeouts expiring together submit thousands of cancels against a
     // 256-entry ring) and it wedged a nightly run for 115 minutes. Filed as
     // lalinsky/zio#623, fixed upstream in #628 ("flush a full submission
-    // queue instead of dropping SQEs", merged as b822fda). Not yet in a
-    // tagged zio release (v0.16.0 predates the fix), so this pins the commit
-    // directly rather than a tag — same as the fork pin did.
+    // queue instead of dropping SQEs", merged as b822fda).
+    //
+    // That fix is still here: df666c2 is v0.17.0 plus #699, 121 commits ahead
+    // of b822fda and zero behind, checked with `compare/b822fda...df666c2`
+    // before moving. "The fix is still in there" is exactly the assumption a
+    // bump is where you lose.
+    //
+    // zrk **v2.1.0 and not v2.0.0**: the tag one would reach for predates
+    // zoxy-io/zrk#53 and pins BoringSSL, while zoxy pins OpenSSL. The two
+    // repositories must agree here — a local band and a fleet number off
+    // different generators are not comparable — and zoxy cannot take v2.0.0,
+    // because its profile harness links both the zrk and zoxy modules and
+    // would get two libcryptos. 2.1.0 is the swap.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.4.1#b2b7ddaa0b125817ea105f258710563f65d42bdc",
-            .hash = "zrk-1.4.1-WqdFO0rIBAABbP3sI9jkhfqcIn4ZQM2zQ2HL9eh4KaAP",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.1.0#a47c02d628064dc1d6285fb5d42bdf90ce407b41",
+            .hash = "zrk-2.1.0-WqdFO1rQBQA9vPHaywTYs1dBhnCIP_h2Wn06dGSD3uxa",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#b822fda55af546ce47918776950338cdf23315c0",
-            .hash = "zio-0.16.0-xHbVVJqoJADE1sz0O0ssHXOjaYODH86TWCUG9Pg4N69C",
+            .url = "git+https://github.com/lalinsky/zio?ref=main#df666c286380bf513dfe843f65a8133207ad7373",
+            .hash = "zio-0.17.0-xHbVVJPWJwBY3c_AkOFjUCF_pTIMnMc7ia9ujTjAfsbk",
         },
     },
     .paths = .{

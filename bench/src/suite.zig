@@ -1760,7 +1760,7 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
         var w = stream.writer(io, &wbuf);
         var rbuf: [1024]u8 = undefined;
         var r = stream.reader(io, &rbuf);
-        return probeExchange(&w.interface, &r.interface, path, null);
+        return probeExchange(&w.interface, &r.interface, path);
     }
 
     // zrk's own TLS transport, not a second implementation of one: the ramp
@@ -1778,8 +1778,12 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
     // a chain to trust nor a name to match. This is the same setting the ramp
     // runs under — `ramp.run` sets `cfg.insecure` from the profile — so the
     // probe cannot accept a handshake the measurement would reject.
-    try st.handshake(io, gpa, stream, tls_probe_host, true, null);
-    return probeExchange(st.writer(), st.reader(), path, st);
+    // `alpn_http1` — zrk 2.x offers ALPN, and this probe speaks HTTP/1.1.
+    // Offering what the ramp offers keeps the probe unable to accept a
+    // handshake the measurement would reject, which is the point of the
+    // `insecure` note above.
+    try st.handshake(io, gpa, stream, tls_probe_host, true, null, zrk.tls.alpn_http1);
+    return probeExchange(st.writer(), st.reader(), path);
 }
 
 /// The name offered as SNI, and never verified.
@@ -1792,20 +1796,23 @@ const tls_probe_host = "bench";
 
 /// One request/response over whichever transport the caller opened.
 ///
-/// `tls` is the state behind `w` when the transport is TLS, and it is passed
-/// for one reason: TWO writers have to be flushed, not one. Flushing the TLS
-/// writer only ENCRYPTS the request into the socket writer's buffer — the
-/// ciphertext does not reach the wire until that writer is flushed as well.
-/// Miss the second flush and the handshake still completes, so everything looks
-/// healthy right up until nothing arrives: four of the five proxies close the
-/// connection and haproxy answers `408 Request Time-out`, which is exactly what
-/// this probe did to every proxy in the first c1k-tls run. zrk's own
-/// connection.zig does both flushes for the same reason (its comment: "the
-/// underlying stream writer must be flushed to actually send the ciphertext").
-fn probeExchange(w: *Io.Writer, r: *Io.Reader, path: []const u8, tls: ?*zrk.tls.State) !void {
+/// One flush, as of zrk 2.x. It used to be two, and the reason is worth keeping
+/// because the failure was invisible: under `std.crypto.tls` the TLS writer
+/// only ENCRYPTED into a socket writer's buffer, so ciphertext did not reach
+/// the wire until that second writer was flushed too. Miss it and the handshake
+/// still completes — everything looks healthy right up until nothing arrives.
+/// Four of the five proxies closed the connection and haproxy answered `408
+/// Request Time-out`, which is what this probe did to every proxy in the first
+/// c1k-tls run.
+///
+/// zrk 2.0.0 moved to ztls, whose std.Io integration writes to the socket
+/// itself, so there is no second buffer to forget; zrk's own connection.zig
+/// dropped its matching double flush in the same change. `State` no longer
+/// exposes a `swriter` at all, which is how this was found rather than
+/// silently kept.
+fn probeExchange(w: *Io.Writer, r: *Io.Reader, path: []const u8) !void {
     try w.print("GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n", .{path});
     try w.flush();
-    if (tls) |st| try st.swriter.interface.flush();
 
     const line = try r.takeDelimiterInclusive('\n');
     // Only a 2xx counts. A proxy that is up but whose origin is dead answers
