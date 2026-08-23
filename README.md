@@ -85,12 +85,14 @@ on the schedule; pass `profiles: c1k,c1k-tls,c10k` on a manual dispatch to run
 | `c1k` | 1 000 | plaintext | — | yes (default) | how fast is each proxy at a healthy concurrency |
 | `c1k-tls` | 1 000 | TLS 1.3 | — | yes (default) | what terminating TLS costs each proxy — `c1k` with TLS on and nothing else changed |
 | `c10k` | 10 000 | plaintext | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
+| `smoke` | 50 | plaintext | — | never | **not a measurement** — the CI gate. A 30 s, 200→5 000 req/s ramp that exists so a push can prove the harness still runs end-to-end without paying for a fleet. Its ramp shape deliberately matches no other profile, so its numbers cannot be plotted against a real one; `profile.zig` has a test asserting that stays true. |
 
 Locally you can work on everything except the load generation itself:
 
 ```sh
 make build     # the bench binary (static musl)
 make test      # unit tests
+make smoke     # a ~90s end-to-end run of the whole suite, 2 proxies
 make local     # a whole run on THIS machine — see the caveat below
 make report    # re-render a run dir:  make report RUN=results/latest PROFILE=c1k
 make up/down   # the backend origin pool, for poking at a proxy by hand

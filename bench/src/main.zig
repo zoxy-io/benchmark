@@ -36,7 +36,7 @@ pub const index = @import("index.zig");
 const usage =
     \\usage: bench <command> [options]
     \\
-    \\  suite   --profile <c1k|c10k> [--proxies a,b,c] [--local]
+    \\  suite   --profile <c100|c1k|c1k-tls|c10k|smoke> [--proxies a,b,c] [--local]
     \\                                                   run the suite
     \\  report  <rundir>                                 render report.json + report.html
     \\  index   <rundir>                                 build the Pages site

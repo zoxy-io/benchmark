@@ -378,13 +378,57 @@ pub const c10k: Profile = .{
     },
 };
 
+/// The CI gate: a real ramp, small enough to run on a shared GitHub runner.
+///
+/// This profile exists so that `zig build test` is not the only thing standing
+/// between a broken `suite.zig` and a wasted night. It drives the entire
+/// production path — compose bring-up, the warm probe, `zrk.runner.run`, the
+/// cAdvisor poller, teardown, `report`, `index`, `notify` — in about 35 seconds
+/// per proxy, against the two stock-image proxies that need no `docker build`.
+///
+/// **It is not a measurement, and it is structurally incapable of becoming
+/// one.** Every other profile shares one `start_rate`/`max_rate`/`ramp_seconds`
+/// so their offered axes line up and their points can go on one chart; this one
+/// deliberately does not, which is what makes a `smoke` number uncomparable to
+/// anything by construction rather than by convention. On top of that it only
+/// ever runs under `--local` (the CI job passes `--local`), and a local run is
+/// already recorded `fleet: local`, banner-marked in the report, and refused by
+/// the trend chart.
+///
+/// The rates are sized for a 4-core GitHub runner sharing itself with two
+/// containers and the generator: 5 000 req/s peak, not 100 000. A gate that
+/// flakes because the runner could not offer the load is a gate that gets
+/// disabled.
+pub const smoke: Profile = .{
+    .name = "smoke",
+    .connections = 50,
+    // Two, not four: the runner has 4 cores total and is also hosting the
+    // proxy and the origin pool it is measuring.
+    .threads = 2,
+    .start_rate = 200,
+    .max_rate = 5_000,
+    .ramp_seconds = 30,
+    .timeout_s = 1,
+    .deadline_ms = 0,
+    .req_path = "/1k",
+    // t=11.25s on this ramp — clear of the t>=3 warmup exclusion, and far
+    // enough from the end that the +/-20% band is whole.
+    .ref_rate = 2000,
+    .ref_band = 0.20,
+    // Two seconds. The cooldown exists to let a proxy's connections drain
+    // before the next turn's container starts; there is no next turn worth
+    // eight seconds of CI wall clock here.
+    .cooldown_s = 2,
+    .proxy_env = &.{},
+};
+
 /// APPEND-ONLY, and the reason is `suite.proxyPort`: it keys each profile's
 /// block of per-turn host ports off this array's index, so inserting a profile
 /// anywhere but the end renumbers every profile after it. Ports are per
 /// (profile, proxy) turn precisely so no turn ever rebinds a port a previous
 /// turn used (runs #25/#26), and a renumbering would hand tonight's turns ports
 /// that an earlier turn in the same dispatch had already served load on.
-pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls };
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -484,6 +528,19 @@ test "profile.all is append-only, because proxyPort keys off its index" {
     try std.testing.expectEqualStrings("c1k", all[1].name);
     try std.testing.expectEqualStrings("c10k", all[2].name);
     try std.testing.expectEqualStrings("c1k-tls", all[3].name);
+    try std.testing.expectEqualStrings("smoke", all[4].name);
+}
+
+test "smoke shares no ramp shape with a published profile" {
+    // The guard on the CI gate. `smoke` is the one profile whose offered axis
+    // is deliberately different, so a number from it cannot be plotted against
+    // a real one by accident — and this fails the moment someone "fixes" it to
+    // match, which would make it silently comparable.
+    for (all) |p| {
+        if (std.mem.eql(u8, p.name, "smoke")) continue;
+        try std.testing.expect(p.max_rate != smoke.max_rate or
+            p.ramp_seconds != smoke.ramp_seconds);
+    }
 }
 
 test "validate rejects the misconfigurations the env plumbing used to allow" {
@@ -521,6 +578,11 @@ test "c10k carries the deadline SLO and c1k does not" {
 
 test "profiles share one ramp shape so the offered axis is comparable" {
     for (all) |p| {
+        // `smoke` is the deliberate exception and the only one allowed: it is
+        // the CI gate, it runs only under `--local`, and its whole point is to
+        // finish in seconds rather than to produce a comparable number. The
+        // companion test below asserts it stays incomparable.
+        if (std.mem.eql(u8, p.name, smoke.name)) continue;
         try std.testing.expectEqual(start_rate, p.start_rate);
         try std.testing.expectEqual(max_rate, p.max_rate);
         try std.testing.expectEqual(ramp_seconds, p.ramp_seconds);
