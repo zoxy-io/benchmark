@@ -98,18 +98,15 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // The `Allocating` itself is arena-ALLOCATED, not a stack local whose
-        // buffer happens to come from the arena. `http.fetch` hands this
-        // pointer to a thread it may abandon, and a stack local would leave
-        // that thread writing into `get`'s dead frame. `wait`'s arena lives
-        // for the whole poll loop and is never reset mid-loop, so the memory
-        // is simply never reused before the process exits.
-        const body = try arena.create(std.Io.Writer.Allocating);
-        body.* = .init(arena);
+        // A plain local. This used to be arena-ALLOCATED because `http.fetch`
+        // handed the pointer to a thread it might abandon, which would have
+        // left that thread writing into this dead frame. `fetch` cancels and
+        // joins now, so nothing outlives the call.
+        var body: std.Io.Writer.Allocating = .init(arena);
         const res = try http.fetch(self.gpa, self.io, .{
             .url = url,
             .authorization = auth,
-            .sink = .{ .collect = body },
+            .sink = .{ .collect = &body },
             .what = key,
         }) orelse return error.RequestTimedOut;
         if (res.status == .not_found) return null;
@@ -155,13 +152,11 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // Arena-ALLOCATED, not a stack local; see the comment in `get` above.
-        const body = try arena.create(std.Io.Writer.Allocating);
-        body.* = .init(arena);
+        var body: std.Io.Writer.Allocating = .init(arena);
         const res = try http.fetch(self.gpa, self.io, .{
             .url = url,
             .authorization = auth,
-            .sink = .{ .collect = body },
+            .sink = .{ .collect = &body },
             .what = "list instances",
         }) orelse return error.RequestTimedOut;
         if (res.status != .ok) return error.ListInstancesFailed;
