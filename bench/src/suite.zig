@@ -185,20 +185,19 @@ const deadline = struct {
         + warm_probe // first 200
         + cadvisor_warm // cAdvisor discovery head start, before the ramp
         + teardown // after runOne returns, still inside the window
-        // Every `deadline.inspect`-bounded probe runOne can make in one turn,
-        // counted for the WORST case, which is zoxy — two of the six are only
-        // asked of it. In order: sockets before start, the leftover/identity
-        // container check, the image's build descriptor, zoxy's baked commit,
-        // the running proxy's version, and zoxy's access-log drop counter.
-        //
-        // This read `4 * inspect` while the code made six such calls: the
-        // commit probe was added without bumping it, and the drop counter would
-        // have been the second. Undercounting here is exactly the run #24
-        // failure mode — the watchdog wins a race it should always lose and one
-        // slow proxy takes every proxy after it — so it is worth re-counting
-        // this list whenever a probe is added, not just believing the comment.
-        + 6 * inspect
-        + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
+            // Every `deadline.inspect`-bounded probe runOne can make in one turn,
+            // counted for the WORST case, which is zoxy — two of the six are only
+            // asked of it. In order: sockets before start, the leftover/identity
+            // container check, the image's build descriptor, zoxy's baked commit,
+            // the running proxy's version, and zoxy's access-log drop counter.
+            //
+            // This read `4 * inspect` while the code made six such calls: the
+            // commit probe was added without bumping it, and the drop counter would
+            // have been the second. Undercounting here is exactly the run #24
+            // failure mode — the watchdog wins a race it should always lose and one
+            // slow proxy takes every proxy after it — so it is worth re-counting
+            // this list whenever a probe is added, not just believing the comment.
+        + 6 * inspect + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
     }
 };
 
@@ -2428,7 +2427,6 @@ test "proxyPort never repeats within one suite dispatch, including a proxy's own
         }
     }
 }
-
 
 test "nowIso produces a sortable UTC stamp" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

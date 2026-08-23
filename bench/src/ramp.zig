@@ -144,14 +144,11 @@ fn onProgress(
         "bench: [{s}] t={d:.0}s done={d} rate={d:.0}/s " ++
             "status={d} connect={d} read={d} write={d} timeout={d} deadline={d}",
         .{
-            ctx.name,          elapsed_s,
-            done,              rate,
-            snapshot.counters.status_errors,
-            snapshot.counters.connect_errors,
-            snapshot.counters.read_errors,
-            snapshot.counters.write_errors,
-            snapshot.counters.timeouts,
-            snapshot.counters.deadline_errors,
+            ctx.name,                        elapsed_s,
+            done,                            rate,
+            snapshot.counters.status_errors, snapshot.counters.connect_errors,
+            snapshot.counters.read_errors,   snapshot.counters.write_errors,
+            snapshot.counters.timeouts,      snapshot.counters.deadline_errors,
         },
     );
     ctx.last_log_s = elapsed_s;
@@ -395,9 +392,18 @@ pub fn coverage(o: Outcome) f64 {
 
 test "coverage classifies a truncated run" {
     const full: Outcome = .{
-        .elapsed_s = 300, .configured_s = 300, .launched = 1000, .interrupted = false,
-        .completed = 0, .status_errors = 0, .socket_errors = 0, .deadline_errors = 0,
-        .max_behind_ns = 0, .saturated = false, .identity_error = false, .cadvisor_samples = 0,
+        .elapsed_s = 300,
+        .configured_s = 300,
+        .launched = 1000,
+        .interrupted = false,
+        .completed = 0,
+        .status_errors = 0,
+        .socket_errors = 0,
+        .deadline_errors = 0,
+        .max_behind_ns = 0,
+        .saturated = false,
+        .identity_error = false,
+        .cadvisor_samples = 0,
     };
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), coverage(full), 1e-9);
 
@@ -411,7 +417,6 @@ test "coverage classifies a truncated run" {
     stub.elapsed_s = 20;
     try std.testing.expect(coverage(stub) < min_coverage);
 }
-
 
 // --- child/parent Outcome hand-off -----------------------------------------
 //
@@ -432,10 +437,10 @@ pub fn renderOutcome(w: *std.Io.Writer, o: Outcome) !void {
             "\"socket_errors\":{d},\"deadline_errors\":{d},\"max_behind_ns\":{d}," ++
             "\"saturated\":{},\"identity_error\":{},\"cadvisor_samples\":{d}}}",
         .{
-            o.elapsed_s,      o.configured_s,   o.launched,
-            o.interrupted,    o.completed,      o.status_errors,
-            o.socket_errors,  o.deadline_errors, o.max_behind_ns,
-            o.saturated,      o.identity_error, o.cadvisor_samples,
+            o.elapsed_s,     o.configured_s,    o.launched,
+            o.interrupted,   o.completed,       o.status_errors,
+            o.socket_errors, o.deadline_errors, o.max_behind_ns,
+            o.saturated,     o.identity_error,  o.cadvisor_samples,
         },
     );
 }

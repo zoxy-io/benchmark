@@ -302,14 +302,14 @@ fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     // fact that `<dir>` must be the PROFILE directory, not the run directory.
     const meta = readProfileMeta(arena, io, run_dir) catch
         readMeta(arena, io, run_dir) catch {
-            std.debug.print(
-                "bench report: no profile.json in {s} — this profile produced no artifacts " ++
-                    "(a run that was cut short), or <dir> is the run directory rather than " ++
-                    "<run>/<profile>\n",
-                .{run_dir},
-            );
-            exit(2);
-        };
+        std.debug.print(
+            "bench report: no profile.json in {s} — this profile produced no artifacts " ++
+                "(a run that was cut short), or <dir> is the run directory rather than " ++
+                "<run>/<profile>\n",
+            .{run_dir},
+        );
+        exit(2);
+    };
     const ordered = try report.orderPresent(arena, meta.proxies);
 
     const inputs = try arena.alloc(report.ProxyInput, ordered.len);
