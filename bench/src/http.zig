@@ -301,7 +301,14 @@ pub fn fetch(gpa: Allocator, io: Io, req: Request) !?Response {
         return null;
     };
     const fetched = try result;
-    if (req.sink == .stream) req.sink.stream.finish();
+    if (req.sink == .stream) {
+        // std.http.Client writes the body into `response_writer` but does not
+        // flush it, so the tail of the last read sits in the sink's buffer
+        // until asked for. `LineSink.drain` cannot fail, so neither can this.
+        const s = req.sink.stream;
+        s.writer.flush() catch {};
+        s.finish();
+    }
     return .{ .status = fetched.status };
 }
 

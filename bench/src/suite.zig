@@ -1470,7 +1470,7 @@ fn runOne(
         // doc comment for why — a miss here just gets logged, never fails
         // the turn.
         if (cadvisor_addr) |addr| {
-            if (!cadvisor.waitUntilFound(probe_io, addr, name, deadline.cadvisor_warm, cadvisor.scrape_connect_timeout)) {
+            if (!cadvisor.waitUntilFound(gpa, probe_io, addr, name, deadline.cadvisor_warm, cadvisor.scrape_deadline_ns)) {
                 redact.log(
                     "bench: [{s}] cadvisor had not reported this container after {d}s; CPU/mem may be absent for this ramp",
                     .{ name, deadline.cadvisor_warm / std.time.ns_per_s },
@@ -1744,6 +1744,14 @@ fn warmProbe(gpa: Allocator, io: Io, target: []const u8, name: []const u8) !void
     return error.WarmProbeFailed;
 }
 
+/// Bounds `probeOnce`'s connect. This used to be `cadvisor.scrape_connect_timeout`,
+/// borrowed because it bounded exactly this; `cadvisor.scrape` now carries a
+/// whole-request deadline rather than a connect timeout, so the constant lives
+/// with its only remaining user.
+const probe_connect_timeout: Io.Timeout = .{
+    .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake },
+};
+
 fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_tls: bool) !void {
     // Bounded the same way and for the same reason as cadvisor.scrape's
     // connect: `warmProbe`'s own elapsed-vs-`deadline.warm_probe` check above
@@ -1751,7 +1759,7 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
     // this proxy's whole turn on a single hung attempt, same class of failure
     // that cost entire nightly runs before cadvisor.zig's fix. Reusing
     // cadvisor's constant rather than a second magic number for the same bound.
-    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = cadvisor.scrape_connect_timeout });
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = probe_connect_timeout });
     defer stream.close(io);
 
     if (!use_tls) {

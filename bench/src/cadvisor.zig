@@ -25,6 +25,7 @@
 //! seeing the wrong name — or seeing two proxies at once — is unambiguous.
 
 const std = @import("std");
+const http = @import("http.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -83,135 +84,92 @@ pub const Observation = struct {
 };
 
 /// One scrape: GET /metrics and pick out the two series we need.
+/// One scrape: GET /metrics and pick out the two series we need.
 ///
-/// Deliberately a hand-rolled plain-HTTP request over std.Io.net rather than
-/// std.http.Client: cAdvisor is plain HTTP on a private address with no
-/// redirects and no TLS, the exposition is ~200 KB of text we want to stream
-/// past rather than buffer, and this avoids depending on std.http.Client
-/// behaving on zio's Io (it is well-trodden only on std.Io.Threaded).
+/// Goes through `http.fetch` with a streaming sink, which is what makes the
+/// framing somebody else's problem. This used to parse the socket by hand, and
+/// spent months asking for HTTP/1.1 while reading the chunked body as plain
+/// text: every 2 KiB, a hex chunk-size line was spliced into whatever metric
+/// line straddled that offset, destroying it. Which series died depended on
+/// byte offsets that hold still for one exposition layout and shift between
+/// runs, so a container could be invisible for an entire ramp while docker and
+/// curl both listed it.
+///
+/// `Sink.stream` keeps the property that motivated the hand-rolled version:
+/// the exposition is parsed a line at a time out of the transport's buffer and
+/// never accumulated, so a ~2 MB body costs one line of memory inside the load
+/// generator's own process.
 pub fn scrape(
+    gpa: Allocator,
     io: Io,
     addr: net.IpAddress,
     proxy: []const u8,
-    fd_slot: ?*std.atomic.Value(i32),
-    connect_timeout: Io.Timeout,
+    deadline_ns: u64,
 ) !Observation {
-    // `connect_timeout` is caller-supplied, not hardcoded here: `Io.Threaded`
-    // panics outright on any non-`.none` timeout ("TODO implement
-    // netConnectIpPosix with timeout" — see suite.zig's `deadline.warm_probe`),
-    // so callers under test pass `.none` and production callers (zio's real
-    // Runtime, which has supported this since zio#230) pass a real bound.
-    //
-    // Bounding it at all matters: `active_fd`/`interrupt()` below can only
-    // unblock a scrape stuck in a READ (the fd is published after connect()
-    // returns), not one stuck IN connect() itself — and a cAdvisor that never
-    // resolves, rather than one that answers slowly, hangs there. That gap
-    // cost entire nightly runs (envoy, intermittently): `interrupt()` is a
-    // no-op while `fd_slot` still reads -1, so `poll_group.cancel` in
-    // ramp.run waited on a connect() that would never return, until the
-    // whole-process `ProxyWatchdog` killed the run ~30 minutes later.
-    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = connect_timeout });
-    defer stream.close(io);
-    // Publish the socket so `interrupt` can unblock a read that never returns.
-    // Declared after the close defer so it runs BEFORE it: the fd is cleared
-    // while it is still valid, never after it could have been reused.
-    if (fd_slot) |slot| slot.store(@intCast(stream.socket.handle), .release);
-    defer if (fd_slot) |slot| slot.store(-1, .release);
+    // `{f}` on an IpAddress prints `host:port`, which is exactly a URL
+    // authority — for IPv4. An IPv6 literal would need brackets here; every
+    // address this is called with is the proxy host's v4.
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{f}/metrics", .{addr});
 
-    {
-        var wbuf: [512]u8 = undefined;
-        var w = stream.writer(io, &wbuf);
-        // HTTP/1.0, deliberately, and not a style choice. Under HTTP/1.1 Go
-        // answers this with `Transfer-Encoding: chunked` in 2 KiB chunks, and
-        // the loop below reads the body as raw text — it has no chunk
-        // decoder. Every 2048th byte therefore splices a hex chunk-size line
-        // into whatever metric line straddles that offset, and that series is
-        // destroyed. Measured against cAdvisor v0.52.1: 523 chunk markers and
-        // 67 of 78 CPU series intact under 1.1, versus 0 markers and 78 of 78
-        // under 1.0.
-        //
-        // Which series is lost depends only on its byte offset, so it is
-        // stable for the life of one exposition layout and shifts between
-        // runs. That is exactly the failure this file used to blame on
-        // cAdvisor being slow to discover a container: on a GitHub runner it
-        // cost roughly half of all turns their CPU and memory, with cAdvisor
-        // publishing the container correctly the whole time.
-        //
-        // HTTP/1.0 has no chunked encoding, so the body runs to the close —
-        // which is the framing this reader already assumes.
-        try w.interface.print(
-            "GET /metrics HTTP/1.0\r\nHost: cadvisor\r\nAccept: text/plain\r\n\r\n",
-            .{},
-        );
-        try w.interface.flush();
-    }
+    var ctx: ScrapeCtx = .{ .proxy = proxy };
+    // 4 KiB is enough: raising this to 64 KiB was measured against a ~2 MB
+    // exposition and changed the sample count not at all, so the drain
+    // round-trips are not what a scrape spends its time on.
+    var stack_buf: [4096]u8 = undefined;
+    const buf = &stack_buf;
+    // One metric line's worth. cAdvisor's are a few hundred bytes; this is the
+    // same bound the hand-rolled reader used, and a line past it is dropped
+    // whole rather than truncated.
+    const carry = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(carry);
 
-    var rbuf: [16 * 1024]u8 = undefined;
-    var r = stream.reader(io, &rbuf);
-    const in = &r.interface;
+    var sink = http.LineSink.init(buf, carry, &ctx, ScrapeCtx.onLine);
+    const res = try http.fetch(gpa, io, .{
+        .url = url,
+        .sink = .{ .stream = &sink },
+        .deadline_ns = deadline_ns,
+        .what = "cadvisor scrape",
+    }) orelse return error.ScrapeTimedOut;
+    if (!res.ok()) return error.ScrapeStatus;
 
-    var obs: Observation = .{};
-    var seen_expected: usize = 0;
+    ctx.obs.found = ctx.seen_expected > 0;
+    return ctx.obs;
+}
 
-    // Response headers, consumed explicitly rather than left for the metric
-    // parser to ignore, so the guard below has somewhere to live. A server
-    // that chunks anyway must fail LOUDLY: silent corruption of a fraction of
-    // the series is what made the original bug survive a nightly run, a doc
-    // comment blaming cAdvisor, and two proxies' worth of missing memory.
-    while (true) {
-        const h = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => return error.ShortResponse,
-            else => return err,
-        };
-        const t = std.mem.trim(u8, h, " \t\r\n");
-        if (t.len == 0) break;
-        if (std.ascii.indexOfIgnoreCase(t, "transfer-encoding:") != null and
-            std.ascii.indexOfIgnoreCase(t, "chunked") != null)
-        {
-            return error.ChunkedResponse;
-        }
-    }
+/// Parse state for one scrape. Lives for the duration of `scrape` only; every
+/// slice handed to `onLine` is valid for that call alone, which is why
+/// `intruder` holds a `known_proxies` entry rather than the line's own bytes.
+const ScrapeCtx = struct {
+    proxy: []const u8,
+    obs: Observation = .{},
+    seen_expected: usize = 0,
 
-    // Stream line by line into a fixed buffer; nothing is accumulated, so a
-    // 200 KB exposition is parsed with zero allocation.
-    while (true) {
-        const line = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
-            // A metric line longer than the buffer is not one of ours; skip the
-            // oversized chunk rather than aborting the whole scrape.
-            error.StreamTooLong => {
-                _ = in.discardDelimiterInclusive('\n') catch break;
-                continue;
-            },
-            else => return err,
-        };
-
+    fn onLine(raw: *anyopaque, line: []const u8) void {
+        const self: *ScrapeCtx = @ptrCast(@alignCast(raw));
         if (parseMetric(line, "container_cpu_usage_seconds_total")) |m| {
             if (nameLabel(m.labels)) |n| {
-                if (std.mem.eql(u8, n, proxy)) {
+                if (std.mem.eql(u8, n, self.proxy)) {
                     // cAdvisor emits one series per cgroup hierarchy level; the
                     // named one is the container itself.
-                    obs.cpu_seconds_total += m.value;
-                    if (m.timestamp_ms) |ms| obs.cadvisor_ms = @max(obs.cadvisor_ms, ms);
-                    seen_expected += 1;
+                    self.obs.cpu_seconds_total += m.value;
+                    if (m.timestamp_ms) |ms| self.obs.cadvisor_ms = @max(self.obs.cadvisor_ms, ms);
+                    self.seen_expected += 1;
                 } else if (matchKnownProxy(n)) |static_name| {
-                    obs.intruder = static_name;
+                    self.obs.intruder = static_name;
                 }
             }
         } else if (parseMetric(line, "container_memory_working_set_bytes")) |m| {
             if (nameLabel(m.labels)) |n| {
-                if (std.mem.eql(u8, n, proxy)) {
-                    obs.mem_ws = @max(obs.mem_ws, @as(u64, @intFromFloat(m.value)));
+                if (std.mem.eql(u8, n, self.proxy)) {
+                    self.obs.mem_ws = @max(self.obs.mem_ws, @as(u64, @intFromFloat(m.value)));
                 } else if (matchKnownProxy(n)) |static_name| {
-                    obs.intruder = static_name;
+                    self.obs.intruder = static_name;
                 }
             }
         }
     }
-
-    obs.found = seen_expected > 0;
-    return obs;
-}
+};
 
 fn isKnownProxy(name: []const u8) bool {
     return matchKnownProxy(name) != null;
@@ -305,15 +263,16 @@ fn nameLabel(labels: []const u8) ?[]const u8 {
 /// one, so without it a single wedged connect() could hold this past
 /// `timeout_ns` indefinitely, same as `Poller.run`'s.
 pub fn waitUntilFound(
+    gpa: Allocator,
     io: Io,
     addr: net.IpAddress,
     proxy: []const u8,
     timeout_ns: u64,
-    connect_timeout: Io.Timeout,
+    per_scrape_ns: u64,
 ) bool {
     const started = Io.Timestamp.now(io, .awake);
     while (true) {
-        if (scrape(io, addr, proxy, null, connect_timeout)) |obs| {
+        if (scrape(gpa, io, addr, proxy, per_scrape_ns)) |obs| {
             if (obs.found) return true;
         } else |_| {}
         if (started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds >= timeout_ns) return false;
@@ -321,13 +280,25 @@ pub fn waitUntilFound(
     }
 }
 
-/// Bounds a single scrape's connect() (see `scrape`'s doc comment) — generous
-/// for what should be an instant local Docker-network HTTP GET, short enough
-/// that a black-holed peer now costs seconds instead of the ~30 minutes an
-/// unbounded connect() cost before this existed.
-pub const scrape_connect_timeout: Io.Timeout = .{
-    .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake },
-};
+/// Bounds a single scrape end to end — generous for what should be an instant
+/// local Docker-network HTTP GET, short enough that a black-holed peer costs
+/// seconds instead of the ~30 minutes an unbounded connect cost before any
+/// bound existed.
+///
+/// One number now covers connect, headers and body, because `http.fetch`
+/// cancels the whole request rather than bounding one syscall of it. That is
+/// what retired `Poller.active_fd`: a scrape can no longer block past this, so
+/// there is nothing left for an outside `shutdown()` to rescue.
+pub const scrape_deadline_ns: u64 = 5 * std.time.ns_per_s;
+
+/// One sampling period, measured start-of-scrape to start-of-scrape.
+///
+/// Deliberately NOT cAdvisor's own 1s housekeeping interval: polling exactly
+/// in step with it would alias, re-reading the same counter every time. This
+/// keeps the ~1.045s effective period the rate maths was characterised against
+/// (see `Sample.cadvisor_ms`), while no longer letting it drift with whatever a
+/// scrape happens to cost.
+pub const poll_period_ns: u64 = 1_050 * std.time.ns_per_ms;
 
 /// Samples one container for the length of a ramp, appending to `out`.
 ///
@@ -346,36 +317,12 @@ pub const Poller = struct {
     gpa: Allocator,
 
     stop: *std.atomic.Value(bool),
-    /// Socket of the scrape currently in flight, or -1.
-    ///
-    /// `stop` alone cannot end a scrape that is already blocked: the poller only
-    /// reads it between polls, and a scrape has neither a connect nor a read
-    /// timeout — so a cAdvisor that stops answering blocks the poller forever,
-    /// and `poll_group.cancel` in ramp.run then waits on it forever. That is a
-    /// stalled scrape costing the RUN, which is exactly what `scrape` promises
-    /// it cannot do.
-    ///
-    /// `interrupt` shuts this socket down from the outside, so the blocked read
-    /// returns and the poller unwinds on its own.
-    active_fd: std.atomic.Value(i32) = .init(-1),
     identity_error: std.atomic.Value(bool) = .init(false),
     scrape_failures: u32 = 0,
     /// cAdvisor was reachable and reported our container at least once. If this
     /// stays false the run produced no CPU/memory data at all, which the report
     /// must show as absent rather than as zero.
     ever_found: bool = false,
-
-    /// Force a scrape that is blocked in connect or read to return.
-    ///
-    /// Called by the caller AFTER setting `stop`, so the poller sees the flag on
-    /// its next pass and exits instead of retrying. `shutdown` rather than
-    /// `close`: the poller still owns the socket and will close it itself, and
-    /// closing an fd out from under a task in flight risks it being reused.
-    pub fn interrupt(self: *Poller) void {
-        const fd = self.active_fd.load(.acquire);
-        if (fd < 0) return;
-        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
-    }
 
     pub fn run(self: *Poller) void {
         // A counter needs two points to become a rate, and the first scrape
@@ -386,7 +333,7 @@ pub const Poller = struct {
             const now = Io.Timestamp.now(self.io, .awake);
             const t = @as(f64, @floatFromInt(self.t0.durationTo(now).nanoseconds)) / std.time.ns_per_s;
 
-            if (scrape(self.io, self.addr, self.proxy, &self.active_fd, scrape_connect_timeout)) |obs| {
+            if (scrape(self.gpa, self.io, self.addr, self.proxy, scrape_deadline_ns)) |obs| {
                 if (obs.intruder) |other| {
                     // A container for a DIFFERENT proxy is live while this one
                     // is being measured. Whatever is answering :8080 may not be
@@ -415,7 +362,16 @@ pub const Poller = struct {
                 self.scrape_failures += 1;
             }
 
-            self.io.sleep(.fromNanoseconds(std.time.ns_per_s), .awake) catch break;
+            // Sleep the REMAINDER of the period, not a flat second. The period
+            // used to be "one second plus however long a scrape took", so the
+            // sampling cadence moved with the cost of parsing an exposition:
+            // switching to `http.fetch` slowed a scrape by ~80 ms and silently
+            // cost every ramp two of its 28 samples. Sampling rate is a
+            // property of the measurement, not of the HTTP client underneath
+            // it.
+            const spent = now.durationTo(Io.Timestamp.now(self.io, .awake)).nanoseconds;
+            const remaining = poll_period_ns -| @as(u64, @intCast(@max(spent, 0)));
+            self.io.sleep(.fromNanoseconds(remaining), .awake) catch break;
         }
     }
 };
@@ -676,11 +632,16 @@ test "waitUntilFound gives up after its bound against an address nothing answers
 
     // A closed local port: connect() fails immediately (ECONNREFUSED), so
     // this exercises the "never found, must eventually give up" path without
-    // actually waiting out a long timeout. `.none`: `Io.Threaded` panics
-    // outright on any other value (see `scrape`'s doc comment) and a fast
-    // ECONNREFUSED never needs the bound anyway.
+    // actually waiting out a long timeout.
     const addr = try net.IpAddress.parse("127.0.0.1", 1);
-    const found = waitUntilFound(io, addr, "zoxy", 300 * std.time.ns_per_ms, .none);
+    const found = waitUntilFound(
+        std.testing.allocator,
+        io,
+        addr,
+        "zoxy",
+        300 * std.time.ns_per_ms,
+        scrape_deadline_ns,
+    );
     try std.testing.expect(!found);
 }
 
@@ -702,17 +663,17 @@ test "isKnownProxy covers the comparison set" {
     try std.testing.expect(!isKnownProxy("cadvisor"));
 }
 
-test "a chunked response is rejected, not silently mis-parsed" {
-    // The bug this guards: `scrape` has no chunk decoder, so a chunked body
-    // splices a hex chunk-size line into whatever metric line straddles each
-    // 2 KiB boundary. Against cAdvisor v0.52.1 that destroyed 11 of 78 CPU
-    // series per scrape, and the series lost stayed lost for as long as the
-    // exposition's byte layout held — which read from outside as "cAdvisor
-    // never reported this container".
+test "a series split across chunk boundaries is still read" {
+    // The bug this pins: `scrape` used to read the body itself with no chunk
+    // decoder, so a hex chunk-size line was spliced into whatever metric line
+    // straddled each 2 KiB boundary. Against cAdvisor v0.52.1 that destroyed
+    // 11 of 78 CPU series per scrape, and the series lost stayed lost as long
+    // as the exposition's byte layout held — which read from outside as
+    // "cAdvisor never reported this container".
     //
-    // The request is HTTP/1.0 precisely so this cannot happen. This test
-    // proves the guard fires if a server chunks regardless, because the
-    // failure mode it replaces was silent.
+    // The series below is deliberately split ACROSS two chunks, at a point
+    // inside its own label set. Decoded, it is one line; read raw, it is two
+    // fragments with "1d" between them and parses as nothing.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -730,12 +691,16 @@ test "a chunked response is rejected, not silently mis-parsed" {
             defer stream.close(sio);
             var wbuf: [1024]u8 = undefined;
             var w = stream.writer(sio, &wbuf);
+            const part1 = "container_cpu_usage_seconds_total{cpu=\"total\",na";
+            const part2 = "me=\"zoxy\"} 0.5 1785556717668\n";
+            // Chunk sizes are computed, not hand-written in hex, so editing
+            // either half cannot silently desynchronise the framing.
             w.interface.print(
                 "HTTP/1.1 200 OK\r\n" ++
                     "Content-Type: text/plain\r\n" ++
                     "Transfer-Encoding: chunked\r\n\r\n" ++
-                    "1a\r\ncontainer_cpu_usage_secon\r\n0\r\n\r\n",
-                .{},
+                    "{x}\r\n{s}\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+                .{ part1.len, part1, part2.len, part2 },
             ) catch return;
             w.interface.flush() catch return;
         }
@@ -745,8 +710,11 @@ test "a chunked response is rejected, not silently mis-parsed" {
     defer group.cancel(io);
     group.async(io, Serve.run, .{ &server, io });
 
-    try std.testing.expectError(
-        error.ChunkedResponse,
-        scrape(io, bound, "zoxy", null, .none),
-    );
+    // Chunked framing is std.http.Client's job now, so a chunked response is
+    // simply decoded. What this pins is that the streaming sink sees the
+    // DECODED body: the series below is split across two chunks, and the old
+    // hand-rolled reader would have found a hex marker in the middle of it.
+    const obs = try scrape(std.testing.allocator, io, bound, "zoxy", 5 * std.time.ns_per_s);
+    try std.testing.expect(obs.found);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), obs.cpu_seconds_total, 1e-9);
 }
