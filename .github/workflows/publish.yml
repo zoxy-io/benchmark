@@ -87,12 +87,17 @@ jobs:
       # Native, unlike the nightly's build: that one cross-compiles a static
       # musl binary because it is SHIPPED to the loadgen VM. Nothing here
       # leaves the runner.
-      - name: Build bench
+      #
+      # `publish` builds bench-publish, not the full `bench`: this job only
+      # ever runs report/index/notify, never the fleet path (suite/remote/
+      # ramp/ycs), so there's no reason to pay to compile that here too. See
+      # bench/build.zig and bench/src/publish_main.zig.
+      - name: Build bench-publish
         working-directory: bench
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build publish -Doptimize=ReleaseFast
 
       - name: Stage the binary
-        run: install -D -m 0755 bench/zig-out/bin/bench "$BENCH"
+        run: install -D -m 0755 bench/zig-out/bin/bench-publish "$BENCH"
 
       # ----------------------------------------------------------- the data --
 
