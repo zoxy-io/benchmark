@@ -74,7 +74,7 @@ pub const Client = struct {
         const res = try http.fetch(self.gpa, self.io, .{
             .url = url,
             .method = .PUT,
-            .payload = body,
+            .body = .{ .bytes = body },
             .authorization = auth,
             .content_type = opts.content_type,
             .what = key,

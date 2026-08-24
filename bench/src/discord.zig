@@ -369,7 +369,7 @@ pub fn post(
         const outcome = http.fetch(gpa, io, .{
             .url = url,
             .method = .POST,
-            .payload = body,
+            .body = .{ .bytes = body },
             .content_type = ctype,
             .what = "Discord POST",
         }) catch |e| {

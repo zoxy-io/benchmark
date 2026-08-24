@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const zurl = @import("zurl");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -124,10 +125,10 @@ pub fn scrape(
     const carry = try gpa.alloc(u8, 16 * 1024);
     defer gpa.free(carry);
 
-    var sink = http.LineSink.init(buf, carry, &ctx, ScrapeCtx.onLine);
+    var sink = zurl.LineSink.init(buf, carry, &ctx, ScrapeCtx.onLine);
     const res = try http.fetch(gpa, io, .{
         .url = url,
-        .sink = .{ .stream = &sink },
+        .sink = .{ .lines = &sink },
         .deadline_ns = deadline_ns,
         .what = "cadvisor scrape",
     }) orelse return error.ScrapeTimedOut;
