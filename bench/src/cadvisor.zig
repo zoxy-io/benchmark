@@ -145,8 +145,10 @@ const ScrapeCtx = struct {
     obs: Observation = .{},
     seen_expected: usize = 0,
 
-    fn onLine(raw: *anyopaque, line: []const u8) void {
-        const self: *ScrapeCtx = @ptrCast(@alignCast(raw));
+    // `?*anyopaque` because zurl's LineSink allows a null context; this one
+    // always passes itself, so the unwrap below cannot fail.
+    fn onLine(raw: ?*anyopaque, line: []const u8) void {
+        const self: *ScrapeCtx = @ptrCast(@alignCast(raw.?));
         if (parseMetric(line, "container_cpu_usage_seconds_total")) |m| {
             if (nameLabel(m.labels)) |n| {
                 if (std.mem.eql(u8, n, self.proxy)) {

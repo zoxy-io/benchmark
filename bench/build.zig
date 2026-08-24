@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
 
     const zrk = b.dependency("zrk", .{ .target = target, .optimize = optimize });
     const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    // zurl replaces the hand-rolled std.http.Client wrapper src/http.zig used
+    // to be. It is std-only plus hparse, so it brings no second copy of zio
+    // or of a TLS stack into this graph -- which is the property its rule 6
+    // exists to guarantee, and the reason it can sit next to zrk here.
+    const zurl = b.dependency("zurl", .{ .target = target, .optimize = optimize });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -14,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zrk", .module = zrk.module("zrk") },
             .{ .name = "zio", .module = zio.module("zio") },
+            .{ .name = "zurl", .module = zurl.module("zurl") },
         },
     });
 
@@ -36,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zrk", .module = zrk.module("zrk") },
                 .{ .name = "zio", .module = zio.module("zio") },
+                .{ .name = "zurl", .module = zurl.module("zurl") },
             },
         }),
     });
