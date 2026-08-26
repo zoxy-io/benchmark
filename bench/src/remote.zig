@@ -311,7 +311,7 @@ pub const Ssh = struct {
             "-o",
             try std.fmt.allocPrint(arena, "UserKnownHostsFile={s}", .{self.known_hosts}),
             "-o",
-            "ConnectTimeout=10",
+            try std.fmt.allocPrint(arena, "ConnectTimeout={d}", .{connect_timeout_s}),
             "-o",
             "ServerAliveInterval=15",
             "-o",
@@ -360,6 +360,64 @@ fn printTail(arena: Allocator, label: []const u8, stream: []const u8) !void {
     std.debug.print("  [{s}] {s}\n", .{ label, redact.scrub(scrubbed, tail) });
 }
 
+/// How long ssh waits for a connection, and for the banner that follows it.
+///
+/// Named rather than inlined into `argv` because `connect_retry_budget_ns`
+/// below is derived from it: a failed connect costs at most this, and the
+/// suite's watchdog arithmetic needs that number to stay true.
+const connect_timeout_s: u64 = 10;
+
+/// Transport retries: attempts, and the wait between them.
+///
+/// The proxy VM's sshd goes away for a few seconds at a time — an apt upgrade
+/// restarting a socket-activated `ssh.socket` is the shape it has — and every
+/// control command that lands in that window used to be lost outright. Run
+/// 32885230435 (2026-08-25 18:41) is what that costs: haproxy's identity check
+/// got `Connection refused`, so did its teardown, the container was left
+/// running, and nginx and pingora then both aborted on `ForeignProxyRunning`.
+/// One refused connect, three proxies with no data, and a green workflow.
+pub const connect_attempts: u32 = 3;
+pub const connect_retry_backoff_ns: u64 = 5 * std.time.ns_per_s;
+
+/// The most wall clock retrying can add to ONE `check`, over its own deadline.
+///
+/// Only a connection that never came up is retried, and `ConnectTimeout` bounds
+/// exactly that — so a retried attempt costs the timeout, never the command's
+/// full deadline. Exported because `suite.deadline.turn` has to count it: a
+/// stage that can now run longer than the watchdog's sum was budgeted for is
+/// precisely the run #24 inversion, where the watchdog wins a race it should
+/// always lose and one slow proxy takes every proxy after it.
+pub const connect_retry_budget_ns: u64 =
+    (connect_attempts - 1) * (connect_timeout_s * std.time.ns_per_s + connect_retry_backoff_ns);
+
+/// Whether ssh failed BEFORE the remote command could have started.
+///
+/// This is the whole safety argument for retrying. Each of these three is
+/// emitted strictly pre-authentication — a refused or timed-out connect, a
+/// banner that never arrived, a key exchange the peer closed — so the command
+/// provably never ran and running it again cannot repeat a side effect.
+///
+/// Deliberately NOT matched: a bare `Connection closed by remote host` with no
+/// `kex_exchange_identification` prefix, which is a session dropped MID-command.
+/// Retrying that would re-run a `docker compose up` that had already taken
+/// effect. When in doubt the answer is to fail, because a lost turn is visible
+/// and a silently repeated one is not.
+///
+/// 255 is ssh's own "I failed" status. A remote command that happens to exit
+/// 255 lands here too, which is why the stderr marker — not the code — decides.
+fn isConnectFailure(res: Outcome) bool {
+    if (res.timed_out) return false;
+    if (res.term != .exited or res.term.exited != 255) return false;
+    for ([_][]const u8{
+        "ssh: connect to host",
+        "banner exchange",
+        "kex_exchange_identification",
+    }) |marker| {
+        if (std.mem.indexOf(u8, res.stderr, marker) != null) return true;
+    }
+    return false;
+}
+
 /// Run a command on `host`, returning an error if it did not succeed. Both of
 /// the child's streams are passed through the redaction filter before being
 /// logged.
@@ -376,7 +434,19 @@ pub fn check(
         .remote => |r| try r.ssh.argv(arena, r.addr, cmd),
         .local => try arena.dupe([]const u8, &.{ "sh", "-c", cmd }),
     };
-    const res = try exec(gpa, io, argv, .{ .deadline_ns = deadline_ns });
+    var attempt: u32 = 1;
+    const res = while (true) : (attempt += 1) {
+        const r = try exec(gpa, io, argv, .{ .deadline_ns = deadline_ns });
+        if (r.ok() or attempt >= connect_attempts or !isConnectFailure(r)) break r;
+        // Freed rather than leaked: `check` is called ~10 times per proxy turn
+        // and a retried connect's output is of no interest to anyone.
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+        redact.log("bench: {s}: ssh could not connect (attempt {d}/{d}), retrying", .{
+            what, attempt, connect_attempts,
+        });
+        io.sleep(.fromNanoseconds(connect_retry_backoff_ns), .awake) catch {};
+    };
     if (!res.ok()) {
         var buf: [64]u8 = undefined;
         redact.log("bench: {s} failed ({s})", .{ what, res.describe(&buf) });
@@ -503,6 +573,45 @@ test "Outcome.ok is true only for a clean exit" {
     // recorded as a successful one.
     const late: Outcome = .{ .term = .{ .exited = 0 }, .stdout = "", .stderr = "", .timed_out = true };
     try std.testing.expect(!late.ok());
+}
+
+test "only a pre-authentication ssh failure is retryable" {
+    // `Outcome.stderr` is the owned, mutable slice `exec` hands back; a string
+    // literal is const, so the test has to shed that to build one by hand.
+    const at = struct {
+        fn f(stderr: []const u8, timed_out: bool) Outcome {
+            return .{
+                .term = .{ .exited = 255 },
+                .stdout = "",
+                .stderr = @constCast(stderr),
+                .timed_out = timed_out,
+            };
+        }
+    }.f;
+
+    const refused = "ssh: connect to host 10.10.0.27 port 22: Connection refused\n";
+    try std.testing.expect(isConnectFailure(at(refused, false)));
+    try std.testing.expect(isConnectFailure(at("Connection timed out during banner exchange\n", false)));
+    try std.testing.expect(isConnectFailure(at("kex_exchange_identification: Connection closed by remote host\n", false)));
+
+    // A session dropped MID-command. The command may already have taken
+    // effect, so this one must NOT be retried — see isConnectFailure's note.
+    try std.testing.expect(!isConnectFailure(at("Connection closed by 10.10.0.27 port 22\n", false)));
+
+    // The remote command's own 255, which says nothing about the transport.
+    try std.testing.expect(!isConnectFailure(at("docker: no such container\n", false)));
+
+    // A killed child is the deadline's business, not the transport's: its
+    // command HAD started, and `exec` already reports it as timed out.
+    try std.testing.expect(!isConnectFailure(at(refused, true)));
+
+    // A clean exit is never a transport failure, whatever is on stderr.
+    try std.testing.expect(!isConnectFailure(.{
+        .term = .{ .exited = 0 },
+        .stdout = "",
+        .stderr = @constCast(refused),
+        .timed_out = false,
+    }));
 }
 
 test "Outcome.describe never leaks a command line" {
