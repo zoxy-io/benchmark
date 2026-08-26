@@ -197,7 +197,12 @@ const deadline = struct {
             // failure mode — the watchdog wins a race it should always lose and one
             // slow proxy takes every proxy after it — so it is worth re-counting
             // this list whenever a probe is added, not just believing the comment.
-        + 6 * inspect + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
+        + 6 * inspect
+            // Every ssh `check` in the turn can now pay `remote`'s transport-retry
+            // budget on top of its own bound: the 6 probes above, one per `start`
+            // attempt, and the teardown. Counted at the worst case for all of them
+            // at once, which is the only reading that keeps the watchdog losing.
+        + (6 + start_attempts + 1) * remote.connect_retry_budget_ns + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
     }
 };
 

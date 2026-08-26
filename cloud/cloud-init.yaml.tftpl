@@ -465,6 +465,29 @@ write_files:
       TimeoutStartSec=infinity
 %{~ endif }
 
+# Ubuntu's own background apt, silenced before it can start.
+#
+# `bootcmd`, not `runcmd`: these timers are `Persistent=true` and fire shortly
+# after boot, which on this fleet is under the run — and `runcmd` is minutes
+# too late, after `package_update` has already refreshed the lists they act on.
+#
+# The needrestart drop-in above stops needrestart BOUNCING a service whose
+# libraries moved; it does nothing about apt upgrading a package whose own
+# postinst restarts it. openssh-server is that package, and on 24.04 ssh is
+# socket-activated, so the restart is a window where port 22 answers
+# `Connection refused`. Run 32885230435 (2026-08-25 18:41) lost three proxies
+# to one such window: haproxy's identity check was refused, its teardown was
+# refused too, the container stayed up, and nginx and pingora both aborted on
+# `ForeignProxyRunning`. `remote.check` now retries a refused connect, and this
+# is the other half — the fleet is destroyed after ~45 minutes, so there is
+# nothing it can gain from a security update landing mid-ramp.
+#
+# `--now` as well as `mask`, because cloud-init is not always first: a timer
+# that already fired has to be stopped, not merely prevented from starting.
+# `|| true` because a mask that fails is not a reason to abandon a boot.
+bootcmd:
+  - systemctl mask --now unattended-upgrades.service apt-daily.timer apt-daily.service apt-daily-upgrade.timer apt-daily-upgrade.service || true
+
 apt:
   sources:
     docker:
