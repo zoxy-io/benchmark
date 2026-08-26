@@ -22,29 +22,32 @@
     // lalinsky/zio#623, fixed upstream in #628 ("flush a full submission
     // queue instead of dropping SQEs", merged as b822fda).
     //
-    // That fix is still here: df666c2 is v0.17.0 plus #699, 121 commits ahead
-    // of b822fda and zero behind, checked with `compare/b822fda...df666c2`
-    // before moving. "The fix is still in there" is exactly the assumption a
-    // bump is where you lose.
+    // That fix is still here: 3820667 is 137 commits ahead of b822fda and zero
+    // behind, checked with `compare/b822fda...3820667` before moving. "The fix
+    // is still in there" is exactly the assumption a bump is where you lose.
     //
-    // zrk **v2.1.0 and not v2.0.0**: the tag one would reach for predates
-    // zoxy-io/zrk#53 and pins BoringSSL, while zoxy pins OpenSSL. The two
-    // repositories must agree here — a local band and a fleet number off
-    // different generators are not comparable — and zoxy cannot take v2.0.0,
-    // because its profile harness links both the zrk and zoxy modules and
-    // would get two libcryptos. 2.1.0 is the swap.
+    // zrk must stay on a tag that pins OpenSSL rather than BoringSSL (that is
+    // zoxy-io/zrk#53 onward, so v2.1.0 or later), because zoxy pins OpenSSL and
+    // the two repositories must agree — a local band and a fleet number off
+    // different generators are not comparable, and zoxy's profile harness links
+    // both the zrk and zoxy modules, so a disagreement is two libcryptos in one
+    // binary.
+    //
+    // zurl is pinned to whatever zrk pins, not bumped independently: zrk's own
+    // graph carries it, and two copies would be two incompatible `zurl` types
+    // the moment either exposes one across the module boundary.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.1.0#a47c02d628064dc1d6285fb5d42bdf90ce407b41",
-            .hash = "zrk-2.1.0-WqdFO1rQBQA9vPHaywTYs1dBhnCIP_h2Wn06dGSD3uxa",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.2.2#793361a15b98220072ad4a96946047782370eb82",
+            .hash = "zrk-2.2.2-WqdFO2RGBgBYo1xIeHULEhviK4TCpmSpAiOwPLshN-l3",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#df666c286380bf513dfe843f65a8133207ad7373",
-            .hash = "zio-0.17.0-xHbVVJPWJwBY3c_AkOFjUCF_pTIMnMc7ia9ujTjAfsbk",
+            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
+            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
         },
         .zurl = .{
-            .url = "git+https://github.com/zoxy-io/zurl#e6e352b1a809fd56704a06353580d5edff48044c",
-            .hash = "zurl-0.0.0--VALCoxDBQDwFYR1ARqp6GwFj-xmKagT9Z8P1CedHTNx",
+            .url = "git+https://github.com/zoxy-io/zurl#4ecb1768985425d4f09b317f23f203983ef87d96",
+            .hash = "zurl-0.0.0--VALCi1dBQA6i4gkVVX11IV13I784dueJYYAzyZZTBPz",
         },
     },
     .paths = .{
