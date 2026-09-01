@@ -100,7 +100,7 @@ http {
         # mounted template, so compose's own `${}` interpolation never reaches
         # it. Same mechanism the backend origin's template already uses for
         # BACKEND_CPUS.
-        listen ${PROXY_PORT};
+        listen ${PROXY_PORT} reuseport;
         include /etc/nginx/origin-location.conf;
     }
 
@@ -131,7 +131,7 @@ http {
     # handshake, so an RSA key would charge one proxy CPU the others never pay —
     # and zoxy would refuse it outright.
     server {
-        listen ${PROXY_TLS_PORT} ssl;
+        listen ${PROXY_TLS_PORT} ssl reuseport;
         # TLS 1.3 only. The generator offers nothing else, so this changes no
         # handshake — it pins what is being measured, identically across the
         # five, instead of leaving each proxy's own default version range to
