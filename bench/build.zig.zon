@@ -6,12 +6,15 @@
     // identity).
     .fingerprint = 0x66d8e325bc180f27,
     .minimum_zig_version = "0.16.0",
-    // Bump with `zig fetch --save=zrk git+https://github.com/zoxy-io/zrk#<ref>`.
+    // Bump with `zig fetch --save=zrk git+https://github.com/zoxy-io/zrk#<ref>`,
+    // or fetch without `--save` and hand-edit url+hash to keep these comments.
     // The zio pin MUST match whatever zio commit that zrk ref depends on (check
     // the fetched zrk package's own build.zig.zon), or the `Io` type won't unify
     // across the module boundary — the failure is
     // "file exists in modules 'zio_options' and 'zio_options0'", which reads
     // like a build-system bug rather than the two-copies-of-zio problem it is.
+    // v2.4.2 pins the same zio and the same zurl v2.2.2 did, so neither moved
+    // with it — checked, not assumed, because that is the bump where they would.
     //
     // No fork left as of zrk v1.4.1 (zoxy-io/zrk#48). zio used to drop a
     // cancel when the io_uring submission queue is full, leaving the target
@@ -26,20 +29,21 @@
     // behind, checked with `compare/b822fda...3820667` before moving. "The fix
     // is still in there" is exactly the assumption a bump is where you lose.
     //
-    // zrk must stay on a tag that pins OpenSSL rather than BoringSSL (that is
-    // zoxy-io/zrk#53 onward, so v2.1.0 or later), because zoxy pins OpenSSL and
-    // the two repositories must agree — a local band and a fleet number off
-    // different generators are not comparable, and zoxy's profile harness links
-    // both the zrk and zoxy modules, so a disagreement is two libcryptos in one
-    // binary.
+    // The libcrypto question that used to live here — OpenSSL, never BoringSSL —
+    // is settled a layer down as of zrk v2.4.0 (zoxy-io/zrk#3183923): zrk pins
+    // zssl, which carries its own, so there is no system OpenSSL to agree about
+    // and no second libcrypto to link twice. zoxy 0.8.0 terminates through zssl
+    // too, at a different commit, and that is fine HERE — this binary links zrk
+    // and talks to zoxy over a socket. The rule still binds in zoxy's own repo,
+    // whose profile harness links both modules into one binary.
     //
     // zurl is pinned to whatever zrk pins, not bumped independently: zrk's own
     // graph carries it, and two copies would be two incompatible `zurl` types
     // the moment either exposes one across the module boundary.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.2.2#793361a15b98220072ad4a96946047782370eb82",
-            .hash = "zrk-2.2.2-WqdFO2RGBgBYo1xIeHULEhviK4TCpmSpAiOwPLshN-l3",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.4.2#63d345286d563af82660b4ab02c970ef58999b2d",
+            .hash = "zrk-2.4.2-WqdFO6tKBwBy6heThWihtNgXHvz1YptJ-IVND3Hscw_3",
         },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",

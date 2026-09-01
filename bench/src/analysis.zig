@@ -31,11 +31,25 @@ pub const p99_keepup: f64 = 0.95;
 pub const p99_window: usize = 9;
 
 /// A parsed zrk `--timeseries` row. Field names mirror the NDJSON emitted by
-/// zrk.report.TimeSeries.record (zrk/src/report.zig:205) so the on-disk format
+/// zrk.report.TimeSeries.record (zrk/src/report.zig) so the on-disk format
 /// stays exactly what the CLI would have written.
 pub const TsRow = struct {
     t: f64 = 0,
+    /// The load offered ACROSS this window, which is the ramp's schedule at
+    /// the window's MIDPOINT — `offeredRate(cfg, t - interval/2)`.
+    ///
+    /// It was the schedule at the window's closing instant until zrk 2.4.2
+    /// (zoxy-io/zrk#70), which paired an instant with the window-averaged
+    /// `achieved_rate` beside it and biased this axis high by half a window of
+    /// slope. On this ramp that is (100000-200)/300 x 0.5s ~= 166 rps, applied
+    /// to every point of the offered axis every chart and every reference-band
+    /// reading is built on. Every proxy in a run moves together, so a run
+    /// compares with itself; a run does NOT compare with one from before the
+    /// bump. See README's fairness rules.
     target_rate: f64 = 0,
+    /// This window's served rate. Unchanged in meaning — zrk#70 moved the
+    /// whole-run `achieved_rate` in the SUMMARY to the tail rate, and this
+    /// harness reads neither that summary nor its new `achieved_rate_end`.
     achieved_rate: f64 = 0,
     requests: u64 = 0,
     errors: u64 = 0,

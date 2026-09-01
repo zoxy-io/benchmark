@@ -192,13 +192,14 @@ noticed.
     offered connections. `bench` reads `zoxy_shed_tls_engines` off the admin
     endpoint after every TLS ramp and puts a note on the row if it is nonzero —
     a shed connection means the number is partly about that ceiling.
-  - **No session resumption, ever.** The generator (zrk, on Zig's std TLS
-    client) never presents a ticket, so every connection is a full handshake.
-    Two consequences: handshakes are paid at *connect* time — all 1 000 in the
-    first seconds of the ramp — and the p50/p99 read at the 2 000 req/s
-    reference rate is record-layer crypto on kept-alive connections, not
-    handshake throughput. **zoxy 0.2.0's ticket support is therefore not
-    exercised by this profile at all.**
+  - **No session resumption, ever.** The generator (zrk, on zssl since 2.4.0)
+    can resume and declines to: it offers no PSK and discards the tickets a
+    server issues, so every connection is a full handshake. Two consequences:
+    handshakes are paid at *connect* time — all 1 000 in the first seconds of
+    the ramp — and the p50/p99 read at the 2 000 req/s reference rate is
+    record-layer crypto on kept-alive connections, not handshake throughput.
+    **zoxy's ticket support is therefore not exercised by this profile at
+    all.**
   - **Inbound only.** Every proxy terminates TLS and talks plaintext to the
     origin pool, because zoxy terminates inbound only; letting the other four
     also encrypt upstream would measure a job zoxy cannot do.
@@ -219,6 +220,13 @@ noticed.
 - **Same ramp for every proxy**: never compare runs with different `MAX_RATE`,
   `RAMP_SECONDS` or `CONNECTIONS` — the shared offered axis depends on it.
   Recorded per run in `results/<runid>/<profile>/profile.json`.
+  - **The offered axis itself moved once, at the zrk 2.4.2 bump.** A
+    `--timeseries` row's `target_rate` is the load offered across that window;
+    it used to be the schedule at the window's closing instant, which is half a
+    window of slope higher (~166 rps on this ramp) and was paired with a
+    window-averaged achieved rate beside it (zoxy-io/zrk#70). Every proxy in a
+    run moves together, so within a run nothing changes; a small shift left on
+    the trend chart across that commit is the commit.
 - **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
   engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
   those three syscalls — not `unconfined`. If io_uring init fails zoxy exits at
