@@ -101,6 +101,7 @@ http {
         # it. Same mechanism the backend origin's template already uses for
         # BACKEND_CPUS.
         listen ${PROXY_PORT} reuseport;
+        proxy_buffering off;
         include /etc/nginx/origin-location.conf;
     }
 
@@ -148,6 +149,7 @@ http {
         # never presents one (Zig's TLS client does not resume), so every
         # connection here is a full handshake whatever this says.
         include /etc/nginx/origin-location.conf;
+        proxy_buffering off;
     }
     # @TLS_END@
 }
