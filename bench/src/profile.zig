@@ -219,7 +219,7 @@ pub const c1k: Profile = .{
         // rather than the proxy, and one that reads as a regression against
         // every pre-pool run.
         //
-        // 5544 = 4 x 1386, comfortably under the ~11463 comptime ceiling.
+        // 5544 = 4 x 1386, comfortably under the 11457 comptime ceiling.
         // Watch `zoxy_shed_upstream_slots` in the run artifacts — nonzero means
         // this arithmetic is still wrong.
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
@@ -251,13 +251,14 @@ pub const c1k_tls: Profile = blk: {
     // c1k's tuning, plus the one knob that only exists when a listener
     // terminates TLS.
     //
-    // ZOXY_TLS_ENGINES is 1024 because that is ALL v0.2.0 ALLOWS: it is both the
+    // ZOXY_TLS_ENGINES is 1024 because that is ALL ZOXY ALLOWS: it is both the
     // shipped default and the comptime ceiling — 2048 and 4096 are rejected at
     // startup with `LimitTlsEnginesOutOfRange`, measured against the v0.2.0
-    // release binary. So unlike conn_slots and upstream_slots, this is not a
-    // number this profile gets to choose, and it is pinned rather than left
-    // implicit for the same reason c1k pins conn_slots to ITS default: the run
-    // record should state the pool the numbers came from.
+    // release binary and still the ceiling at 0.8.0. So unlike conn_slots and
+    // upstream_slots, this is not a number this profile gets to choose, and it
+    // is pinned rather than left implicit for the same reason c1k pins
+    // conn_slots to ITS default: the run record should state the pool the
+    // numbers came from.
     //
     // zoxy holds one preallocated engine per admitted TLS connection and sheds
     // past the pool, where the other four allocate per connection with no such
@@ -270,11 +271,13 @@ pub const c1k_tls: Profile = blk: {
     // cap rather than its TLS — which is a finding about zoxy's ceiling, not a
     // number to publish as its TLS throughput.
     //
-    // It is also most of zoxy's memory here: ~136 KiB plus a 64 KiB plaintext
-    // buffer per engine, preallocated at boot, so ~283 MiB against 35 MiB for
-    // the same proxy with no TLS listener (measured, v0.2.0). That is a real
-    // property of terminating TLS this way, and it is why the TLS listener is
-    // not left bound on the plaintext profiles — see compose.yaml.
+    // It is also most of zoxy's memory here: ~92 KiB of engine plus a 64 KiB
+    // plaintext buffer each, preallocated at boot, over a 10 MiB shared
+    // libcrypto heap — so this profile prices at ~270 MiB against ~104 MiB for
+    // the same proxy with no TLS listener (`zoxy --check`, 0.8.0; it was ~136
+    // KiB per engine under the ztls engine 0.8.0 replaced with zssl). That is a
+    // real property of terminating TLS this way, and it is why the TLS listener
+    // is not left bound on the plaintext profiles — see compose.yaml.
     p.proxy_env = &.{
         .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
@@ -364,7 +367,16 @@ pub const c10k: Profile = .{
         // The comptime ceiling for both, pinned equal as of zoxy #108. Without
         // this zoxy sheds ~1/3 of responses by admission policy at 10k
         // connections and the number measures the cap, not the proxy.
-        .{ .key = "ZOXY_CONN_SLOTS", .value = "11464" },
+        //
+        // 11457, not the 11464 this file carried: the ceiling is derived from
+        // the ⅞-CQ budget and moves whenever the worst-case op count does —
+        // zoxy #132 reserved ring ops for the concurrent health-probe sweep
+        // and took nine slots off it in v0.5.0. A stale value here is not a
+        // silent drift: the loader refuses `LimitConnSlotsOutOfRange` and the
+        // turn fails at startup, which is what it did until this line moved.
+        // `zoxy --check <rendered config>` re-reads the ceiling in a second,
+        // and is the thing to run after a zoxy bump.
+        .{ .key = "ZOXY_CONN_SLOTS", .value = "11457" },
         // NOT 4x conn_slots, unlike c1k — there is no room. The pool is already
         // AT the comptime ceiling, so with a four-node origin this profile
         // cannot park a warm upstream per (connection, endpoint) the way c1k
@@ -374,7 +386,7 @@ pub const c10k: Profile = .{
         // needs at 10k for pool depth. If `zoxy_shed_upstream_slots` shows up
         // here, this profile is measuring the ceiling and not the proxy, and the
         // fix is upstream in zoxy rather than in this file.
-        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "11464" },
+        .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "11457" },
     },
 };
 
@@ -494,16 +506,17 @@ test "c1k-tls is c1k with TLS on, and nothing else" {
         }
     }
     try std.testing.expect(tls_engines >= c1k_tls.connections);
-    // v0.2.0 rejects anything above this at startup (LimitTlsEnginesOutOfRange),
-    // so a profile that needs more headroom needs a zoxy that allows it.
+    // zoxy rejects anything above this at startup (LimitTlsEnginesOutOfRange —
+    // `constants.tls_engines_max`, unchanged from v0.2.0 through 0.8.0), so a
+    // profile that needs more headroom needs a zoxy that allows it.
     try std.testing.expect(tls_engines <= 1024);
 }
 
 test "only a TLS profile sizes the TLS session pool" {
     // `tls_engines` is "zero exactly when no listener terminates TLS" — setting
-    // it on a plaintext profile would preallocate ~136 KiB per engine for a
-    // listener that does not exist, and put a quarter of a gigabyte on a
-    // published memory number.
+    // it on a plaintext profile would preallocate ~156 KiB per engine for a
+    // listener that does not exist, and put ~166 MiB on a published memory
+    // number.
     for (all) |p| {
         if (p.tls) continue;
         for (p.proxy_env) |kv| {

@@ -206,9 +206,9 @@ noticed.
     at all unless the profile terminates TLS, so `c1k` runs the configuration it
     ran before this existed and its trend is continuous across the commit. That
     is not tidiness — zoxy preallocates its TLS engine pool at boot, so an
-    always-bound listener would have added ~250 MiB (35 MiB → 283 MiB, measured
-    on v0.2.0) to a published memory number for a socket that never sees a
-    handshake.
+    always-bound listener would have added ~166 MiB (68 MiB → 234 MiB, as
+    `zoxy --check` prices 0.8.0) to a published memory number for a socket that
+    never sees a handshake.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).
@@ -231,11 +231,11 @@ noticed.
 - **zoxy caps admitted connections per process**: on the phase-1 L7 path,
   concurrency is bounded by `limits.conn_slots` (stock default 1386, ~32 MiB —
   zoxy prints the exact figure at startup) with a shared upstream keep-alive
-  pool, `limits.upstream_slots` (stock default 1024). An upstream is leased
+  pool, `limits.upstream_slots` (stock default 1311). An upstream is leased
   per admitted connection at saturation, not per in-flight request, so a conn
   ceiling above the upstream ceiling is admission capacity that can't be
   served — `bench` pins both explicitly per profile (`proxy_env` in
-  `profile.zig`): 1386 conn / **5544 upstream** for `c1k`, 11464/11464 (the
+  `profile.zig`): 1386 conn / **5544 upstream** for `c1k`, 11457/11457 (the
   io_uring completion-queue ceiling) for `c10k`. The upstream pool is 4x
   conn_slots at `c1k` because zoxy parks a keep-alive upstream **per endpoint**
   and round-robin rotates one downstream connection through all four backends;
