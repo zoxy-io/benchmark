@@ -45,7 +45,7 @@ pub const TsRow = struct {
     /// to every point of the offered axis every chart and every reference-band
     /// reading is built on. Every proxy in a run moves together, so a run
     /// compares with itself; a run does NOT compare with one from before the
-    /// bump. See README's fairness rules.
+    /// bump. See docs/METHODOLOGY.md's fairness rules.
     target_rate: f64 = 0,
     /// This window's served rate. Unchanged in meaning — zrk#70 moved the
     /// whole-run `achieved_rate` in the SUMMARY to the tail rate, and this
