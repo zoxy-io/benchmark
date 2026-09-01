@@ -13,7 +13,7 @@
 # (depends_on), so no runtime resolver is needed — same as pingora.
 worker_processes 1;
 worker_rlimit_nofile 262144;
-error_log /var/log/nginx/error.log warn;
+error_log /tmp/error.log warn;
 
 events {
     worker_connections 65536;
