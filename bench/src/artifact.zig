@@ -408,7 +408,7 @@ test "render records c10k's ramp settings so a reader can tell the profiles apar
     try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"timeout_s\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"connections\":10000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"ZOXY_UPSTREAM_SLOTS\":\"11464\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"ZOXY_UPSTREAM_SLOTS\":\"11457\"") != null);
 }
 
 test "status.usable gates what may be charted" {

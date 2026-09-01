@@ -2105,7 +2105,7 @@ const proxy_tls_port_base: u16 = 19080;
 /// curl nor openssl and bash's /dev/tcp cannot handshake. The TLS one is
 /// `null` on a plaintext profile and no proxy renders a TLS listener at all
 /// then — see compose.yaml's x-proxy-common for the measurement that decided
-/// that (zoxy preallocates its TLS session pool: 35 MiB against 283 MiB).
+/// that (zoxy preallocates its TLS session pool: 68 MiB against 234 MiB).
 const Ports = struct {
     plain: u16,
     tls: ?u16,
@@ -2349,8 +2349,8 @@ test "envPrefix carries EVERY backend address as well as the profile's tuning" {
     // c10k is plaintext, so no TLS port travels and every proxy renders no TLS
     // listener at all.
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT") == null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11464") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11464") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_CONN_SLOTS=11457") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_UPSTREAM_SLOTS=11457") != null);
 }
 
 test "c1k widens zoxy's upstream pool to cover every endpoint" {

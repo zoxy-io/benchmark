@@ -99,10 +99,11 @@ x-proxy-common: &proxy-common
 #
 # That conditional is deliberate, and it was measured rather than assumed. An
 # always-bound TLS listener would be simpler here, but zoxy PREALLOCATES its TLS
-# session pool at boot: 35 MiB with no TLS listener against 283 MiB with one at
-# the stock 1024 engines (v0.2.0, ~136 KiB + a 64 KiB plaintext buffer each). A
-# quarter of a gigabyte added to a published memory number, on profiles that
-# never send a handshake, is not an acceptable price for uniform config. So a
+# session pool at boot: 68 MiB with no TLS listener against 234 MiB with one at
+# the stock 1024 engines (`zoxy --check`, 0.8.0 — ~92 KiB of engine + a 64 KiB
+# plaintext buffer each, over a 10 MiB shared libcrypto heap). A sixth of a
+# gigabyte added to a published memory number, on profiles that never send a
+# handshake, is not an acceptable price for uniform config. So a
 # plaintext turn renders exactly the configuration it rendered before TLS
 # existed here, and the c1k/c1k-tls pair stays a subtraction.
 #
@@ -338,10 +339,10 @@ services:
     # overlay — thread parity with the others (all = 1). On the phase-1 L7 path
     # concurrency is capped PER PROCESS at a configurable limits.conn_slots
     # (default 1386, ~32 MiB; ZOXY_CONN_SLOTS below opts up toward the comptime
-    # c10k ceiling, 11464 by default) with a shared upstream keep-alive pool of
-    # limits.upstream_slots (default 1024, deliberately NOT tracking its own
+    # c10k ceiling, 11457 by default) with a shared upstream keep-alive pool of
+    # limits.upstream_slots (default 1311, deliberately NOT tracking its own
     # ceiling — an operator opts up explicitly via ZOXY_UPSTREAM_SLOTS). The
-    # two ceilings are pinned equal (11464/11464 as of zoxy #108: an upstream
+    # two ceilings are pinned equal (11457/11457 as of zoxy #108: an upstream
     # is leased per admitted connection at saturation, not per in-flight
     # request, so a higher conn ceiling than upstream ceiling was admission
     # capacity that couldn't be served). Past the admission ceiling zoxy sheds
@@ -356,9 +357,9 @@ services:
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
       ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
       # The TLS session pool, set by the TLS profiles only. It is the largest
-      # object zoxy holds — ~136 KiB plus a 64 KiB plaintext buffer each,
+      # object zoxy holds — ~92 KiB plus a 64 KiB plaintext buffer each,
       # preallocated at boot — so it is both why the TLS listener is not left
-      # bound on plaintext turns (35 MiB against 283 MiB, measured on v0.2.0)
+      # bound on plaintext turns (68 MiB against 234 MiB, priced at 0.8.0)
       # and why the profile has to size it: one engine is held per admitted
       # connection, so anything under conn_slots sheds by admission policy.
       ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
