@@ -68,20 +68,24 @@ pub const Profile = struct {
     /// speak TLS at all, so a healthcheck through the TLS listener is not
     /// available in the images this comparison is allowed to use.
     ///
-    /// What the generator is, and is not, exercising — zrk drives Zig's std TLS
-    /// client, so all three of these travel with any number this profile
-    /// produces:
+    /// What the generator is, and is not, exercising — zrk terminates through
+    /// zssl as of 2.4.0 (it drove Zig's std TLS client before), so all three of
+    /// these travel with any number this profile produces:
     ///
-    ///   * TLS 1.3 ONLY. Nothing here measures 1.2, and every proxy's listener
-    ///     is pinned to 1.3 so the negotiation cannot silently differ.
-    ///   * NO ALPN is offered, so every proxy falls back to HTTP/1.1 — the same
-    ///     protocol the plaintext profiles measure. Nothing here is HTTP/2.
-    ///   * NO SESSION RESUMPTION. The client never presents a ticket, so every
-    ///     connection is a full handshake and zoxy's 0.2.0 ticket support is
-    ///     never exercised. Handshakes are paid at CONNECT time — all
-    ///     `connections` of them in the first seconds of the ramp — and the
-    ///     steady state that `ref_rate` reads is record-layer crypto on a
-    ///     kept-alive connection, not handshake throughput.
+    ///   * TLS 1.3 ONLY. Nothing here measures 1.2 — zssl implements no other
+    ///     version — and every proxy's listener is pinned to 1.3 so the
+    ///     negotiation cannot silently differ.
+    ///   * ALPN offers `http/1.1` AND NOTHING ELSE, so every proxy speaks the
+    ///     same protocol the plaintext profiles measure. zrk can offer `h2`
+    ///     (`cfg.http2`, which this harness never sets); nothing here is
+    ///     HTTP/2.
+    ///   * NO SESSION RESUMPTION. zssl can resume, and zrk declines to: it
+    ///     offers no PSK and discards the tickets a server issues, so every
+    ///     connection is a full handshake and zoxy's ticket support is never
+    ///     exercised. Handshakes are paid at CONNECT time — all `connections`
+    ///     of them in the first seconds of the ramp — and the steady state that
+    ///     `ref_rate` reads is record-layer crypto on a kept-alive connection,
+    ///     not handshake throughput.
     tls: bool = false,
 
     /// SUMMARY-latency reference offered rate: a shared, light, sub-knee load

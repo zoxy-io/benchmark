@@ -1832,12 +1832,20 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
     // that follows this probe handshakes through exactly this code, so a
     // handshake this accepts is one the measurement will accept too.
     //
-    // HEAP, and not a stack local: the state is ~56 KiB of record buffers, and
-    // `tls.Client` stores pointers into them and into the stream adapters
-    // beside them, so it cannot be moved once `handshake` has run.
+    // HEAP, and not a stack local: the state is ~92 KiB of record buffers as of
+    // zrk 2.4.0's zssl engine (`@sizeOf` 94432 — two 16645-byte out buffers, a
+    // wire record, a reassembly buffer and the read/write pair), and the client
+    // stores pointers into them and into the stream adapters beside them, so it
+    // cannot be moved once `handshake` has run.
     const st = try gpa.create(zrk.tls.State);
     defer gpa.destroy(st);
-    st.* = .{};
+    // `init` then `deinit`, not a `.{}` literal: as of zrk 2.4.0 the session is
+    // zssl's and `State` is an undefined block with no field defaults — `init`
+    // writes the one field (`live`) that makes every other method safe to call,
+    // and `deinit` is what hands the session back. A literal stopped compiling
+    // rather than stopped working, which is the good direction for this to fail.
+    st.init();
+    defer st.deinit();
     // `insecure`: the certificate is self-signed and generated per run (see
     // `ensureTlsMaterial`), and the target is an IP literal, so there is neither
     // a chain to trust nor a name to match. This is the same setting the ramp
@@ -1853,10 +1861,14 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
 
 /// The name offered as SNI, and never verified.
 ///
-/// Zig's TLS client sends no SNI at all when verification is off, so this is
-/// only what the API requires to be handed something. It is not a hostname any
-/// proxy here is configured for, and no proxy here selects a certificate by
-/// name — each has exactly one.
+/// It IS on the wire now: zrk's zssl client sends SNI even under `-k`, on the
+/// argument that a server needing it to pick a certificate needs it either way.
+/// Zig's std TLS client, which zrk 2.4.0 replaced, sent none when verification
+/// was off — so this went from a value the API demanded to a value the peer
+/// reads. Harmless here and checked rather than assumed: no proxy in this
+/// comparison selects a certificate by name (each has exactly one), and every
+/// TLS listener is an `http` one, so zoxy's L4 SNI routing is not in the path
+/// either. It is not a hostname any of them is configured for.
 const tls_probe_host = "bench";
 
 /// One request/response over whichever transport the caller opened.
