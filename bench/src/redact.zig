@@ -170,6 +170,31 @@ pub fn scrubAnyIp(out: []u8, text: []const u8) []const u8 {
     return out[0..len];
 }
 
+/// `scrubAnyIp` over a whole document, into `arena`.
+///
+/// The buffer-based form above stops at the end of its output buffer, so it can
+/// only be handed a bounded slice — which is right for a log LINE and wrong for
+/// a captured file, where the silent truncation would land mid-run with nothing
+/// saying so. This one grows instead, and works a line at a time for the same
+/// reason `logAnyIp` does.
+///
+/// The per-line scratch is the line's own length plus slack: a replacement can
+/// never be longer than what it replaces ("<addr>" is 6 bytes, the shortest
+/// dotted quad is 7), so the input length is already an upper bound and the
+/// slack is only there so that relation never has to be re-derived by a reader.
+pub fn scrubAnyIpAlloc(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append(arena, '\n');
+        first = false;
+        const scratch = try arena.alloc(u8, line.len + 8);
+        try out.appendSlice(arena, scrubAnyIp(scratch, line));
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Print `text` a line at a time, each line scrubbed by `scrubAnyIp`.
 ///
 /// Line-at-a-time, not the whole blob at once, for the same reason
@@ -230,6 +255,45 @@ test "assertNoIps passes a clean report" {
     try assertNoIps("report", "{\"runid\":\"20260728-000102\",\"sustained\":43120}");
     try assertNoIps("report", "p99 was 1.10ms at 8000 req/s over 300s");
     try assertNoIps("empty", "");
+}
+
+test "scrubAnyIpAlloc removes every address and keeps the shape" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Copied verbatim from a captured nginx /tmp/error.log: three addresses on
+    // one line, in three different syntactic positions. A proxy's error log is
+    // the densest source of addresses this harness touches, which is why the
+    // capture is scrubbed rather than trusted.
+    const captured =
+        "2026/09/01 17:37:59 [error] 29#29: *19 connect() failed (113: Host is unreachable) " ++
+        "while connecting to upstream, client: 192.168.97.1, server: , " ++
+        "request: \"GET /1k HTTP/1.1\", upstream: \"http://192.168.97.4:9000/1k\", " ++
+        "host: \"127.0.0.1:8080\"\n";
+    const clean = try scrubAnyIpAlloc(arena, captured);
+    try assertNoIps("captured", clean);
+    try std.testing.expectEqualStrings(
+        "2026/09/01 17:37:59 [error] 29#29: *19 connect() failed (113: Host is unreachable) " ++
+            "while connecting to upstream, client: <addr>, server: , " ++
+            "request: \"GET /1k HTTP/1.1\", upstream: \"http://<addr>:9000/1k\", " ++
+            "host: \"<addr>:8080\"\n",
+        clean,
+    );
+}
+
+test "scrubAnyIpAlloc does not truncate a document past one line buffer" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Longer than `logAnyIp`'s 4 KiB scratch, which is the truncation this
+    // function exists to avoid.
+    var long: std.ArrayList(u8) = .empty;
+    for (0..400) |i| try long.print(arena, "line {d} from 10.0.0.13\n", .{i});
+    const clean = try scrubAnyIpAlloc(arena, long.items);
+    try assertNoIps("long", clean);
+    try std.testing.expect(std.mem.endsWith(u8, clean, "line 399 from <addr>\n"));
 }
 
 test "assertNoIps does not fire on version strings or ordinary numbers" {

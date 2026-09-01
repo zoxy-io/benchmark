@@ -101,9 +101,38 @@ Written by the loadgen at `~/bench/results/<runid>/<profile>/`, then tarred.
     <proxy>.ndjson                   zrk timeseries, byte-identical to the CLI's
     <proxy>.hgrm                     whole-run percentile distribution
     <proxy>.cadvisor.ndjson          {"t":..,"cpu_seconds_total":..,"mem_ws":..,"cadvisor_ms":..} @1Hz
+    <proxy>.error.log                the proxy's own diagnostics — see below
   c1k-tls/ ...
   c10k/ ...
 ```
+
+`<proxy>.error.log` is captured for every proxy and every outcome, after the ramp
+and before the container is removed. Two sources, each tailed to 256 KiB:
+
+- `docker logs <proxy> 2>&1` — where haproxy, envoy, pingora and zoxy put their
+  diagnostics, and where nginx puts the startup `[emerg]` it emits *before* it
+  has opened its own error log.
+- `docker cp <proxy>:/tmp/error.log` for nginx, whose `error_log` is a real file
+  (proxies/nginx/nginx.conf.template). It was `/var/log/nginx/error.log` — the
+  stock image's symlink to `/dev/stderr` — until #16 moved it, so a capture that
+  read only `docker logs` was correct before that commit and silently empty
+  after it.
+
+Both work on a container that has already exited, which is the case this exists
+for: `logs` reads dockerd's capture rather than the process, and `cp` reads the
+stopped container's filesystem. Neither works after `docker rm -f`, which is why
+the capture runs before teardown.
+
+Access logs are deliberately NOT in it: every proxy writes one to
+`/tmp/access.log`, they run to millions of lines, and they are not diagnostics.
+
+It exists because run `20260901-111818` had zoxy's container vanish 109s into the
+c1k ramp — cAdvisor stopped finding it, the load generator logged 2.28M refused
+connections for the remaining three minutes, and nothing anywhere recorded why.
+
+Unlike every other file here it is NOT published to the Pages site: `.log` is
+absent from `commands.publishable`, which is an allowlist. It lives in the bucket
+and reaches a human through `bench fetch`.
 
 One directory per profile, named by the profile — so a profile name is also a
 path segment on the published site and a series key in the trend chart.

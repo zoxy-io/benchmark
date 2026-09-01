@@ -185,11 +185,12 @@ const deadline = struct {
         + warm_probe // first 200
         + cadvisor_warm // cAdvisor discovery head start, before the ramp
         + teardown // after runOne returns, still inside the window
-            // Every `deadline.inspect`-bounded probe runOne can make in one turn,
-            // counted for the WORST case, which is zoxy — two of the six are only
-            // asked of it. In order: sockets before start, the leftover/identity
-            // container check, the image's build descriptor, zoxy's baked commit,
-            // the running proxy's version, and zoxy's access-log drop counter.
+            // Every `deadline.inspect`-bounded probe a turn can make, counted for
+            // the WORST case, which is zoxy — two of the seven are only asked of
+            // it. In order: sockets before start, the leftover/identity container
+            // check, the image's build descriptor, zoxy's baked commit, the
+            // running proxy's version, zoxy's access-log drop counter, and the
+            // error-log capture that runs after runOne returns.
             //
             // This read `4 * inspect` while the code made six such calls: the
             // commit probe was added without bumping it, and the drop counter would
@@ -197,12 +198,12 @@ const deadline = struct {
             // failure mode — the watchdog wins a race it should always lose and one
             // slow proxy takes every proxy after it — so it is worth re-counting
             // this list whenever a probe is added, not just believing the comment.
-        + 6 * inspect
+        + 7 * inspect
             // Every ssh `check` in the turn can now pay `remote`'s transport-retry
-            // budget on top of its own bound: the 6 probes above, one per `start`
+            // budget on top of its own bound: the 7 probes above, one per `start`
             // attempt, and the teardown. Counted at the worst case for all of them
             // at once, which is the only reading that keeps the watchdog losing.
-        + (6 + start_attempts + 1) * remote.connect_retry_budget_ns + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
+        + (7 + start_attempts + 1) * remote.connect_retry_budget_ns + (cooldown_s + 60) * std.time.ns_per_s; // cooldown, plus grace
     }
 };
 
@@ -1196,6 +1197,11 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         records.items[records.items.len - 1] = rec;
         try flush.write();
 
+        // Before teardown, which removes the container the log lives in — and
+        // outside `runOne`, so a proxy that died mid-ramp still leaves its
+        // reason behind.
+        captureErrorLog(gpa, arena, io, opts.fleet, opts.out_dir, name);
+
         // Always tear down, whatever happened. Best-effort: a failure here is
         // reported by the NEXT proxy's identity check rather than silently
         // corrupting it.
@@ -1918,6 +1924,169 @@ fn reportStartFailure(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet, na
         const tail = res.stdout[res.stdout.len -| 2048..];
         redact.log("bench: [{s}] container log:\n{s}", .{ name, redact.scrub(&scrubbed, tail) });
     } else |_| {}
+}
+
+/// How much of the container's log `captureErrorLog` keeps, per proxy per profile.
+///
+/// A tail rather than the whole stream: what a reader needs is the end — the
+/// panic, the OOM line, the drain tally — and an unbounded capture would put a
+/// chatty proxy's whole night into `results.tar`. 256 KiB holds a startup
+/// banner, a drain's counter dump and a stack trace several times over, and
+/// five proxies times two profiles of it is under 3 MiB in the worst case.
+const error_log_tail_bytes: usize = 256 * 1024;
+
+/// Save `name`'s diagnostic output into the profile's results directory, so it
+/// ships to Object Storage inside `results.tar`.
+///
+/// Called for EVERY proxy and every outcome, from the caller's turn loop rather
+/// than from `runOne`, because the interesting case is the one `runOne` returned
+/// an error for. It must run before `teardownProxy`, which does `docker rm -f`:
+/// a container that has exited still has its log, and one that has been removed
+/// does not. Nightly run 20260901-111818 is what this is for — zoxy's container
+/// vanished 109s into the c1k ramp and the only record of why went with it.
+///
+/// Best-effort in every direction. A diagnostic that could fail the run it is
+/// trying to explain would defeat the point, so every failure here is a logged
+/// line and nothing else.
+fn captureErrorLog(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    fleet: Fleet,
+    out_dir: []const u8,
+    name: []const u8,
+) void {
+    const cmd = errorLogCmd(arena, name) catch return;
+    // `check` rather than `exec` for its ssh connect-retry budget. Its
+    // failure path prints a tail of the command's output scrubbed only by
+    // `redact.scrub`'s registered-address table, which would be the wrong
+    // scrubber for another machine's log — but that path is unreachable with
+    // content in it: the command's exit status is `tail`'s (no `pipefail`), so
+    // it is zero whenever the transport worked, and when the transport did not
+    // there is no output to print.
+    const res = remote.check(
+        gpa,
+        arena,
+        io,
+        fleet.proxyHost(),
+        captureWhat(arena, name),
+        cmd,
+        deadline.inspect,
+    ) catch |e| {
+        redact.log("bench: [{s}] could not capture the error log: {s}", .{ name, @errorName(e) });
+        return;
+    };
+    if (res.stdout.len == 0) return;
+
+    // Scrubbed before anything else looks at it: this is another machine's
+    // output, so `redact.scrub`'s registered-address table cannot help (the
+    // addresses in an nginx `[error]` line are the backends', not the ones this
+    // process dialled), and `scrubAnyIp` is the blunt form built for exactly
+    // that case.
+    const clean = redact.scrubAnyIpAlloc(arena, res.stdout) catch |e| {
+        redact.log("bench: [{s}] could not scrub the error log: {s}", .{ name, @errorName(e) });
+        return;
+    };
+    // Skipped rather than fatal, unlike every other `assertNoIps` call site. The
+    // published artifacts fail the run because shipping one is worse than losing
+    // it; this file is a diagnostic that is not published at all (`.log` is not
+    // in `commands.publishable`), so the proportionate answer to a scrubber miss
+    // is to drop the file and say so.
+    redact.assertNoIps("error log", clean) catch {
+        redact.log("bench: [{s}] error log withheld: it still contains an address", .{name});
+        return;
+    };
+    writeErrorLog(io, arena, out_dir, name, clean);
+}
+
+fn captureWhat(arena: Allocator, name: []const u8) []const u8 {
+    return std.fmt.allocPrint(arena, "capture {s} error log", .{name}) catch "capture error log";
+}
+
+/// A proxy's diagnostic log that is a FILE inside the container, rather than the
+/// container's stderr — so `docker logs` cannot see it.
+///
+/// nginx is the only one. haproxy, envoy, pingora and zoxy all write diagnostics
+/// to stderr (pingora's startup line is an `eprintln!`; haproxy's [NOTICE] lines
+/// are stderr by design — proxies/haproxy/haproxy.cfg). nginx's
+/// `error_log /tmp/error.log warn;` is a real file for the same reason its
+/// access log is: the official image's /var/log/nginx/*.log are symlinks to
+/// /dev/stdout and /dev/stderr, and writing a proxy's log into a pipe dockerd
+/// drains puts dockerd's log driver inside the measurement
+/// (proxies/nginx/nginx.conf.template says so at length).
+///
+/// This moved once already — #16 took it from /var/log/nginx/error.log, where it
+/// WAS the /dev/stderr symlink and `docker logs` did carry it, to /tmp. A capture
+/// that only read `docker logs` was correct before that commit and silently
+/// empty after it, which is why the path is named here rather than assumed.
+fn errorLogPath(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "nginx")) return "/tmp/error.log";
+    return null;
+}
+
+/// `docker logs`, plus the file for a proxy that keeps its diagnostics in one.
+///
+/// Deliberately not `docker exec ... cat`: exec needs a RUNNING container, and
+/// the container this most needs to read is one that has already died. Both
+/// `docker logs` and `docker cp` serve an exited container — `logs` reads
+/// dockerd's own capture rather than the process, and `cp` reads the stopped
+/// container's filesystem — which is the whole reason this runs before
+/// `teardownProxy`'s `docker rm -f` rather than after it. `cp` to `-` streams a
+/// tar, hence `tar -xO`.
+///
+/// Access logs are excluded on purpose. Every proxy writes one to
+/// /tmp/access.log, they run to millions of lines, and they are not diagnostics.
+fn errorLogCmd(arena: Allocator, name: []const u8) ![]const u8 {
+    const logs = try std.fmt.allocPrint(
+        arena,
+        "echo '=== docker logs {s} ==='; docker logs {s} 2>&1 | tail -c {d}",
+        .{ name, name, error_log_tail_bytes },
+    );
+    const path = errorLogPath(name) orelse return logs;
+    return std.fmt.allocPrint(
+        arena,
+        "{s}; echo; echo '=== {s}:{s} ==='; " ++
+            "docker cp {s}:{s} - 2>/dev/null | tar -xO 2>/dev/null | tail -c {d}",
+        .{ logs, name, path, name, path, error_log_tail_bytes },
+    );
+}
+
+test "errorLogCmd tails both streams of a possibly-dead container" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cmd = try errorLogCmd(arena_state.allocator(), "zoxy");
+    // `2>&1` is what makes this the ERROR log: a proxy's diagnostics are on
+    // stderr, and `docker logs` without it would return the access-log-free
+    // stdout and look convincingly empty.
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "docker logs zoxy 2>&1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "tail -c 262144") != null);
+    // zoxy keeps nothing in a file, so its command stops there.
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "docker cp") == null);
+}
+
+test "errorLogCmd also copies nginx's error_log, which is a file and not stderr" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cmd = try errorLogCmd(arena_state.allocator(), "nginx");
+    // The path #16 moved it to. Pinned because a capture that reads only
+    // `docker logs` still LOOKS like it works — it returns the container's
+    // startup chatter and none of the errors.
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "docker cp nginx:/tmp/error.log -") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "tar -xO") != null);
+}
+
+fn writeErrorLog(io: Io, arena: Allocator, out_dir: []const u8, name: []const u8, text: []const u8) void {
+    const path = std.fmt.allocPrint(arena, "{s}/{s}.error.log", .{ out_dir, name }) catch return;
+    const f = Io.Dir.cwd().createFile(io, path, .{}) catch |e| {
+        redact.log("bench: [{s}] could not write {s}: {s}", .{ name, path, @errorName(e) });
+        return;
+    };
+    defer f.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fw: Io.File.Writer = .init(f, io, &buf);
+    fw.interface.writeAll(text) catch return;
+    fw.interface.flush() catch return;
+    redact.log("bench: [{s}] error log saved ({d} bytes)", .{ name, text.len });
 }
 
 /// Fail unless `expected` is the only known proxy container running.
