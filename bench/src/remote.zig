@@ -106,9 +106,11 @@ const kill_grace_ns: u64 = 5 * std.time.ns_per_s;
 /// whichever of `wait`/`kill` runs first — so by the time a deadline fires the
 /// waiter may already have cleared the only record of what to signal.
 fn killGroup(pid: std.posix.pid_t) void {
-    // Raw syscall: nothing here may touch `io`, which by definition is already
-    // failing to make progress when a deadline fires.
-    _ = std.os.linux.kill(-pid, std.os.linux.SIG.KILL);
+    // A direct libc call, deliberately: nothing here may touch `io`, which by
+    // definition is already failing to make progress when a deadline fires.
+    // Not `std.os.linux.kill` — that compiles on any target but issues a Linux
+    // syscall, which on Darwin traps SIGSYS and kills the CALLER instead.
+    std.posix.kill(-pid, .KILL) catch {};
 }
 
 /// Spawn `argv`, capture both streams, and enforce a wall-clock deadline.
@@ -516,10 +518,12 @@ test "the deadline hook runs, and runs before the child is killed" {
     const res = try exec(
         std.testing.allocator,
         threaded.io(),
-        // Absolute path and a shell BUILTIN loop, because a test has neither: PATH
-        // comes from `std.process.Init`, which only `main` receives, so a bare
-        // `sleep` here fails to resolve with FileNotFound.
-        &.{ "/bin/sh", "-c", "while :; do :; done" },
+        // Absolute path, because a test has no PATH: it comes from
+        // `std.process.Init`, which only `main` receives, so a bare `sleep`
+        // here fails to resolve with FileNotFound. Sleeping rather than
+        // spinning, so that a child this test fails to kill costs an idle
+        // process rather than a pinned core.
+        &.{ "/bin/sleep", "60" },
         .{
             .deadline_ns = 200 * std.time.ns_per_ms,
             .on_deadline = struct {
@@ -550,10 +554,12 @@ test "no hook is not an error" {
     const res = try exec(
         std.testing.allocator,
         threaded.io(),
-        // Absolute path and a shell BUILTIN loop, because a test has neither: PATH
-        // comes from `std.process.Init`, which only `main` receives, so a bare
-        // `sleep` here fails to resolve with FileNotFound.
-        &.{ "/bin/sh", "-c", "while :; do :; done" },
+        // Absolute path, because a test has no PATH: it comes from
+        // `std.process.Init`, which only `main` receives, so a bare `sleep`
+        // here fails to resolve with FileNotFound. Sleeping rather than
+        // spinning, so that a child this test fails to kill costs an idle
+        // process rather than a pinned core.
+        &.{ "/bin/sleep", "60" },
         .{ .deadline_ns = 200 * std.time.ns_per_ms },
     );
     defer std.testing.allocator.free(res.stdout);
