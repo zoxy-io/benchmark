@@ -71,10 +71,14 @@ jobs:
     env:
       # Absolute, and NOT `./bench` — that path is the source directory.
       BENCH: ${{ github.workspace }}/bin/bench
-      # The only secret this job holds, and the only cloud-ish config it needs:
-      # no bucket, no service account, no IAM token. Read by `bench notify`.
-      # Never passed to a VM, never echoed.
+      # The only secret this job holds. Read by `bench notify`. Never passed to
+      # a VM, never echoed.
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      # A repository VARIABLE, not a secret, and not a credential: this job
+      # still mints no IAM token (see the Discord step). It is here only so the
+      # landing page can link the run's `results.tar`, which the loadgen already
+      # uploaded and which the bucket serves anonymously.
+      BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
 
     steps:
       - uses: actions/checkout@v7
@@ -203,12 +207,28 @@ jobs:
             : > history.ndjson
           fi
 
+      # `--results-url` is what puts the raw-data download on the landing page.
+      # It points at the object the loadgen uploaded (bench/CONTRACT.md's
+      # Object Storage layout), not at anything rebuilt here — that archive is
+      # the complete run, error logs included, and the site would otherwise
+      # carry no copy of those at all.
+      #
+      # Left empty when BENCH_BUCKET is unset (a fork), which renders no link
+      # rather than a broken one. Same endpoint literal nightly.yml uses for
+      # payload.tar.
       - name: Build the Pages site
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
         run: |
           set -euo pipefail
-          "$BENCH" index "results/$RUNID" --out _site --history history.ndjson
+          results_url=""
+          if [ -n "${BENCH_BUCKET:-}" ]; then
+            results_url="https://storage.yandexcloud.net/$BENCH_BUCKET/runs/$RUNID/results.tar"
+          else
+            echo "BENCH_BUCKET is unset — the page will carry no raw-data link"
+          fi
+          "$BENCH" index "results/$RUNID" --out _site --history history.ndjson \
+            --results-url "$results_url"
 
       - name: Upload the Pages artifact
         uses: actions/upload-pages-artifact@v5

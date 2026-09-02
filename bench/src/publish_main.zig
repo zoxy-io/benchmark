@@ -13,7 +13,7 @@ const usage =
     \\
     \\  report  <rundir> [--profile <name>] [--base-url <url>]
     \\                                                   render report.json + report.html
-    \\  index   <rundir> [--out <dir>] [--history <file>]
+    \\  index   <rundir> [--out <dir>] [--history <file>] [--results-url <url>]
     \\                                                   build the Pages site
     \\  notify  <rundir> [--dry-run]                     post to Discord
     \\

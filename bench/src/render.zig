@@ -115,6 +115,11 @@ pub fn cmdIndex(init: std.process.Init, args: []const [:0]const u8) !void {
         runid,
         try flagValue(args, "--out") orelse "_site",
         try flagValue(args, "--history") orelse "",
+        // A full URL rather than a bucket name: it keeps `bench` ignorant of
+        // the storage endpoint, which nothing else in this binary knows either
+        // (`bench-publish` does not link ycs.zig), and lets a fork host the
+        // archive wherever it likes.
+        try flagValue(args, "--results-url") orelse "",
     ));
 }
 

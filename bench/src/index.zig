@@ -187,6 +187,9 @@ pub const ProfileSummary = struct {
 };
 
 /// The landing page: what ran, how it went, and the trend.
+/// `results_url` is where this run's `results.tar` can be downloaded, or empty
+/// when there is nowhere to point — a local run, or a fork with no bucket. The
+/// link is only drawn when there is something behind it.
 pub fn renderIndex(
     arena: Allocator,
     out: *Writer,
@@ -194,6 +197,7 @@ pub fn renderIndex(
     finished: []const u8,
     profiles: []const ProfileSummary,
     history: []const HistoryRow,
+    results_url: []const u8,
 ) !void {
     try out.writeAll(
         \\<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -208,7 +212,26 @@ pub fn renderIndex(
     try out.writeAll("<div class=\"eyebrow\">HTTP (L7) proxy benchmark · nightly</div>");
     try out.print("<h1>latest run <span class=\"rid\">{s}</span></h1>", .{runid});
     try out.print("<p class=\"meta\">Finished {s}. Only the most recent run is published here; " ++
-        "every run's raw data is kept as a workflow artifact.</p>", .{finished});
+        "every run's raw data is kept as a workflow artifact.", .{finished});
+    // The whole run in one download, straight from the bucket the loadgen
+    // uploaded it to. Everything the suite produced, including each proxy's
+    // error log — which is the artifact that says WHY a proxy is degraded, and
+    // is not otherwise reachable from this site.
+    //
+    // The retention is stated because it is shorter than this page's: the
+    // bucket drops a run after 30 days (see docs/SETUP.md), so a reader
+    // arriving at a stale site finds a dead link, and should be told why
+    // rather than left to guess.
+    if (results_url.len > 0) {
+        try out.print(
+            "<br>Everything this run measured, in one archive: " ++
+                "<a href=\"{s}\">results.tar</a> — the per-window timeseries, the cAdvisor " ++
+                "samples, the percentile distributions and each proxy's error log. " ++
+                "Kept for 30 days after the run.",
+            .{results_url},
+        );
+    }
+    try out.writeAll("</p>");
 
     try out.writeAll("<div class=\"tablewrap\"><table><tr><th>profile</th><th>connections</th>" ++
         "<th>transport</th><th>deadline</th><th>result</th><th></th></tr>");
@@ -471,7 +494,7 @@ test "trend cards for multiple profiles sit inside one grid2, for spacing" {
 
     var buf: [256 * 1024]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    try renderIndex(arena, &out, "r1", "t", &profiles, &rows);
+    try renderIndex(arena, &out, "r1", "t", &profiles, &rows, "");
 
     const s = out.buffered();
     const grid_start = std.mem.indexOf(u8, s, "<div class=\"grid2\">").?;
@@ -492,13 +515,35 @@ test "the landing page is IP-clean and names each profile's result" {
         .{ .name = "c1k", .ok = 4, .failed = 0, .connections = 1000, .deadline_ms = 0 },
         .{ .name = "c10k", .ok = 3, .failed = 1, .connections = 10000, .deadline_ms = 1000 },
     };
-    try renderIndex(arena_state.allocator(), &out, "20260728-000102", "2026-07-28T00:52:11Z", &profiles, &.{});
+    try renderIndex(arena_state.allocator(), &out, "20260728-000102", "2026-07-28T00:52:11Z", &profiles, &.{}, "");
 
     const s = out.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "4/4 ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "3/4 ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "1000ms") != null);
     try redact.assertNoIps("index.html", s);
+}
+
+test "the results.tar link is drawn only when there is somewhere to point" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const profiles = [_]ProfileSummary{
+        .{ .name = "c1k", .ok = 4, .failed = 0, .connections = 1000, .deadline_ms = 0 },
+    };
+    const url = "https://storage.example.net/b/runs/r1/results.tar";
+
+    var buf: [256 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try renderIndex(arena, &out, "r1", "t", &profiles, &.{}, url);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), url) != null);
+
+    // A local run has no bucket behind it, and a dead link is worse than none.
+    var buf2: [256 * 1024]u8 = undefined;
+    var out2: std.Io.Writer = .fixed(&buf2);
+    try renderIndex(arena, &out2, "r1", "t", &profiles, &.{}, "");
+    try std.testing.expect(std.mem.indexOf(u8, out2.buffered(), "results.tar") == null);
 }
 
 test "the trend plots a degraded night — it is usable data, not a gap" {

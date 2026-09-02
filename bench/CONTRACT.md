@@ -70,7 +70,8 @@ s3://$BENCH_BUCKET/runs/<runid>/
   boot-ok.<role>       written by each VM once cloud-init finishes (diagnoses a boot failure);
                        <role> is loadgen | proxy | backend0..backend3, one object per VM
   log                  the suite's running log, re-uploaded every ~30s
-  results.tar          every artifact, uploaded once the suite finishes
+  results.tar          every artifact, uploaded once the suite finishes; the
+                       landing page links this object directly (see docs/SETUP.md)
   DONE                 written last, after results.tar; its presence means "complete"
   FAILED               written instead of DONE if the suite could not run at all
 ```
@@ -130,9 +131,10 @@ It exists because run `20260901-111818` had zoxy's container vanish 109s into th
 c1k ramp — cAdvisor stopped finding it, the load generator logged 2.28M refused
 connections for the remaining three minutes, and nothing anywhere recorded why.
 
-Unlike every other file here it is NOT published to the Pages site: `.log` is
-absent from `commands.publishable`, which is an allowlist. It lives in the bucket
-and reaches a human through `bench fetch`.
+It is not copied onto the Pages site: `.log` is absent from
+`commands.publishable`, which is an allowlist. It reaches a human through
+`bench fetch`, or through the `results.tar` link on the landing page — which is
+this object, served straight from the bucket rather than rebuilt on the runner.
 
 One directory per profile, named by the profile — so a profile name is also a
 path segment on the published site and a series key in the trend chart.

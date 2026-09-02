@@ -665,6 +665,9 @@ pub fn buildIndex(
     runid: []const u8,
     out_dir: []const u8,
     history_path: []const u8,
+    /// Where this run's results.tar can be downloaded, linked from the landing
+    /// page. Empty for a local run, or a fork with no bucket.
+    results_url: []const u8,
 ) !u8 {
     _ = gpa;
     try Io.Dir.cwd().createDirPath(io, out_dir);
@@ -771,7 +774,7 @@ pub fn buildIndex(
     {
         var page: std.ArrayList(u8) = .empty;
         var pw: std.Io.Writer.Allocating = .fromArrayList(arena, &page);
-        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, full);
+        try index.renderIndex(arena, &pw.writer, runid, ts, summaries.items, full, results_url);
         try redact.assertNoIps("index.html", pw.written());
 
         const path = try std.fmt.allocPrint(arena, "{s}/index.html", .{out_dir});

@@ -291,30 +291,34 @@ leak. If your organisation can enforce this centrally
 (organization-manager → security policy → forbid static access keys), do
 — **[verify]**, I could not confirm the exact policy name.
 
-### Keep the bucket fully private
+### Bucket read access
 
-Nothing here needs to be world-readable, so leave Yandex's default (public
-access blocked) alone. The bucket is a transient drop-box between the runner
-and the VMs; every object in it is raw run data and stays private until the
-lifecycle rule deletes it.
+`results.tar` is read anonymously by anyone who opens the site: the landing page
+links `https://storage.yandexcloud.net/$BENCH_BUCKET/runs/<runid>/results.tar`
+directly, which is how a reader gets the run's raw data and, in particular, the
+proxy error logs — the site carries no other copy of those. So the bucket needs
+to serve reads publicly. Nothing else about it changes: writes stay bound to the
+two service accounts, and the 30-day rule below still deletes runs on schedule.
 
-This was briefly not true. `bench notify` used to upload each profile's
+Note what this does NOT do: `publish` still mints no IAM token. An anonymous GET
+needs no credential, and `BENCH_BUCKET` is a repository *variable* rather than a
+secret, so the workflow only has to build a URL string. Leave `BENCH_BUCKET`
+unset in a fork and the page simply carries no link.
+
+Every object in the bucket is run data that is already public by intent — `bench`
+refuses to write an artifact containing an IP address (`redact.assertNoIps`), so
+there is nothing in a run directory that the reports do not already publish. The
+one thing to keep in mind is that this is a bucket-wide read grant: anything ever
+written under a different prefix would be readable too.
+
+There is history here worth knowing. `bench notify` used to upload each profile's
 `report.html` with `x-amz-acl: public-read` and link that URL from the Discord
-embed — the report is linked rather than attached because a Discord HTML
-attachment cannot be previewed, so the artifact that took the whole night to
-produce would go unread. It now links the GitHub Pages copy instead, which the
-publish workflow deploys from the same HTML a few steps earlier.
-
-The Object Storage copy bought one thing: a per-run immutable link, where the
-Pages copy only ever holds the latest run. That was not worth making `publish`
-a job that authenticates to the cloud at all — it handles nothing but files
-already on the runner's disk — and the embed still names its own run id, so an
-old post stays honest about which night it describes even though its link now
-opens the newest report.
-
-If you would rather the bucket stay entirely private, do nothing — the Pages
-link covers the latest run, and only the ability to link an *older* run's report
-is lost.
+embed. It now links the GitHub Pages copy instead, which the publish workflow
+deploys from the same HTML a few steps earlier — the Object Storage copy bought a
+per-run immutable link, and that was not worth making `publish` a job that
+*authenticates* to the cloud. Reading a public object is a different thing from
+holding a credential, which is why the raw-data link is fine and the report
+upload was not.
 
 ### 30-day lifecycle rule on `runs/`
 
