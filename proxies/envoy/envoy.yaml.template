@@ -1,22 +1,6 @@
-# L7 HTTP reverse proxy :8080 -> backend:9000 (parity with zoxy's phase-1 L7
-# build — every proxy now parses HTTP/1.1 and reverse-proxies requests). Worker
-# count is hardcoded to 1 via --concurrency in the compose command (1 CPU).
-# STRICT_DNS because the upstreams are hostnames (compose services locally,
-# extra_hosts entries in cloud). Access logging is ON, to stdout, in envoy's own
-# stock format (see access_log below). Envoy keeps both the downstream
-# and the pooled upstream connections alive by default.
-#
-# The upstream is a four-node POOL (backend0..backend3) and the pick policy is
-# pinned to ROUND_ROBIN, matching every other proxy in the comparison. Envoy's
-# own default happens to be round-robin too, so this is a statement of intent
-# rather than a change — but it now decides something, so it is not left
-# implicit.
-#
-# @PORT@ and @TLS_PORT@ are rendered by compose.yaml's `command` (a sed pass
-# before envoy starts) rather than left at a fixed 8080/8443 — see
-# x-proxy-common there for why the listener ports vary per turn. The admin port
-# below stays fixed: it is loopback-only and not implicated in the port-reuse
-# issue this addresses.
+# L7 reverse proxy -> backend0..3, ROUND_ROBIN as on every proxy. 1 worker via
+# --concurrency in compose. Listener ports are rendered by compose.yaml's sed
+# (see x-proxy-common); the loopback admin port stays fixed.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9902 }
@@ -27,39 +11,16 @@ static_resources:
       address:
         socket_address: { address: 0.0.0.0, port_value: @PORT@ }
       filter_chains:
-        # ANCHORED, and aliased by the TLS listener below. Envoy parses this as
-        # YAML before turning it into protobuf, so the alias is resolved by the
-        # parser and both listeners are guaranteed the identical HTTP filter
-        # chain — same router, same access log, same timeouts. Copying the block
-        # would let the plaintext and TLS listeners drift into proxying
-        # differently, which is precisely what the c1k/c1k-tls pair is supposed
-        # to hold constant.
+        # Anchored and aliased by the TLS listener, so both share the exact
+        # same HTTP filter chain.
         - filters: &http_chain
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
-                # Access log -> a FILE, in envoy's DEFAULT format. No
-                # `log_format`/`json_format` key on purpose: leaving it out is
-                # what selects the stock line envoy documents as its default
-                # access log, which is the line an envoy operator actually
-                # reads. Each proxy here logs its own idiomatic format rather
-                # than a common one; the five differ in length (roughly 90-250
-                # bytes), which has to be read WITH the numbers.
-                #
-                # /tmp/access.log and not /dev/stdout: a write to stdout is a
-                # write to a pipe dockerd drains, and a proxy that fills that
-                # pipe blocks on it, turning the ramp into a measurement of
-                # docker's log driver. Every proxy here logs to this same path
-                # for that reason — /tmp specifically because it is writable by
-                # each image's user without a mkdir, and envoy's own compose
-                # command already writes /tmp/envoy.yaml.
-                #
-                # Envoy buffers access-log writes and flushes them on a timer
-                # (`file_flush_interval`, 10s by default) or when the buffer
-                # fills, rather than writing once per request as nginx does.
-                # That is envoy's own design, not a setting made here, and it is
-                # part of what this comparison now measures.
+                # Default format (no log_format), to a file: a stdout pipe
+                # would block on dockerd. Envoy buffers and flushes on a timer
+                # (file_flush_interval), unlike nginx; that is stock behaviour.
                 access_log:
                   - name: envoy.access_loggers.file
                     typed_config:
@@ -76,8 +37,7 @@ static_resources:
                         - match: { prefix: "/" }
                           route:
                             cluster: origin
-                            # don't let Envoy time out the request itself; the
-                            # loadgen owns the deadline (parity with the others).
+                            # No request timeout; the loadgen owns the deadline.
                             timeout: 0s
                 http_filters:
                   - name: envoy.filters.http.router
@@ -85,38 +45,11 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
     # @TLS_BEGIN@
-    # The TLS listener: the same filter chain as `plain`, behind a TLS
-    # transport socket.
-    #
-    # EVERYTHING FROM THE MARKER ABOVE TO THE ONE BELOW IS DELETED on a
-    # plaintext turn, by the sed in compose.yaml's `command` — the markers are
-    # YAML comments, so the TLS turn needs no substitution at all and simply
-    # keeps them. envoy has no conditionals and this file is a static mount, so
-    # a line-range delete is the mechanism available; the alternative, a second
-    # always-bound listener, would have moved the plaintext profiles' numbers
-    # for a socket they never use.
-    #
-    # NOTHING ELSE IN THIS FILE MAY SPELL EITHER MARKER, this comment included:
-    # sed's range ends at the first line matching the end marker, so naming it
-    # in the prose here closed the range four lines in and left the listener
-    # behind — which is how the plaintext turn first came up with a TLS
-    # listener bound and an unrendered port in it.
-    #
-    # Envoy terminates here and the upstream leg stays plaintext (the `origin`
-    # cluster below is shared, and has no transport_socket of its own), which is
-    # what every proxy in the comparison does: zoxy's TLS is inbound-only.
-    #
-    # The certificate is the run's own self-signed ECDSA P-256 pair, generated
-    # on the proxy host before any container starts and mounted read-only at
-    # /etc/bench/tls — the same key material all five load.
-    #
-    # `alpn_protocols: [http/1.1]`, stated rather than left to the default, for
-    # the same reason haproxy's bind pins it: haproxy's TLS default advertises
-    # h2 and duly negotiated HTTP/2 when something offering ALPN connected,
-    # while envoy and nginx stayed on HTTP/1.1. The generator offers no ALPN, so
-    # every proxy speaks HTTP/1.1 today — but the protocol under test should be
-    # a property of this file, not of each proxy's defaults. Every number this
-    # benchmark has published is HTTP/1.1.
+    # TLS listener, same filter chain. This marked block is deleted by the sed
+    # in compose.yaml on a plaintext turn. NO OTHER LINE MAY SPELL EITHER
+    # MARKER: sed's range would end early and leave the listener behind.
+    # Upstream stays plaintext. `alpn_protocols: [http/1.1]` pins HTTP/1.1
+    # (haproxy's default advertises h2).
     - name: tls
       address:
         socket_address: { address: 0.0.0.0, port_value: @TLS_PORT@ }
@@ -127,9 +60,7 @@ static_resources:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               common_tls_context:
                 alpn_protocols: ["http/1.1"]
-                # TLS 1.3 only, pinned for the same reason the other proxies pin
-                # it: the version in play should be a stated property of the
-                # run, not each proxy's own default range.
+                # TLS 1.3 only, pinned as on every proxy.
                 tls_params:
                   tls_minimum_protocol_version: TLSv1_3
                   tls_maximum_protocol_version: TLSv1_3
@@ -144,10 +75,8 @@ static_resources:
       connect_timeout: 5s
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
-      # Envoy's DEFAULT circuit breaker caps a cluster at 1024 upstream
-      # connections and requests; raise every threshold well above CONNECTIONS
-      # so pooled HTTP requests are never queued/rejected (parity with haproxy
-      # maxconn).
+      # Raise the default 1024 circuit breaker so pooled requests are never
+      # queued/rejected (parity with haproxy maxconn).
       circuit_breakers:
         thresholds:
           - priority: DEFAULT
@@ -155,10 +84,8 @@ static_resources:
             max_pending_requests: 200000
             max_requests: 200000
             max_retries: 200000
-      # Four origins in ONE locality, so ROUND_ROBIN spreads evenly across all
-      # of them. Splitting them into separate `endpoints` entries would make
-      # them separate localities, and envoy weights localities before it
-      # round-robins within one — a different policy than the other proxies run.
+      # One locality: separate `endpoints` entries would be weighted by
+      # locality before round-robin.
       load_assignment:
         cluster_name: origin
         endpoints:

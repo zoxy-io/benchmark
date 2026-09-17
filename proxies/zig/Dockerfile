@@ -1,25 +1,11 @@
-# The Zig toolchain as its own image, so a nightly stops re-downloading it.
-#
-# zoxy has no published binary, so it is built from source and that needs a Zig
-# the distros do not carry (0.16.0). It used to be fetched with curl inside
-# zoxy's own build: 55 MB from ziglang.org, on every run, with no verification
-# and no retry — a third-party dependency in the critical path of an unattended
-# job. It cost run #21 a whole profile when tar met a truncated stream.
-#
-# Splitting it out fixes both halves. The toolchain is a pure function of
-# ZIG_VERSION and the architecture, so unlike zoxy's floating-`main` source build
-# it caches perfectly: `bench-image-cache` keeps it in Object Storage and the
-# download happens only when the version is deliberately bumped.
-#
-# git and ca-certificates live here too, because zoxy's build stage clones from
-# GitHub and there is no reason for that apt round-trip to repeat either.
+# Zig toolchain as its own image so it caches (bench-image-cache) instead of
+# being downloaded from ziglang.org on every run (run #21 lost a profile to a
+# truncated tarball). git/ca-certificates are for zoxy's clone.
 FROM debian:bookworm-slim
 
 ARG ZIG_VERSION=0.16.0
-# From ziglang.org/download/index.json, alongside the tarball it describes.
-# amd64 only: it is the sole architecture the fleet runs, and a checksum that is
-# absent is better than one that is wrong. An arm64 build (local smoke tier only)
-# skips the check rather than silently trusting a value nobody verified.
+# From ziglang.org/download/index.json. amd64 only (the fleet's arch); arm64
+# (local smoke) skips the check rather than trust an unverified value.
 ARG ZIG_SHA256_AMD64=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 ARG TARGETARCH
 

@@ -1,25 +1,9 @@
 name: publish
 
-# Everything downstream of the measurement: render a run's artifacts into
-# report.html, build the Pages site, deploy it, and post to Discord.
-#
-# A REUSABLE workflow with two entry points, so the render/deploy path has ONE
-# implementation:
-#
-#   * `workflow_call` — nightly.yml calls this once its bench job has uploaded
-#     the raw artifact. That job now only measures.
-#   * `workflow_dispatch` — re-publish any past run. Used when a rendering bug
-#     is fixed and the live site should show the fix without spending a fleet
-#     run on new numbers.
-#
-# The split is measure/publish rather than nightly/republish deliberately: a
-# republish that re-implemented rendering would drift from the nightly's, and
-# the whole reason to republish is usually that the rendering changed.
-#
-# The INPUT is an Actions run id, not a bench run id. The raw data lives in
-# that run's `bench-<runid>` artifact (90-day retention), and the bench run id
-# is read back out of the artifact rather than passed — one input that cannot
-# disagree with itself.
+# Render a run's artifacts, deploy the Pages site, and post to Discord.
+# One implementation for both callers: nightly.yml (workflow_call) and manual
+# re-publishing of a past run (workflow_dispatch). Input is an Actions run id;
+# the bench run id is read from its `bench-<runid>` artifact.
 
 on:
   workflow_call:
@@ -54,10 +38,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
-    # `actions: read` is what lets download-artifact reach ANOTHER run's
-    # artifact — the re-publish case. `id-token: write` is deploy-pages' own
-    # authentication, and nothing else: see the Discord step on why this job
-    # mints no cloud token.
+    # `actions: read` lets download-artifact reach another run's artifact;
+    # `id-token: write` is only for deploy-pages.
     permissions:
       contents: read
       actions: read
@@ -69,15 +51,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     env:
-      # Absolute, and NOT `./bench` — that path is the source directory.
+      # Absolute; `./bench` is the source directory.
       BENCH: ${{ github.workspace }}/bin/bench
-      # The only secret this job holds. Read by `bench notify`. Never passed to
-      # a VM, never echoed.
+      # The only secret here. Never pass it to a VM or echo it.
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-      # A repository VARIABLE, not a secret, and not a credential: this job
-      # still mints no IAM token (see the Discord step). It is here only so the
-      # landing page can link the run's `results.tar`, which the loadgen already
-      # uploaded and which the bucket serves anonymously.
+      # A variable, not a credential; only used to link the run's results.tar.
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
 
     steps:
@@ -88,14 +66,8 @@ jobs:
         with:
           version: 0.16.0
 
-      # Native, unlike the nightly's build: that one cross-compiles a static
-      # musl binary because it is SHIPPED to the loadgen VM. Nothing here
-      # leaves the runner.
-      #
-      # `publish` builds bench-publish, not the full `bench`: this job only
-      # ever runs report/index/notify, never the fleet path (suite/remote/
-      # ramp/ycs), so there's no reason to pay to compile that here too. See
-      # bench/build.zig and bench/src/publish_main.zig.
+      # Native bench-publish (report/index/notify only); nothing leaves the
+      # runner. See bench/src/publish_main.zig.
       - name: Build bench-publish
         working-directory: bench
         run: zig build publish -Doptimize=ReleaseFast
@@ -105,9 +77,7 @@ jobs:
 
       # ----------------------------------------------------------- the data --
 
-      # Blank on a dispatch means "the newest nightly that succeeded", which is
-      # what someone re-publishing after a rendering fix almost always wants,
-      # and saves them looking a run id up by hand.
+      # Blank on dispatch = newest successful nightly.
       - name: Resolve the source run
         id: src
         env:
@@ -133,8 +103,7 @@ jobs:
           path: results
           merge-multiple: true
 
-      # The bench run id is whatever directory the artifact carries, rather
-      # than a second input that could contradict the first.
+      # The bench run id comes from the artifact, not a second input.
       - name: Identify the run
         id: meta
         run: |
@@ -154,11 +123,7 @@ jobs:
 
       # --------------------------------------------------------- the render --
 
-      # `--base-url` makes a proxy's ".hgrm" download link absolute rather than
-      # relative to wherever the page is opened from. Pages is now the only
-      # place report.html is served, so a bare link would resolve there too —
-      # but an absolute one also survives the file being saved or re-hosted,
-      # and it is the same URL `bench notify` puts in the Discord embed.
+      # `--base-url` makes ".hgrm" links absolute (same URL `bench notify` uses).
       - name: Render the per-profile reports
         id: report
         env:
@@ -166,10 +131,7 @@ jobs:
           BASE: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
-          # Driven by what the run actually PRODUCED, not by a profile list: a
-          # run cut short mid-way still has whole profiles worth publishing,
-          # and re-publishing an old run must not need to know what that
-          # night's BENCH_PROFILES happened to be.
+          # Driven by what the run produced, so partial and old runs publish.
           rendered=0
           for d in "results/$RUNID"/*/; do
             p="$(basename "$d")"
@@ -186,15 +148,8 @@ jobs:
           fi
           echo "rendered $rendered profile(s)"
 
-      # deploy-pages replaces the site wholesale, so the trend chart's history
-      # lives IN the published site and has to be carried forward by hand:
-      # download the currently-published history.ndjson and hand it to `bench
-      # index`, which re-emits it with this run's rows appended (`bench index`
-      # merges by run id, so re-publishing a run already in history replaces
-      # its rows rather than doubling them).
-      #
-      # Best-effort by design — a first run has no site to read, and a 404 must
-      # not be a failure.
+      # deploy-pages replaces the site, so carry history.ndjson forward;
+      # `bench index` merges by run id. A 404 (first run) is not a failure.
       - name: Fetch the published history
         env:
           BASE: ${{ steps.base.outputs.base }}
@@ -207,15 +162,8 @@ jobs:
             : > history.ndjson
           fi
 
-      # `--results-url` is what puts the raw-data download on the landing page.
-      # It points at the object the loadgen uploaded (bench/CONTRACT.md's
-      # Object Storage layout), not at anything rebuilt here — that archive is
-      # the complete run, error logs included, and the site would otherwise
-      # carry no copy of those at all.
-      #
-      # Left empty when BENCH_BUCKET is unset (a fork), which renders no link
-      # rather than a broken one. Same endpoint literal nightly.yml uses for
-      # payload.tar.
+      # Links the loadgen's uploaded results.tar (bench/CONTRACT.md), which
+      # includes error logs. No link when BENCH_BUCKET is unset (a fork).
       - name: Build the Pages site
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
@@ -241,21 +189,9 @@ jobs:
 
       # ---------------------------------------------------------- the post --
 
-      # Only when asked. The nightly asks; a re-publish does not, because the
-      # night's post already went out and a second one reporting the same
-      # numbers reads as a second run.
-      #
-      # No cloud credential here, deliberately. This job never touches Yandex:
-      # the results arrive as an Actions artifact and the report it links is the
-      # copy deployed to Pages a few steps up. It briefly did mint an IAM token
-      # — `bench notify` used to upload report.html public-read to Object
-      # Storage for a per-run immutable link — and that broke the moment the
-      # job gained `environment: github-pages`, because the environment rewrites
-      # the OIDC `sub` claim to `repo:<owner>/<repo>:environment:github-pages`
-      # and the federated credential is bound to the `ref:refs/heads/main`
-      # subject. The fix was to delete the dependency rather than bind a second
-      # subject: an immutable link is not worth a cloud credential in a job that
-      # otherwise handles nothing but files already on this runner.
+      # Only when asked: a re-publish must not post the same night twice.
+      # No cloud credential: the `github-pages` environment changes the OIDC
+      # `sub` claim, which the federated credential is not bound to.
       - name: Notify Discord
         if: inputs.notify
         continue-on-error: true
@@ -264,8 +200,7 @@ jobs:
           BASE_URL: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
-          # No webhook configured (a fork, or a first run) — render and validate
-          # the post without sending it, rather than failing the night.
+          # No webhook (fork or first run): dry run rather than failing.
           dry=()
           if [ -z "${DISCORD_WEBHOOK:-}" ]; then
             echo "DISCORD_WEBHOOK is unset — dry run"

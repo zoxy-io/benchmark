@@ -1,16 +1,7 @@
 //! The measurement math, transliterated 1:1 from report/report.py.
 //!
-//! This module is deliberately NOT a redesign. Every function keeps the
-//! Python's name and the substance of its comment, because those comments
-//! encode corrections that each cost a bad run to find: the end-of-run partial
-//! flush that faked a 62k "sustained", the window-midpoint offered reference
-//! that removed phantom start-of-run shedding, the deliberately-unclamped shed,
-//! and the keep-up BAND that rejects post-knee catch-up bursts.
-//!
-//! The Phase 0 gate for the Zig rewrite is that `bench report` reproduces
-//! `python3 report/report.py`'s report.json field-for-field on an existing run
-//! directory. If you change a constant or a comparison here, that gate is the
-//! thing that tells you whether you were right.
+//! Gate: `bench report` must reproduce report.py's report.json field-for-field
+//! on an existing run dir. Check it after changing any constant or comparison.
 
 const std = @import("std");
 const zrk = @import("zrk");
@@ -21,40 +12,27 @@ const Histogram = zrk.hdr.Histogram;
 /// throughput: "keeping up" = achieved >= KEEPUP * offered  (report.py:187)
 pub const keepup: f64 = 0.90;
 
-/// p99-vs-offered CURVE only: looser than the histogram so the line isn't
-/// starved — 0.99 drops ~78% of windows, leaving a sparse, low-res curve; <=5%
-/// backlog is still a fair per-window p99 reading and ~triples points.
-/// (report.py:188)
+/// p99-vs-offered curve only: looser than `keepup` so the curve isn't starved;
+/// <=5% backlog is still a fair per-window p99.  (report.py:188)
 pub const p99_keepup: f64 = 0.95;
 
 /// Neighborhood width for p99Curve's merge (report.py:367 `win=9`).
 pub const p99_window: usize = 9;
 
-/// A parsed zrk `--timeseries` row. Field names mirror the NDJSON emitted by
-/// zrk.report.TimeSeries.record (zrk/src/report.zig) so the on-disk format
-/// stays exactly what the CLI would have written.
+/// A parsed zrk `--timeseries` row; field names mirror the NDJSON from
+/// zrk.report.TimeSeries.record (zrk/src/report.zig).
 pub const TsRow = struct {
     t: f64 = 0,
-    /// The load offered ACROSS this window, which is the ramp's schedule at
-    /// the window's MIDPOINT — `offeredRate(cfg, t - interval/2)`.
-    ///
-    /// It was the schedule at the window's closing instant until zrk 2.4.2
-    /// (zoxy-io/zrk#70), which paired an instant with the window-averaged
-    /// `achieved_rate` beside it and biased this axis high by half a window of
-    /// slope. On this ramp that is (100000-200)/300 x 0.5s ~= 166 rps, applied
-    /// to every point of the offered axis every chart and every reference-band
-    /// reading is built on. Every proxy in a run moves together, so a run
-    /// compares with itself; a run does NOT compare with one from before the
-    /// bump. See docs/METHODOLOGY.md's fairness rules.
+    /// Load offered across this window: the ramp's schedule at the window
+    /// MIDPOINT (since zrk 2.4.2, zoxy-io/zrk#70). Runs from before that bump
+    /// are not comparable; see docs/METHODOLOGY.md.
     target_rate: f64 = 0,
-    /// This window's served rate. Unchanged in meaning — zrk#70 moved the
-    /// whole-run `achieved_rate` in the SUMMARY to the tail rate, and this
-    /// harness reads neither that summary nor its new `achieved_rate_end`.
+    /// This window's served rate (not the SUMMARY's `achieved_rate`, which
+    /// zrk#70 changed).
     achieved_rate: f64 = 0,
     requests: u64 = 0,
     errors: u64 = 0,
-    /// Borrowed from the arena the rows were parsed into; empty if the run was
-    /// recorded without `timeseries_histogram`.
+    /// Borrowed from the parse arena; empty without `timeseries_histogram`.
     latency_histogram: []const u8 = "",
     p50_us: f64 = 0,
     p99_us: f64 = 0,
@@ -62,9 +40,7 @@ pub const TsRow = struct {
     max_us: f64 = 0,
 };
 
-/// One merged measurement window, the unit every chart and summary reads.
-/// Latency is in SECONDS here (report.py hands charts seconds; `yfmt="ms"`
-/// scales by 1000), matching report.py:123-126.
+/// One merged measurement window. Latency is in SECONDS (report.py:123-126).
 pub const Window = struct {
     t: f64,
     offered: f64,
@@ -79,11 +55,9 @@ pub const Window = struct {
 
 pub const Point = struct { x: f64, y: f64 };
 
-/// Parse an NDJSON file into rows in emission order, skipping junk.
-/// Mirrors report.py:37 `read_ndjson`: a missing file yields no rows (not an
-/// error) and an unparseable line is skipped rather than fatal — zrk writes the
-/// series incrementally, so a killed run leaves a half-written final line that
-/// must not invalidate the 300 good ones before it.
+/// Parse an NDJSON file into rows. A missing file yields no rows and a bad
+/// line is skipped: a killed run leaves a half-written last line.
+/// (report.py:37)
 pub fn readNdjson(arena: Allocator, io: std.Io, path: []const u8) ![]TsRow {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return &.{},
@@ -137,14 +111,10 @@ fn parseRow(arena: Allocator, line: []const u8) !TsRow {
     };
 }
 
-/// The measurement windows worth trusting, dropping zrk's end-of-run PARTIAL
-/// flush. zrk closes a run with a final sub-interval window (dt << the ~1s grid)
-/// whose achieved_rate is a handful of requests over a sliver of wall-clock — a
-/// backlog-drain burst, not steady state. Its rate lands anywhere (a collapsed
-/// proxy's hit 0.94x offered, sneaking past the keep-up band to fake a 62k
-/// "sustained"), so exclude any window narrower than half the run's median
-/// window. Window width = gap to the prior row's timestamp (first row: from
-/// t=0).  (report.py:54)
+/// Drop zrk's end-of-run partial flush: any window narrower than half the
+/// median width. Its rate is a backlog-drain burst that can fake a
+/// "sustained" peak. Width = gap to the prior row (first: from t=0).
+/// (report.py:54)
 pub fn fullWindows(arena: Allocator, rows: []const TsRow) ![]TsRow {
     if (rows.len == 0) return &.{};
 
@@ -163,17 +133,11 @@ pub fn fullWindows(arena: Allocator, rows: []const TsRow) ![]TsRow {
     return out.toOwnedSlice(arena);
 }
 
-/// Merge per-loadgen NDJSON into one window series, ALIGNED BY INTERVAL INDEX.
-/// Combined offered/achieved are SUMS ACROSS LOADGENS (each loadgen emits one
-/// row per interval); latency is the max across loadgens (a conservative tail —
-/// they hit the same proxy, so distributions track).
+/// Merge per-loadgen NDJSON into one window series. Offered/achieved are summed
+/// across loadgens; latency is the max (conservative tail).
 ///
-/// Bucketing is by each loadgen's interval SEQUENCE INDEX, not by rounded
-/// wall-clock seconds. zrk's ~1s grid drifts, so a single loadgen can emit two
-/// rows that round to the same integer second (notably the last on-grid window
-/// plus the end-of-run flush row at t~=duration+eps). Rounding-then-summing
-/// fused those two windows and DOUBLED that point's offered/achieved — a
-/// phantom spike at the right edge of every chart.  (report.py:69)
+/// Buckets by interval SEQUENCE INDEX, not rounded wall-clock: zrk's grid
+/// drifts, and rounding fused windows into a doubled point.  (report.py:69)
 pub fn merge(arena: Allocator, per_tag: []const []const TsRow) ![]Window {
     var n: usize = 0;
     for (per_tag) |rows| n = @max(n, rows.len);
@@ -216,23 +180,12 @@ pub fn merge(arena: Allocator, per_tag: []const []const TsRow) ![]Window {
         else
             0;
 
-        // shed = fraction of OFFERED load the proxy never served. Under overload
-        // these HTTP proxies mostly just can't keep up rather than reject (err
-        // stays low) — so the shortfall (achieved < offered) is the real
-        // "shedding"; explicit rejects (e.g. zoxy's static shed response past
-        // its admission cap) surface separately as errors.
+        // shed = fraction of offered load never served; explicit rejects show
+        // up separately as errors. Referenced to the window-average offered to
+        // avoid phantom shed on a rising ramp.
         //
-        // Reference the WINDOW-AVERAGE offered (midpoint of this and the
-        // previous window's end rate): zrk stamps target_rate at window END,
-        // which on a rising ramp overstates what was actually asked during the
-        // window by slope*dt/2 — ~11% of offered in the earliest windows, which
-        // read as phantom "shedding" at the start of every run (the direct
-        // baseline showed the identical bump, proving no proxy was involved).
-        //
-        // NOT clamped at 0: per-window noise is symmetric around true zero, and
-        // clamping raw windows clips only the negative half — a phantom positive
-        // bias exactly where shed should read 0. The chart clamps AFTER
-        // median-smoothing instead, which is unbiased.
+        // NOT clamped at 0: clamping noisy raw windows biases shed upward. The
+        // chart clamps after median-smoothing instead.
         const mid = if (prev_offered != 0) (a.offered + prev_offered) / 2 else a.offered;
         const shed = if (mid != 0) 1.0 - a.achieved / mid else 0.0;
         prev_offered = a.offered;
@@ -252,20 +205,11 @@ pub fn merge(arena: Allocator, per_tag: []const []const TsRow) ![]Window {
     return out;
 }
 
-/// Max SUSTAINABLE throughput: the highest achieved rate while the proxy is
-/// still delivering >= `keepup` of what's offered. This is the real "how fast
-/// can it go" number — it excludes both the pre-knee ramp (achieved==offered,
-/// not a limit) and the post-knee thrash.
+/// Max sustainable throughput: highest achieved rate while keeping up.
 ///
-/// Keep-up is a BAND, not a floor. A window whose achieved massively OVERSHOOTS
-/// offered isn't sustained throughput — it's zrk's open-loop catch-up draining
-/// backlog after a stall (CO correction). Bounding above by offered/keepup
-/// rejects that post-knee thrash, the very burst the one-sided
-/// `achieved >= keepup*offered` test wrongly counted as a new peak.
-///
-/// NOTE this supersedes loadgen/zrk-runner/src/main.zig:158 `summarize()`, which
-/// was one-sided and therefore disagreed with the report past the knee.
-/// (report.py:202)
+/// Keep-up is a BAND: achieved above offered/keepup is open-loop catch-up
+/// after a stall, not throughput. Supersedes the one-sided `summarize()` in
+/// loadgen/zrk-runner/src/main.zig:158.  (report.py:202)
 pub fn sustained(rows: []const Window) f64 {
     var best: f64 = 0;
     for (rows) |r| {
@@ -278,16 +222,12 @@ pub fn sustained(rows: []const Window) f64 {
     return best;
 }
 
-/// Merge the per-window HdrHistogram blobs for the windows whose OFFERED rate
-/// sits within +/-`band` of `rate` — every proxy's latency at the SAME light,
-/// sub-knee load. Throughput keep-up is NOT enough to isolate healthy latency:
-/// near its knee a proxy serves ~offered rate while sitting on a huge standing
-/// queue, so the CO-corrected tail balloons even though achieved tracks offered.
-/// A shared reference rate well below every proxy's knee measures per-request
-/// COST instead of queueing delay.
+/// Merge per-window histograms whose offered rate is within +/-`band` of
+/// `rate`: every proxy's latency at the same sub-knee load, measuring
+/// per-request cost rather than queueing delay near the knee.
 ///
-/// Returns null if the proxy never reached the reference band. Caller owns the
-/// histogram.  (report.py:130)
+/// Null if the proxy never reached the band. Caller owns the histogram.
+/// (report.py:130)
 pub fn refHist(
     gpa: Allocator,
     rows: []const TsRow,
@@ -316,19 +256,10 @@ pub fn refHist(
     return acc;
 }
 
-/// The whole run's latency histogram: every window merged, no rate band and no
-/// warmup exclusion. This is the same aggregate `ramp.zig` writes to the
-/// `.hgrm` file (`result.snapshot.hist`, zrk's own cumulative histogram) —
-/// reconstructed here from the per-window blobs already in the `.ndjson`
-/// rather than re-parsed from the `.hgrm` text, because the `.hgrm` format is
-/// a percentile TABLE (lossy, meant for a human or `hdrhistogram` tooling to
-/// read) rather than something meant to round-trip back into a `Histogram`.
-///
-/// Deliberately separate from `refHist`: that one exists so the SUMMARY
-/// TABLE'S p50/p99 read at one common, fair, sub-knee rate — this one is for
-/// the DISTRIBUTION CHART, which should show what actually happened over the
-/// whole ramp, warmup included, not a fairness-filtered slice of it.
-/// Returns null only when the run produced no histogram data at all.
+/// Whole-run latency histogram: every window merged, no band, warmup
+/// included. For the distribution chart; the summary table uses `refHist`.
+/// Rebuilt from per-window blobs because `.hgrm` is a lossy percentile table.
+/// Null only when the run produced no histogram data.
 pub fn wholeRunHist(gpa: Allocator, rows: []const TsRow) !?Histogram {
     var acc: ?Histogram = null;
     errdefer if (acc) |*h| h.deinit();
@@ -352,29 +283,16 @@ fn emptyLike(gpa: Allocator, src: *const Histogram) !Histogram {
     return Histogram.init(gpa, src.lowest_discernible, src.highest_trackable, src.sig_figs);
 }
 
-/// `Histogram.add` asserts equal `counts_len`, which in a ReleaseFast build is
-/// unchecked rather than merely fatal. Blobs within one run always agree, but a
-/// run dir assembled from mismatched zrk versions would silently corrupt every
-/// merged percentile — so make that a named error instead.
+/// `Histogram.add` asserts equal `counts_len`, unchecked in ReleaseFast; a run
+/// dir from mismatched zrk versions would silently corrupt percentiles.
 fn addCompatible(dst: *Histogram, src: *const Histogram) !void {
     if (dst.counts_len != src.counts_len) return error.HistogramGeometryMismatch;
     dst.add(src);
 }
 
-/// Dense, low-noise p99-vs-offered curve: one point per keep-up window (full
-/// x-resolution), but each p99 is read from the MERGED per-window HdrHistograms
-/// of a `win`-wide neighborhood — many windows' samples instead of one ~1s
-/// window's few tail samples — so the estimate is stable rather than sawtooth.
-/// Median-smoothing the raw per-window p99 couldn't fix that; merging the actual
-/// sample counts does.
-///
-/// The Python (report.py:382-401) hand-rolls a sparse (bucket, count)
-/// neighborhood merge and then reaches into hdr.Hdr's private `_median_equiv` /
-/// `_value_from_index` helpers, because it had to reimplement HdrHistogram. Here
-/// `Histogram.add` + `valueAtPercentile` are the real thing, and they agree by
-/// construction: `valueAtPercentile` uses @round(p/100 * total) then
-/// `medianEquivalentValue`, exactly what the Python reproduced by hand.
-/// (report.py:367)
+/// Dense p99-vs-offered curve: one point per keep-up window, each p99 read
+/// from the merged histograms of a `win`-wide neighborhood so it is stable
+/// rather than sawtooth.  (report.py:367)
 pub fn p99Curve(
     gpa: Allocator,
     arena: Allocator,
@@ -403,11 +321,8 @@ pub fn p99Curve(
     const half = win / 2;
     var out: std.ArrayList(Point) = .empty;
     for (0..hists.len) |i| {
-        // Accumulate in the geometry the blobs were RECORDED with, not this
-        // build's stats.newHistogram defaults. report.py does the same
-        // (`geo = hdrs[0]`), and it matters for run dirs recorded by an older
-        // zrk whose histogram bounds differed — `Histogram.add` asserts equal
-        // counts_len, so a fresh accumulator would abort on those.
+        // Use the recorded blobs' geometry, not stats.newHistogram defaults:
+        // older zrk runs used different bounds and `add` would abort.
         var acc = try emptyLike(gpa, &hists[0]);
         defer acc.deinit();
 
@@ -422,9 +337,8 @@ pub fn p99Curve(
     return out.toOwnedSlice(arena);
 }
 
-/// (n = 1/(1-percentile), latency_ms) points across the range, for the per-proxy
-/// latency-distribution card. ~10 points per decade, with the true max pinned at
-/// the far right.  (report.py:174)
+/// (n = 1/(1-percentile), latency_ms) points, ~10 per decade, true max pinned
+/// at the far right.  (report.py:174)
 pub fn hdrPoints(arena: Allocator, h: *const Histogram) ![]Point {
     const total = h.count();
     if (total == 0) return &.{};
@@ -441,10 +355,8 @@ pub fn hdrPoints(arena: Allocator, h: *const Histogram) ![]Point {
     return out.toOwnedSlice(arena);
 }
 
-/// Rolling-median (odd window) over x-sorted points — damps per-window jitter
-/// and lone spikes (e.g. shed-ratio blowing up in a low-offered warmup window
-/// where the tiny denominator makes a small dip read as a huge fraction) while
-/// keeping the trend.  (report.py:329)
+/// Rolling median (odd window) over x-sorted points; damps lone spikes such as
+/// shed ratio in low-offered warmup windows.  (report.py:329)
 pub fn smoothMedian(arena: Allocator, pts: []const Point, w: usize) ![]Point {
     const s = try arena.dupe(Point, pts);
     std.mem.sort(Point, s, {}, ptLessThan);
@@ -469,20 +381,15 @@ fn ptLessThan(_: void, a: Point, b: Point) bool {
     return a.x < b.x;
 }
 
-/// zrk's histogram tops out at `hist_highest` (60s, zrk/src/stats.zig:35) and
-/// CLAMPS rather than drops, so a catastrophically overloaded run reports every
-/// tail percentile as exactly that ceiling. Those are not measurements, and the
-/// report must say so instead of printing a confident number.
-///
-/// This is what the c10k profile's loadgen-side `deadline_ns` exists to prevent;
-/// the check stays as a backstop in case a run is configured without one.
+/// True when the histogram hit zrk's 60s ceiling (zrk/src/stats.zig:35). zrk
+/// clamps, so those tail percentiles are not measurements. Backstop for runs
+/// without a loadgen `deadline_ns`.
 pub fn isSaturated(h: *const Histogram) bool {
     return h.max() >= 59_000_000;
 }
 
 // ---------------------------------------------------------------------------
-// Tests. These pin the behaviours whose comments above explain what they cost
-// to discover — a refactor that "simplifies" one of them should fail here.
+// Tests: pin the behaviours documented above.
 // ---------------------------------------------------------------------------
 
 test "fullWindows drops the end-of-run partial flush" {
@@ -490,7 +397,7 @@ test "fullWindows drops the end-of-run partial flush" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Four 1s windows plus zrk's closing sliver at t=4.05 (dt=0.05 << 0.5*1.0).
+    // Four 1s windows plus zrk's closing sliver at t=4.05.
     const rows = [_]TsRow{
         .{ .t = 1.0, .achieved_rate = 100 },
         .{ .t = 2.0, .achieved_rate = 100 },
@@ -504,7 +411,7 @@ test "fullWindows drops the end-of-run partial flush" {
 }
 
 test "sustained rejects post-knee catch-up overshoot" {
-    // A window achieving far MORE than offered is backlog drain, not throughput.
+    // Achieving far more than offered is backlog drain, not throughput.
     const rows = [_]Window{
         .{ .t = 5, .offered = 1000, .achieved = 1000, .err = 0, .shed = 0, .p50 = 0, .p99 = 0, .p999 = 0, .max = 0 },
         .{ .t = 6, .offered = 2000, .achieved = 9000, .err = 0, .shed = 0, .p50 = 0, .p99 = 0, .p999 = 0, .max = 0 },
@@ -525,9 +432,7 @@ test "merge references offered at the window midpoint, and leaves shed unclamped
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A perfectly-keeping-up proxy on a rising ramp: achieved equals the window
-    // AVERAGE offered, so shed must read ~0. Referencing the end-of-window
-    // target_rate instead would report a phantom positive shed here.
+    // Keeping up on a rising ramp: shed must read ~0.
     const rows = [_]TsRow{
         .{ .t = 1, .target_rate = 1000, .achieved_rate = 1000, .requests = 1000 },
         .{ .t = 2, .target_rate = 2000, .achieved_rate = 1500, .requests = 1500 },
@@ -536,8 +441,7 @@ test "merge references offered at the window midpoint, and leaves shed unclamped
     try std.testing.expectEqual(@as(usize, 2), w.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0), w[1].shed, 1e-12);
 
-    // And an over-serving window yields a NEGATIVE shed rather than being
-    // clipped at zero — clamping raw windows biases the mean upward.
+    // Over-serving yields NEGATIVE shed, not clipped at zero.
     const over = [_]TsRow{
         .{ .t = 1, .target_rate = 1000, .achieved_rate = 1000, .requests = 1000 },
         .{ .t = 2, .target_rate = 2000, .achieved_rate = 3000, .requests = 3000 },
@@ -551,8 +455,7 @@ test "merge aligns loadgens by interval index and sums them" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Two loadgens whose grids have drifted apart in wall-clock but agree in
-    // sequence. Bucketing by rounded time would fuse rows and double a point.
+    // Loadgen grids drifted in wall-clock but agree in sequence.
     const lg1 = [_]TsRow{
         .{ .t = 1.00, .target_rate = 500, .achieved_rate = 500, .requests = 500, .p99_us = 1000 },
         .{ .t = 2.00, .target_rate = 600, .achieved_rate = 600, .requests = 600, .p99_us = 1000 },
@@ -565,7 +468,7 @@ test "merge aligns loadgens by interval index and sums them" {
     try std.testing.expectEqual(@as(usize, 2), w.len);
     try std.testing.expectEqual(@as(f64, 1000), w[0].offered); // summed
     try std.testing.expectEqual(@as(f64, 1000), w[0].achieved);
-    // latency is the max across loadgens, not the sum or the mean
+    // latency is the max across loadgens
     try std.testing.expectApproxEqAbs(@as(f64, 0.004), w[0].p99, 1e-12);
 }
 
@@ -585,8 +488,7 @@ test "smoothMedian kills a lone spike but keeps the trend" {
 test "refHist merges only the windows inside the reference band" {
     const gpa = std.testing.allocator;
 
-    // Build three windows: one below the band, one inside, one above. Only the
-    // in-band one may contribute, so the merged count must be exactly its own.
+    // Only the in-band window may contribute to the merged count.
     var inside = try zrk.stats.newHistogram(gpa);
     defer inside.deinit();
     inside.record(1234);
@@ -627,9 +529,7 @@ test "wholeRunHist merges every window, unlike refHist's band+warmup filter" {
     const inside_b64 = try inside.encodeBase64(gpa);
     defer gpa.free(inside_b64);
 
-    // Same three rows `refHist`'s band test uses, PLUS a t<3 warmup row —
-    // wholeRunHist must include all four, where refHist(2000, 0.20) would
-    // keep only the "inside" one.
+    // refHist's rows plus a warmup row: wholeRunHist includes all four.
     const rows = [_]TsRow{
         .{ .t = 1, .target_rate = 100, .latency_histogram = below_b64 }, // warmup
         .{ .t = 5, .target_rate = 500, .latency_histogram = below_b64 }, // below band
@@ -660,7 +560,7 @@ test "refHist skips the warmup and returns null when the band is never reached" 
     const b64 = try h0.encodeBase64(gpa);
     defer gpa.free(b64);
 
-    // In-band by rate, but at t<3 — the warmup exclusion must drop it.
+    // In-band by rate, but at t<3: the warmup exclusion must drop it.
     const warmup = [_]TsRow{.{ .t = 1, .target_rate = 2000, .latency_histogram = b64 }};
     try std.testing.expect((try refHist(gpa, &warmup, 2000, 0.20)) == null);
 
@@ -677,7 +577,7 @@ test "isSaturated flags a histogram pegged at zrk's 60s ceiling" {
     h.record(1000);
     try std.testing.expect(!isSaturated(&h));
 
-    // What a real c10k run recorded before the deadline SLO was introduced.
+    // A real c10k run before the deadline SLO.
     h.record(60_000_000);
     try std.testing.expect(isSaturated(&h));
 }

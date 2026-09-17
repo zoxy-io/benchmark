@@ -1,19 +1,9 @@
 //! Running commands on the other two VMs, with deadlines that actually fire.
 //!
-//! The old harness had no timeout of any kind: every `ssh` used only
-//! `-o BatchMode=yes`, with no `ConnectTimeout`, no `ServerAliveInterval`, and
-//! no wall-clock bound. The ramp invocation in particular was silent for 300s,
-//! which sits right inside the 300-350s idle window cloud NAT gateways commonly
-//! enforce — so a dropped session left the driver blocked forever. That is
-//! survivable when a human is watching and fatal when nothing is.
-//!
-//! Every call here therefore carries a deadline, and a timed-out child is killed
-//! by process GROUP so a wedged `ssh` cannot outlive it. Partial output is
-//! RETURNED rather than discarded, because a killed command's stdout is usually
-//! the only evidence of what went wrong.
-//!
-//! Nothing here logs an argv by default. Command lines carry the peers' private
-//! addresses (compose needs `BACKENDn_IP`), and this output is published.
+//! Every call has a deadline (a silent ssh can sit forever behind a NAT idle
+//! timeout); a timed-out child is killed by process group and its partial
+//! output returned. Never log an argv by default: it carries private peer
+//! addresses and the output is published.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,8 +16,7 @@ pub const Outcome = struct {
     term: std.process.Child.Term,
     stdout: []u8,
     stderr: []u8,
-    /// The deadline fired and the child was killed. `term` is then whatever the
-    /// kill produced and says nothing about the command's own outcome.
+    /// The deadline fired and the child was killed; `term` then reflects the kill.
     timed_out: bool,
 
     pub fn ok(self: Outcome) bool {
@@ -48,68 +37,29 @@ pub const Outcome = struct {
 
 pub const ExecOptions = struct {
     deadline_ns: u64,
-    /// Cap on captured output; beyond this the tail is dropped. Guards against
-    /// a command that decides to stream forever.
+    /// Cap on captured output; beyond this the tail is dropped.
     max_output: usize = 1 << 20,
-    /// Log the argv on failure. Off by default because argv carries peer
-    /// addresses; turn it on only for commands built from constants.
+    /// Log the argv on failure. Only for commands built from constants: argv
+    /// carries peer addresses.
     log_argv: bool = false,
-    /// Called once, immediately BEFORE the deadline's kill — the last moment the
-    /// child's state can still be observed.
-    ///
-    /// It exists because the evidence a timeout needs is usually destroyed by the
-    /// timeout itself: a wedged ramp holds thousands of ESTABLISHED connections,
-    /// and killing it closes every one, so a census read after the fact reports an
-    /// aftermath instead of the wedge. /proc/net is per-netns and the loadgen runs
-    /// this child on the host, so the parent can read the child's sockets — but
-    /// only while it is alive.
-    ///
-    /// Must not touch `io`: by definition this fires when something has already
-    /// failed to finish, and a hook that can block is a hook that turns a bounded
-    /// timeout back into a hang.
+    /// Called once, just BEFORE the deadline's kill, to observe state the kill
+    /// destroys (e.g. the wedged ramp's sockets). Must not touch `io` or block.
     on_deadline: ?*const fn () void = null,
-    /// Print the child's output AS IT ARRIVES rather than only when it exits.
-    ///
-    /// Off by default: for the short control commands the buffered-and-echoed-on-
-    /// failure behaviour is what you want. On for the ramp, which is the one child
-    /// that runs for minutes, because buffering it has two costs that only show up
-    /// when something is wrong. Run #24: haproxy's ramp wedged, the watchdog ended
-    /// the parent, and the child's ENTIRE buffer died with it unprinted — the one
-    /// proxy whose output was wanted was the only one guaranteed not to produce
-    /// any. And even on a clean kill the parent echoes a tail, so the earlier
-    /// lines are gone; meanwhile the runner tailing the journal sees nothing at
-    /// all for 15 minutes and the whole step looks hung.
+    /// Print the child's output as it arrives, not only at exit. For the
+    /// long-running ramp: buffered output dies with a killed parent (run #24).
     stream_output: bool = false,
 };
 
 /// How long a killed child gets to actually die before we stop waiting for it.
 const kill_grace_ns: u64 = 5 * std.time.ns_per_s;
 
-/// SIGKILL the child's whole process GROUP, and reap nothing.
-///
-/// Not `Child.kill`, for two reasons.
-///
-/// It signals the direct child only, so an `ssh` that has forked leaves the
-/// grandchild holding the connection — the thing `.pgid = 0` was set up to
-/// prevent. A negative pid targets the group, which with `.pgid = 0` is exactly
-/// this child and its descendants.
-///
-/// And it reaps: it waits on the child it just signalled, which races the
-/// `Waiter` already waiting on the same pid. The waiter wins, `Child.kill`'s
-/// `waitpid` gets ECHILD, and std reads that as a double-free — a hard panic in
-/// a Debug build (so `bench suite --local` died on any deadline), silently
-/// swallowed in the ReleaseFast build the fleet runs, which instead lost the
-/// exit status and left the term `unknown`. Leaving the reap to the one thread
-/// already doing it removes the race rather than tolerating it.
-///
-/// Takes the pid rather than the `Child`, because `Child.id` is set to null by
-/// whichever of `wait`/`kill` runs first — so by the time a deadline fires the
-/// waiter may already have cleared the only record of what to signal.
+/// SIGKILL the child's whole process group, and reap nothing. Not
+/// `Child.kill`: it signals only the direct child (leaving an ssh grandchild),
+/// and its reap races `Waiter` (ECHILD: Debug panic, lost term in release).
+/// Takes the pid because `Child.id` is nulled by whichever reaps first.
 fn killGroup(pid: std.posix.pid_t) void {
-    // A direct libc call, deliberately: nothing here may touch `io`, which by
-    // definition is already failing to make progress when a deadline fires.
-    // Not `std.os.linux.kill` — that compiles on any target but issues a Linux
-    // syscall, which on Darwin traps SIGSYS and kills the CALLER instead.
+    // Libc kill, not `io` (already stuck). Not `std.os.linux.kill`: a Linux
+    // syscall on Darwin traps SIGSYS and kills the caller.
     std.posix.kill(-pid, .KILL) catch {};
 }
 
@@ -125,13 +75,11 @@ pub fn exec(
         .stdin = .close,
         .stdout = .pipe,
         .stderr = .pipe,
-        // Its own process group, so killing on deadline reaches any grandchild
-        // ssh has spawned rather than leaving one holding the connection.
+        // Own process group, so a deadline kill reaches ssh's grandchildren.
         .pgid = 0,
     });
-    // Captured now, while it is still there to capture: `Child.id` is cleared by
-    // the reap, and the reap happens on another thread. With `.pgid = 0` the
-    // child's group id IS its pid, so this is the group to signal.
+    // Capture now: the reap on another thread clears `Child.id`. With
+    // `.pgid = 0` the pid is also the group id.
     const pid = child.id.?;
 
     var out: std.ArrayList(u8) = .empty;
@@ -141,10 +89,7 @@ pub fn exec(
 
     var timed_out = false;
 
-    // Race the child against the deadline. Draining both pipes concurrently
-    // matters: a command that fills the stderr pipe while we block reading
-    // stdout would deadlock, which is exactly how a verbose `docker build`
-    // would hang the suite.
+    // Drain both pipes concurrently, or a full stderr pipe deadlocks the child.
     var group: Io.Group = .init;
     defer group.cancel(io);
 
@@ -157,28 +102,19 @@ pub fn exec(
     var wait_group: Io.Group = .init;
     wait_group.async(io, Waiter.run, .{&waiter});
 
-    // Poll rather than select, so this stays provider-agnostic between the
-    // Threaded Io used on the runner and zio's used during a ramp.
+    // Poll rather than select, to stay agnostic between Threaded Io and zio.
     const step_ns: u64 = 50 * std.time.ns_per_ms;
     var waited: u64 = 0;
     while (!waiter.done.load(.acquire)) {
         if (waited >= opts.deadline_ns) {
-            // Re-checked before committing to the timeout, for the child that
-            // finishes right on the wire: reporting it `timed_out` would be a
-            // lie, and a pid that has already been reaped can be REUSED, so
-            // signalling it would aim SIGKILL at whatever inherited the number.
+            // Re-check: a child that just finished isn't timed out, and its pid may
+            // already be reused.
             if (waiter.done.load(.acquire)) break;
             timed_out = true;
             if (opts.on_deadline) |hook| hook();
             killGroup(pid);
-            // Let `Waiter` do the reaping, then move on.
-            //
-            // SIGKILL is prompt, so this normally returns on the first tick. It
-            // is bounded anyway because "prompt" is not "guaranteed": a process
-            // blocked in an uninterruptible kernel operation — the ramp child
-            // sitting in io_uring is exactly that shape — does not die until the
-            // operation completes, and waiting on it without a bound would put
-            // the hang straight back.
+            // Let `Waiter` reap. Bounded: a child stuck in an uninterruptible op
+            // (e.g. io_uring) may not die promptly.
             var grace: u64 = 0;
             while (!waiter.done.load(.acquire) and grace < kill_grace_ns) {
                 io.sleep(.fromNanoseconds(step_ns), .awake) catch break;
@@ -240,12 +176,8 @@ const Drain = struct {
     }
 
     /// Print every COMPLETE line accumulated since the last call.
-    ///
-    /// Line-at-a-time, not chunk-at-a-time, and that is the whole reason this is
-    /// not simply `.inherit` on the child's stdio: `redact.scrub` matches an
-    /// address as a literal, so a read boundary falling inside one would let it
-    /// through unscrubbed. Scrubbing whole lines out of the contiguous
-    /// accumulation buffer means a read can split anything it likes.
+    /// Print every complete line accumulated since the last call. Whole lines
+    /// only, so a read boundary can't split an address past `redact.scrub`.
     fn flushLines(self: *Drain) void {
         const pending = self.into.items[self.echoed..];
         const end = std.mem.lastIndexOfScalar(u8, pending, '\n') orelse return;
@@ -261,16 +193,13 @@ const Drain = struct {
 };
 
 /// Print `text` a line at a time, each line scrubbed.
-///
-/// Per line rather than in one pass because `scrub` stops at the end of its
-/// output buffer: handing it a whole burst would silently drop the tail.
+/// Per line because `scrub` truncates at the end of its output buffer.
 fn printScrubbed(text: []const u8) void {
     var scrubbed: [4096]u8 = undefined;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        // `scrub` can only grow a line (each address becomes a longer
-        // placeholder), so an over-long one is truncated rather than risked.
+        // Cap at half the buffer so the scrubbed line always fits.
         const safe = line[0..@min(line.len, scrubbed.len / 2)];
         std.debug.print("{s}\n", .{redact.scrub(&scrubbed, safe)});
     }
@@ -283,16 +212,9 @@ pub const Ssh = struct {
     user: []const u8 = "ubuntu",
 
     /// The options every connection gets.
-    ///
-    /// `StrictHostKeyChecking=yes` against a PINNED known_hosts is possible here
-    /// only because terraform generates the host keys and injects them at boot,
-    /// so they are known before the VM exists. Trust-on-first-use would be the
-    /// usual compromise for ephemeral hosts; this avoids it.
-    ///
-    /// `ServerAliveInterval`/`ServerAliveCountMax` bound a silent session to
-    /// ~120s of no traffic. The ramp is silent for far longer than that by
-    /// design, so `bench suite` runs it locally rather than over ssh — these
-    /// options exist for the short control commands.
+    /// The options every connection gets. Host keys are pinned (terraform
+    /// generates and injects them). ServerAlive bounds a silent session to ~120s,
+    /// so the long silent ramp must not run over ssh.
     pub fn argv(
         self: Ssh,
         arena: Allocator,
@@ -328,85 +250,51 @@ pub const Ssh = struct {
 };
 
 /// Where a control command runs.
-///
-/// The two arms differ only in how the command string is delivered — over ssh to
-/// a fleet VM, or to a local shell for `bench suite --local`. Both hand the
-/// command to a shell, so `cd x && docker compose ...` means the same thing
-/// either way and the suite needs no separate code path per mode.
+/// Where a control command runs: ssh to a fleet VM, or a local shell for
+/// `bench suite --local`. Both go through a shell, so commands are identical.
 pub const Host = union(enum) {
     remote: struct { ssh: Ssh, addr: []const u8 },
     local,
 };
 
 /// The tail of one captured stream, redacted and printed under `label`.
-///
-/// 16 KiB, not 1 KiB. BuildKit prints the real error FIRST and then its own
-/// epilogue — a Dockerfile source frame plus a `failed to solve: process
-/// "/bin/sh -c ..."` line echoing the whole RUN command — and that boilerplate
-/// alone runs well past 1 KiB. So on a `docker compose build` failure, which is
-/// the single most common thing this function has to explain, a 1 KiB tail was
-/// GUARANTEED to be pure epilogue with the compiler's output cut off the front.
-///
-/// `exec` already keeps the first 1 MiB of each stream (max_output), so this
-/// only bounds what gets PRINTED — the data was there.
+/// The tail of one captured stream, redacted and printed under `label`.
+/// 16 KiB because BuildKit's epilogue alone exceeds 1 KiB and would hide the
+/// real error.
 fn printTail(arena: Allocator, label: []const u8, stream: []const u8) !void {
     if (stream.len == 0) return;
     const keep = 16 * 1024;
     const tail = stream[stream.len -| keep..];
-    // Heap, not a stack array: `scrub` silently stops at the end of its output
-    // buffer, so a buffer smaller than the slice would trade the truncation
-    // above for the same truncation one layer down. Every registered address is
-    // longer than the `<addr>` it becomes, so the result cannot outgrow its
-    // input.
+    // Heap-sized to the tail: `scrub` truncates at its buffer end, and a
+    // scrubbed result never outgrows its input.
     const scrubbed = try arena.alloc(u8, tail.len);
     std.debug.print("  [{s}] {s}\n", .{ label, redact.scrub(scrubbed, tail) });
 }
 
 /// How long ssh waits for a connection, and for the banner that follows it.
-///
-/// Named rather than inlined into `argv` because `connect_retry_budget_ns`
-/// below is derived from it: a failed connect costs at most this, and the
-/// suite's watchdog arithmetic needs that number to stay true.
+/// How long ssh waits for a connection and banner. `connect_retry_budget_ns`
+/// derives from it.
 const connect_timeout_s: u64 = 10;
 
 /// Transport retries: attempts, and the wait between them.
-///
-/// The proxy VM's sshd goes away for a few seconds at a time — an apt upgrade
-/// restarting a socket-activated `ssh.socket` is the shape it has — and every
-/// control command that lands in that window used to be lost outright. Run
-/// 32885230435 (2026-08-25 18:41) is what that costs: haproxy's identity check
-/// got `Connection refused`, so did its teardown, the container was left
-/// running, and nginx and pingora then both aborted on `ForeignProxyRunning`.
-/// One refused connect, three proxies with no data, and a green workflow.
+/// Transport retries: attempts, and the wait between them. sshd on the proxy
+/// VM can vanish for seconds (e.g. apt restarting `ssh.socket`); see run
+/// 32885230435.
 pub const connect_attempts: u32 = 3;
 pub const connect_retry_backoff_ns: u64 = 5 * std.time.ns_per_s;
 
 /// The most wall clock retrying can add to ONE `check`, over its own deadline.
-///
-/// Only a connection that never came up is retried, and `ConnectTimeout` bounds
-/// exactly that — so a retried attempt costs the timeout, never the command's
-/// full deadline. Exported because `suite.deadline.turn` has to count it: a
-/// stage that can now run longer than the watchdog's sum was budgeted for is
-/// precisely the run #24 inversion, where the watchdog wins a race it should
-/// always lose and one slow proxy takes every proxy after it.
+/// The most wall clock retrying can add to ONE `check`. Only failed connects
+/// are retried, so each retry costs the connect timeout. `suite.deadline.turn`
+/// must count it, or the watchdog can fire first (run #24).
 pub const connect_retry_budget_ns: u64 =
     (connect_attempts - 1) * (connect_timeout_s * std.time.ns_per_s + connect_retry_backoff_ns);
 
 /// Whether ssh failed BEFORE the remote command could have started.
-///
-/// This is the whole safety argument for retrying. Each of these three is
-/// emitted strictly pre-authentication — a refused or timed-out connect, a
-/// banner that never arrived, a key exchange the peer closed — so the command
-/// provably never ran and running it again cannot repeat a side effect.
-///
-/// Deliberately NOT matched: a bare `Connection closed by remote host` with no
-/// `kex_exchange_identification` prefix, which is a session dropped MID-command.
-/// Retrying that would re-run a `docker compose up` that had already taken
-/// effect. When in doubt the answer is to fail, because a lost turn is visible
-/// and a silently repeated one is not.
-///
-/// 255 is ssh's own "I failed" status. A remote command that happens to exit
-/// 255 lands here too, which is why the stderr marker — not the code — decides.
+/// Whether ssh failed BEFORE the remote command could have started, so a retry
+/// cannot repeat a side effect. A bare `Connection closed by remote host` is a
+/// mid-command drop and must NOT match. Exit 255 alone is not enough (a remote
+/// command can exit 255); the stderr marker decides.
 fn isConnectFailure(res: Outcome) bool {
     if (res.timed_out) return false;
     if (res.term != .exited or res.term.exited != 255) return false;
@@ -420,9 +308,8 @@ fn isConnectFailure(res: Outcome) bool {
     return false;
 }
 
-/// Run a command on `host`, returning an error if it did not succeed. Both of
-/// the child's streams are passed through the redaction filter before being
-/// logged.
+/// Run a command on `host`, returning an error if it did not succeed. Output
+/// is redacted before logging.
 pub fn check(
     gpa: Allocator,
     arena: Allocator,
@@ -440,8 +327,6 @@ pub fn check(
     const res = while (true) : (attempt += 1) {
         const r = try exec(gpa, io, argv, .{ .deadline_ns = deadline_ns });
         if (r.ok() or attempt >= connect_attempts or !isConnectFailure(r)) break r;
-        // Freed rather than leaked: `check` is called ~10 times per proxy turn
-        // and a retried connect's output is of no interest to anyone.
         gpa.free(r.stdout);
         gpa.free(r.stderr);
         redact.log("bench: {s}: ssh could not connect (attempt {d}/{d}), retrying", .{
@@ -452,19 +337,8 @@ pub fn check(
     if (!res.ok()) {
         var buf: [64]u8 = undefined;
         redact.log("bench: {s} failed ({s})", .{ what, res.describe(&buf) });
-        // BOTH streams, stdout first. Only printing stderr is how two zoxy
-        // build failures in a row (runs 30693210951 and 30749146321) came out
-        // as nothing but a Dockerfile source frame: `docker compose build`
-        // splits its output, and the half this was printing is the useless
-        // half. Compose writes its own progress lines and the `failed to
-        // solve:` epilogue to stderr, while BuildKit writes the STEP LOG — the
-        // `#N 12.3 <line>` echo of everything the RUN itself printed, i.e. the
-        // compiler's actual error — to stdout. Widening the stderr tail from
-        // 1 KiB to 16 KiB after the first occurrence therefore bought nothing:
-        // the cause was never on that stream to begin with.
-        //
-        // stdout first because that is the cause and stderr is the epilogue,
-        // which is also the order BuildKit emits them in.
+        // Both streams, stdout first: BuildKit writes the step log (the real
+        // error) to stdout, compose's epilogue to stderr.
         try printTail(arena, "stdout", res.stdout);
         try printTail(arena, "stderr", res.stderr);
         return error.RemoteCommandFailed;
@@ -473,9 +347,7 @@ pub fn check(
 }
 
 test "the streaming echo consumes only complete lines" {
-    // The property that makes streaming safe to scrub: a read boundary landing
-    // inside a line — or inside an ADDRESS — never reaches `scrub`, because
-    // nothing is printed until its newline arrives.
+    // A split line (or address) is never printed before its newline arrives.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     var d = Drain{
@@ -503,14 +375,11 @@ test "the streaming echo consumes only complete lines" {
     try std.testing.expectEqual(@as(usize, 6), d.echoed);
 }
 
-/// Set by the test below; a hook is a plain fn, so there is nowhere else to
-/// record that it ran.
+/// Set by the test below's hook, which is a plain fn.
 var hook_fired: bool = false;
 
 test "the deadline hook runs, and runs before the child is killed" {
-    // The ordering is the entire point: the hook exists to observe state that
-    // the kill destroys. The child below never finishes on its own, so a hook
-    // that fires at all can only have fired on the deadline path.
+    // The child never exits, so a fired hook can only be the deadline path.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
 
@@ -518,11 +387,7 @@ test "the deadline hook runs, and runs before the child is killed" {
     const res = try exec(
         std.testing.allocator,
         threaded.io(),
-        // Absolute path, because a test has no PATH: it comes from
-        // `std.process.Init`, which only `main` receives, so a bare `sleep`
-        // here fails to resolve with FileNotFound. Sleeping rather than
-        // spinning, so that a child this test fails to kill costs an idle
-        // process rather than a pinned core.
+        // Absolute path: tests have no PATH (it comes from `std.process.Init`).
         &.{ "/bin/sleep", "60" },
         .{
             .deadline_ns = 200 * std.time.ns_per_ms,
@@ -540,8 +405,7 @@ test "the deadline hook runs, and runs before the child is killed" {
     try std.testing.expect(!res.ok());
     try std.testing.expect(hook_fired);
 
-    // The termination survives the kill, which is the other half of `killGroup`:
-    // reaping from two threads lost it to ECHILD and left this `unknown`.
+    // The term survives the kill (single reaper; see `killGroup`).
     switch (res.term) {
         .signal => |s| try std.testing.expectEqual(@as(u32, 9), @intFromEnum(s)),
         else => return error.TestExpectedSignalledChild,
@@ -554,11 +418,7 @@ test "no hook is not an error" {
     const res = try exec(
         std.testing.allocator,
         threaded.io(),
-        // Absolute path, because a test has no PATH: it comes from
-        // `std.process.Init`, which only `main` receives, so a bare `sleep`
-        // here fails to resolve with FileNotFound. Sleeping rather than
-        // spinning, so that a child this test fails to kill costs an idle
-        // process rather than a pinned core.
+        // Absolute path: tests have no PATH (it comes from `std.process.Init`).
         &.{ "/bin/sleep", "60" },
         .{ .deadline_ns = 200 * std.time.ns_per_ms },
     );
@@ -574,16 +434,13 @@ test "Outcome.ok is true only for a clean exit" {
     const nonzero: Outcome = .{ .term = .{ .exited = 1 }, .stdout = "", .stderr = "", .timed_out = false };
     try std.testing.expect(!nonzero.ok());
 
-    // A command killed on deadline may still report Exited(0) from the kill
-    // path; the timeout flag must veto it, or a timed-out ramp would be
-    // recorded as a successful one.
+    // A timed-out command must not be ok, whatever its term.
     const late: Outcome = .{ .term = .{ .exited = 0 }, .stdout = "", .stderr = "", .timed_out = true };
     try std.testing.expect(!late.ok());
 }
 
 test "only a pre-authentication ssh failure is retryable" {
-    // `Outcome.stderr` is the owned, mutable slice `exec` hands back; a string
-    // literal is const, so the test has to shed that to build one by hand.
+    // Builds an Outcome; `stderr` is mutable there, so literals need @constCast.
     const at = struct {
         fn f(stderr: []const u8, timed_out: bool) Outcome {
             return .{
@@ -600,15 +457,13 @@ test "only a pre-authentication ssh failure is retryable" {
     try std.testing.expect(isConnectFailure(at("Connection timed out during banner exchange\n", false)));
     try std.testing.expect(isConnectFailure(at("kex_exchange_identification: Connection closed by remote host\n", false)));
 
-    // A session dropped MID-command. The command may already have taken
-    // effect, so this one must NOT be retried — see isConnectFailure's note.
+    // Mid-command drop: may have taken effect, must NOT be retried.
     try std.testing.expect(!isConnectFailure(at("Connection closed by 10.10.0.27 port 22\n", false)));
 
     // The remote command's own 255, which says nothing about the transport.
     try std.testing.expect(!isConnectFailure(at("docker: no such container\n", false)));
 
-    // A killed child is the deadline's business, not the transport's: its
-    // command HAD started, and `exec` already reports it as timed out.
+    // A killed child had started its command; that's the deadline's business.
     try std.testing.expect(!isConnectFailure(at(refused, true)));
 
     // A clean exit is never a transport failure, whatever is on stderr.

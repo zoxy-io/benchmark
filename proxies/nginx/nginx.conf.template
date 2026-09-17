@@ -1,16 +1,6 @@
-# L7 HTTP reverse proxy :8080 -> the backend0..backend3 pool, plus a TLS
-# listener on :8443 for the TLS profiles only (see the bottom of this file, and
-# tls-server.conf.template) (parity with every
-# other proxy here — parse HTTP/1.1, pick an origin, reverse-proxy the request,
-# keeping both the client and the pooled upstream connection alive). This is an
-# envsubst template (official-image mechanism): worker count is hardcoded to 1
-# to match the 1-CPU quota (explicit — `auto` would count HOST cores and
-# oversubscribe the cgroup, the trap haproxy's nbthread / envoy's --concurrency
-# avoid too). Access logging is ON, to stdout, in the official image's own
-# stock `main` format (see the http block). Each
-# `backendN` resolves once at startup via the container's resolver (bridge DNS)
-# or /etc/hosts (cloud extra_hosts); the origins are already healthy by then
-# (depends_on), so no runtime resolver is needed — same as pingora.
+# L7 reverse proxy -> backend0..3; TLS server only on TLS profiles (25-tls.sh).
+# envsubst template. 1 worker for the 1-CPU quota (`auto` counts host cores).
+# backendN resolves once at startup; origins are healthy by then (depends_on).
 worker_processes 1;
 worker_rlimit_nofile 262144;
 error_log /tmp/error.log warn;
@@ -22,132 +12,55 @@ events {
 }
 
 http {
-    # Access log -> the container's stdout, in the format the official nginx
-    # image ships. This whole file REPLACES that image's default nginx.conf, so
-    # `main` is reproduced here verbatim (combined + $http_x_forwarded_for)
-    # rather than inherited — a stock nginx logs this line, and the cost of
-    # writing it belongs in the numbers.
-    #
-    # Each proxy here logs in its own idiomatic format rather than a common
-    # one, so the line each writes is the line its own operators would read.
-    # The formats differ in length (roughly 90-250 bytes across the five, this
-    # being among the shortest), which has to be read WITH the numbers.
+    # The official image's stock `main` format, reproduced because this file
+    # replaces its nginx.conf. Each proxy logs in its own format.
     log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                     '$status $body_bytes_sent "$http_referer" '
                     '"$http_user_agent" "$http_x_forwarded_for"';
 
-    # A FILE, not stdout. Writing to stdout means writing to a pipe that
-    # dockerd drains; when dockerd falls behind, the 64 KiB pipe buffer fills
-    # and nginx's worker BLOCKS on the log write — at which point the ramp is
-    # measuring dockerd's log driver rather than nginx. A regular file goes to
-    # page cache and returns, with the kernel flushing it out of band.
-    #
-    # /tmp because it is the one path writable by every proxy image's user
-    # without a mkdir or a chown: envoy and haproxy both run non-root (envoy
-    # already writes /tmp/envoy.yaml in its own compose command), and the
-    # official nginx image's /var/log/nginx/access.log is a SYMLINK to
-    # /dev/stdout, which is exactly what this is avoiding. The path is uniform
-    # across all five so no proxy's sink is quietly different from another's.
-    # It is a benchmark's choice, not a production one.
-    #
-    # No `buffer=`/`gzip=` on purpose. Unbuffered is nginx's DEFAULT, so this is
-    # one write() per request — the stock behaviour, and the one worth
-    # measuring. Turning on a 64k buffer here would be tuning nginx's logging
-    # while the other four run theirs as shipped.
+    # A file, not stdout: a full stdout pipe blocks the worker on dockerd.
+    # /tmp is writable by every proxy image (the image's access.log links to
+    # /dev/stdout). Unbuffered, nginx's default: don't tune one proxy's log.
     access_log /tmp/access.log main;
     server_tokens off;
 
-    # Four origins. nginx's default balancing method IS round-robin, which is
-    # what every proxy in this comparison is pinned to — stated here rather
-    # than left implicit, because it now decides something. No `least_conn`,
-    # no weights.
-    #
-    # `max_fails=0` is NOT cosmetic. Unlike the others, nginx ships PASSIVE
-    # health checking on by default (max_fails=1, fail_timeout=10s): one failed
-    # connection ejects that origin from balancing for ten seconds. Every
-    # backend stays up for the whole run, so this never fires in the healthy
-    # case — but this benchmark deliberately drives the proxy past its knee,
-    # and a connection error there would silently drop nginx to a three-origin
-    # pool mid-ramp while haproxy (no `check`), envoy, pingora and zoxy all
-    # keep hammering four. That is an availability feature masquerading as
-    # throughput, so it is turned off rather than measured.
+    # Round-robin (nginx default), as on every proxy.
+    # `max_fails=0` is required: nginx's default passive health check would
+    # eject an origin for 10s on one error past the knee, unlike the others.
     upstream origin {
         server backend0:9000 max_fails=0;
         server backend1:9000 max_fails=0;
         server backend2:9000 max_fails=0;
         server backend3:9000 max_fails=0;
 
-        # Pool + keep-alive the upstream leg for parity with the other L7
-        # proxies (haproxy http-reuse, envoy/pingora pools, zoxy's per-endpoint
-        # idle lists). Without this nginx opens a fresh backend connection per
-        # request and pays a connect on the hot path.
-        #
-        # 2048, not 512, and for the same reason pingora's pool was multiplied:
-        # this cache is per WORKER and shared across every server in the group,
-        # so with four origins 512 would leave ~128 idle connections each and
-        # reintroduce exactly the per-request connect this line exists to
-        # prevent. Round-robin means one client connection rotates through all
-        # four, so each wants a warm upstream.
+        # Upstream keep-alive pool for parity with the other proxies. Per
+        # worker and shared by all four origins, hence 2048 not 512.
         keepalive 2048;
         keepalive_requests 1000000;
         keepalive_timeout 60s;
     }
 
     server {
-        # Rendered by the image's envsubst hook from the container environment.
-        # The listener port varies per (profile, proxy) turn on the cloud fleet
-        # — see compose.yaml's x-proxy-common for why — and this file is a
-        # mounted template, so compose's own `${}` interpolation never reaches
-        # it. Same mechanism the backend origin's template already uses for
-        # BACKEND_CPUS.
+        # Port varies per turn (compose.yaml x-proxy-common); rendered by the
+        # image's envsubst hook.
         listen ${PROXY_PORT} backlog=65535 reuseport;
         proxy_buffering off;
         include /etc/nginx/origin-location.conf;
     }
 
     # @TLS_BEGIN@
-    # The TLS listener, for the TLS profiles.
-    #
-    # EVERYTHING FROM THE MARKER ABOVE TO THE ONE BELOW IS DELETED from the
-    # rendered config on a plaintext turn, by 25-tls.sh in this image's
-    # /docker-entrypoint.d — the image's template hook substitutes variables, it
-    # cannot leave a block out, and a plaintext turn has to run the
-    # configuration it ran before TLS existed here rather than one with an extra
-    # listener and a loaded certificate in it. envoy's template carries the same
-    # markers for the same reason.
-    #
-    # NOTHING ELSE IN THIS FILE MAY SPELL EITHER MARKER, this comment included:
-    # sed's range ends at the first line matching the end marker, so naming it
-    # in the prose here closed the range early and left the block behind —
-    # nginx then died with `host not found in "ssl" of the "listen" directive`,
-    # which is what an unset port renders to.
-    #
-    # nginx terminates here and the upstream leg stays plaintext: the `origin`
-    # upstream above is the one both servers proxy to. Every proxy in the
-    # comparison does it that way, because zoxy terminates inbound only.
-    #
-    # The certificate is the run's own self-signed ECDSA P-256 pair, generated
-    # on the proxy host before any container starts and mounted read-only at
-    # /etc/bench/tls. All five load the same key material: a signature is per
-    # handshake, so an RSA key would charge one proxy CPU the others never pay —
-    # and zoxy would refuse it outright.
+    # TLS listener. This whole marked block is deleted by 25-tls.sh on a
+    # plaintext turn. NO OTHER LINE MAY SPELL EITHER MARKER: sed's range would
+    # end early and leave a broken listen directive.
+    # Upstream stays plaintext. Same ECDSA P-256 cert for all five proxies.
     server {
         listen ${PROXY_TLS_PORT} ssl backlog=65535 reuseport;
-        # TLS 1.3 only. The generator offers nothing else, so this changes no
-        # handshake — it pins what is being measured, identically across the
-        # five, instead of leaving each proxy's own default version range to
-        # decide it.
+        # TLS 1.3 only, pinned identically across proxies.
         ssl_protocols TLSv1.3;
         ssl_certificate     /etc/bench/tls/bench.crt;
         ssl_certificate_key /etc/bench/tls/bench.key;
-        # No `http2 on;`, which is nginx's default and is stated here because
-        # the other two proxies had to state the same thing: haproxy's TLS bind
-        # advertises h2 by default and negotiated HTTP/2 with an ALPN-offering
-        # client while this listener stayed on HTTP/1.1. Every number this
-        # benchmark publishes is HTTP/1.1, on all five proxies.
-        # Session tickets are nginx's default and are left alone: the generator
-        # never presents one (Zig's TLS client does not resume), so every
-        # connection here is a full handshake whatever this says.
+        # HTTP/1.1 only (no `http2 on;`), as on every proxy. Session tickets
+        # left default; the generator never resumes.
         include /etc/nginx/origin-location.conf;
         proxy_buffering off;
     }

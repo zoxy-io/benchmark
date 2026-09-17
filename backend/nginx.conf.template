@@ -1,11 +1,7 @@
-# The origin. Exists only to NOT be the bottleneck: canned fixed-size bodies
-# served from tmpfs (page cache), no logging on the hot path, no GOAWAY
-# mid-run, fds of the 4 bodies cached.
+# The origin: must never be the bottleneck. Canned bodies from tmpfs, no
+# hot-path logging, no mid-run connection churn.
 #
-# This is an envsubst template (official-image mechanism): worker count comes
-# from BACKEND_CPUS so it matches the container's cpu quota — `auto` would
-# count HOST cores and oversubscribe the cgroup. Same explicit-thread-parity
-# rule the proxies follow (nbthread / --concurrency / GOMAXPROCS).
+# worker_processes from BACKEND_CPUS: `auto` counts host cores, not the quota.
 worker_processes ${BACKEND_CPUS};
 worker_cpu_affinity auto;
 worker_rlimit_nofile 262144;
@@ -27,15 +23,13 @@ http {
     keepalive_requests 100000000; # no mid-run connection churn from the origin
     reset_timedout_connection on;
 
-    # The same 4 files are opened millions of times per ramp — cache the fds
-    # so the hot path never open()/stat()s.
+    # Cache the body fds: no open()/stat() on the hot path.
     open_file_cache max=64 inactive=300s;
     open_file_cache_valid 300s;
     open_file_cache_min_uses 1;
     open_file_cache_errors on;
 
-    # gzip stays off (default): compression would change transfer sizes and
-    # spend backend CPU — bodies must be byte-identical for every proxy.
+    # gzip off (default): bodies must be byte-identical for every proxy.
 
     server {
         listen 9000 backlog=65535 reuseport;

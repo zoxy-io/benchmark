@@ -1,14 +1,8 @@
 //! Builds the GitHub Pages site and the nightly-over-time trend chart.
 //!
-//! Only the most recent run is published — `actions/deploy-pages` replaces the
-//! site wholesale — so the run-to-run history lives in a single `history.ndjson`
-//! at the site root, fetched from the live site before deploying and republished
-//! with tonight's rows appended. That circularity is deliberate: it keeps
-//! history without a database, a branch, or a nightly commit.
-//!
-//! Losing history is explicitly survivable. A 404 on the first run, or a failed
-//! fetch, costs one night of trend data and nothing else, because the durable
-//! record is the workflow artifact rather than this page.
+//! `deploy-pages` replaces the site wholesale, so history lives in
+//! `history.ndjson`: fetched from the live site, appended, republished. Losing
+//! it costs trend data only; the durable record is the workflow artifact.
 
 const std = @import("std");
 
@@ -24,9 +18,8 @@ const Writer = std.Io.Writer;
 const css = @embedFile("assets/report.css");
 const js = @embedFile("assets/report.js");
 
-/// One row of history: a single proxy's result in a single profile on a single
-/// night. NDJSON so appending is a concatenation and a truncated write costs one
-/// line rather than the file.
+/// One row of history: one proxy, one profile, one night. NDJSON, so a
+/// truncated write costs one line.
 pub const HistoryRow = struct {
     runid: []const u8,
     ts: []const u8,
@@ -72,8 +65,7 @@ pub fn parseHistory(arena: Allocator, text: []const u8) ![]HistoryRow {
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
-        // A malformed line is skipped rather than fatal: history is a
-        // convenience, and one bad row must not cost the whole trend.
+        // Skip malformed lines; one bad row must not cost the whole trend.
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
         const o = v.object;
         try out.append(arena, .{
@@ -100,9 +92,8 @@ fn num(v: ?std.json.Value) ?f64 {
     };
 }
 
-/// Sustained throughput for `proxy` in `profile` on the most recent PRIOR run,
-/// used for the vs-last-night delta. Only `ok` rows count: comparing against a
-/// degraded night would report a regression that is really just a short ramp.
+/// Sustained for `proxy` in `profile` on the most recent PRIOR run, for the
+/// vs-last-night delta. Only `ok` rows: a degraded baseline fakes regressions.
 pub fn previousSustained(
     rows: []const HistoryRow,
     profile_name: []const u8,
@@ -121,15 +112,8 @@ pub fn previousSustained(
     return if (best) |b| b.sustained else null;
 }
 
-/// `prior` with any row `fresh` supersedes removed, then `fresh` appended.
-///
-/// A row is identified by (runid, profile, proxy) — one proxy's result in one
-/// profile on one night. Appending blindly is right for a new night, whose rows
-/// cannot already be there, and wrong for RE-publishing a run that is already in
-/// the published history: that run's rows would appear twice, and the trend
-/// would plot two points at the same x for the same proxy. Re-publishing exists
-/// precisely so a rendering fix can reach the site without a new fleet run, so
-/// it must be idempotent.
+/// `prior` minus rows `fresh` supersedes, then `fresh` appended. Rows are keyed
+/// by (runid, profile, proxy), so re-publishing a run is idempotent.
 pub fn mergeHistory(
     arena: Allocator,
     prior: []const HistoryRow,
@@ -153,15 +137,9 @@ pub fn mergeHistory(
     return out.toOwnedSlice(arena);
 }
 
-/// Whether a history row's status means it carries numbers worth drawing.
-///
-/// The same rule `artifact.Status.usable` states — ok or degraded — applied to
-/// the status as history.ndjson spells it. An unrecognised status is treated as
-/// not plottable: a row this build does not understand is not one to guess at.
-///
-/// Deliberately NOT used by `previousSustained`: excluding degraded nights from
-/// the delta BASELINE is correct for the reason documented there, and that is a
-/// different question from whether the night appears on the trend at all.
+/// Whether a history row carries numbers worth drawing: ok or degraded, as
+/// `artifact.Status.usable`. Unknown statuses are not plottable. Not used by
+/// `previousSustained`, which also excludes degraded.
 fn plottable(status: []const u8) bool {
     const s = std.meta.stringToEnum(artifact.Status, status) orelse return false;
     return s.usable();
@@ -179,17 +157,12 @@ pub const ProfileSummary = struct {
     failed: usize,
     connections: u32,
     deadline_ms: u64,
-    /// Load offered over TLS, terminated by the proxy. A column of its own on
-    /// the landing page rather than something to be inferred from the profile's
-    /// name — the trend chart plots these series side by side, and a reader
-    /// comparing two lines has to be able to see that one of them is encrypted.
+    /// Load offered over TLS, terminated by the proxy; shown as its own column.
     tls: bool = false,
 };
 
-/// The landing page: what ran, how it went, and the trend.
-/// `results_url` is where this run's `results.tar` can be downloaded, or empty
-/// when there is nowhere to point — a local run, or a fork with no bucket. The
-/// link is only drawn when there is something behind it.
+/// The landing page: what ran, how it went, and the trend. `results_url` is
+/// this run's `results.tar` download, or empty (no link drawn).
 pub fn renderIndex(
     arena: Allocator,
     out: *Writer,
@@ -213,15 +186,9 @@ pub fn renderIndex(
     try out.print("<h1>latest run <span class=\"rid\">{s}</span></h1>", .{runid});
     try out.print("<p class=\"meta\">Finished {s}. Only the most recent run is published here; " ++
         "every run's raw data is kept as a workflow artifact.", .{finished});
-    // The whole run in one download, straight from the bucket the loadgen
-    // uploaded it to. Everything the suite produced, including each proxy's
-    // error log — which is the artifact that says WHY a proxy is degraded, and
-    // is not otherwise reachable from this site.
-    //
-    // The retention is stated because it is shorter than this page's: the
-    // bucket drops a run after 30 days (see docs/SETUP.md), so a reader
-    // arriving at a stale site finds a dead link, and should be told why
-    // rather than left to guess.
+    // The whole run, including each proxy's error log, which is otherwise
+    // unreachable from this site. Retention is stated: the bucket drops runs
+    // after 30 days (docs/SETUP.md).
     if (results_url.len > 0) {
         try out.print(
             "<br>Everything this run measured, in one archive: " ++
@@ -254,11 +221,7 @@ pub fn renderIndex(
 
     // --- trend, one line per proxy per profile
     //
-    // Wrapped in the SAME `.grid2` html.zig's own chart section uses: `.card`
-    // itself carries no margin (the page resets `margin:0` globally), so
-    // spacing between these sections comes ENTIRELY from `.grid2`'s `gap` —
-    // without this wrapper, one profile's trend card sits flush against the
-    // next with no visible separation at all.
+    // Wrapped in `.grid2`: `.card` has no margin, spacing comes from its `gap`.
     var any_trend = false;
     for (profiles) |p| {
         if ((try trendSeries(arena, history, p.name)).series.len > 0) any_trend = true;
@@ -278,10 +241,7 @@ pub fn renderIndex(
                     "against the others of the same night rather than in absolute terms</p>",
                 .{p.name},
             );
-            // A static legend, not just the hover tooltip: this is the site's
-            // landing page, screenshotted and shared far more than a run
-            // report is, so a reader has to be able to tell the lines apart
-            // without moving the mouse.
+            // A static legend: the landing page is screenshotted, not hovered.
             try out.writeAll("<p class=\"legend\">");
             for (series) |s| {
                 try out.print("<span class=\"lgitem\"><span class=\"swatch s-{s}\"></span>{s}</span>", .{ s.name, s.name });
@@ -293,20 +253,13 @@ pub fn renderIndex(
                 .yfmt = .si,
                 .y_unit = "req/s",
                 .x_label = "run",
-                // x counts nights, so the axis ends on the last one and ticks
-                // land on whole runs — see Options.x_ordinal.
+                // x counts nights; see Options.x_ordinal.
                 .x_ordinal = true,
-                // One point per night, so the nights have to be visible as
-                // points. Without this a profile with a single night of
-                // history drew an empty chart — a one-point `<polyline>` has
-                // no segment to stroke — and the newest run was simply absent
-                // from the overview.
+                // One point per night; a single-night history needs markers.
                 .markers = true,
             }, series);
             try out.print("<div class=\"tooltip\" id=\"tip-{s}\" hidden></div></div>", .{id});
-            // x is a run INDEX here, not a rate — pass the run ids so hovering a
-            // night names it, instead of the tooltip claiming an offered req/s
-            // this chart has no axis for.
+            // x is a run index: pass run ids so the tooltip names the night.
             try svg.writeChartData(out, id, series, .si, null, .{
                 .name = "run",
                 .labels = trend.runids,
@@ -321,15 +274,11 @@ pub fn renderIndex(
     try out.writeAll("</script></body></html>");
 }
 
-/// One series per proxy, x = run index oldest-to-newest.
-///
-/// The x axis is an index rather than a date because runs are not evenly spaced
-/// — a night can be skipped — and plotting an index keeps every point visible
-/// instead of bunching them.
+/// One series per proxy, x = run index oldest-to-newest. An index, not a date,
+/// because runs are not evenly spaced.
 const Trend = struct {
     series: []svg.Series,
-    /// The run id at each x position, so the hover tooltip can name the night
-    /// instead of reporting a bare ordinal ("run 3" answers nothing).
+    /// The run id at each x, so the tooltip can name the night.
     runids: [][]const u8,
 };
 
@@ -358,19 +307,9 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
                 if (!std.mem.eql(u8, r.profile, profile_name)) continue;
                 if (!std.mem.eql(u8, r.proxy, proxy)) continue;
                 if (!std.mem.eql(u8, r.runid, rid)) continue;
-                // A failed night leaves a GAP rather than a zero, so the line
-                // does not dive to the floor and read as a collapse.
-                //
-                // GAP means failed or skipped — a night with no numbers. It
-                // does NOT mean degraded: that status is defined as "usable but
-                // incomplete", the run report ranks and charts it, and
-                // history.ndjson records it. Testing `status == "ok"` here (as
-                // this did) silently dropped those nights from the trend while
-                // still writing them to history, so the newest run could be
-                // absent from the overview for the whole night — and every
-                // reason a run gets marked degraded (a short ramp, absent
-                // cAdvisor samples, a stale zoxy build) is a reason someone
-                // would then go looking for it on exactly this chart.
+                // Failed/skipped nights leave a GAP, not a zero. Degraded
+                // nights are plotted: they are in history and are exactly the
+                // ones someone looks for.
                 if (!plottable(r.status)) continue;
                 try pts.append(arena, .{ .x = @floatFromInt(i), .y = r.sustained });
             }
@@ -379,10 +318,8 @@ fn trendSeries(arena: Allocator, history: []const HistoryRow, profile_name: []co
         try out.append(arena, .{
             .name = proxy,
             .pts = try pts.toOwnedSlice(arena),
-            // Historical only: `direct` was the no-proxy origin calibration and
-            // was drawn dashed so it read as a reference rather than a
-            // competitor. No run produces it any more, but nights before the
-            // removal are still in history — see report.proxy_order.
+            // Historical: `direct` (no-proxy baseline) is drawn dashed; old
+            // nights still carry it. See report.proxy_order.
             .dashed = std.mem.eql(u8, proxy, "direct"),
         });
     }
@@ -429,7 +366,7 @@ test "previousSustained picks the latest prior ok run" {
 test "previousSustained ignores degraded and failed nights" {
     const rows = [_]HistoryRow{
         .{ .runid = "20260726-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 40000 },
-        // A short ramp would report a huge fake regression if compared against.
+        // A short ramp would report a fake regression if compared against.
         .{ .runid = "20260727-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "degraded", .sustained = 9000 },
     };
     try std.testing.expectApproxEqAbs(
@@ -466,19 +403,14 @@ test "the trend leaves a gap for a failed night rather than plotting zero" {
     };
     const series = (try trendSeries(arena, &rows, "c1k")).series;
     try std.testing.expectEqual(@as(usize, 1), series.len);
-    // Three runs, two plotted points: the failed night is absent, not a zero
-    // that would read as a collapse.
+    // Three runs, two points: the failed night is absent, not zero.
     try std.testing.expectEqual(@as(usize, 2), series[0].pts.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0), series[0].pts[0].x, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 2), series[0].pts[1].x, 1e-9);
 }
 
 test "trend cards for multiple profiles sit inside one grid2, for spacing" {
-    // `.card` carries no margin of its own — every other multi-card section
-    // on this page relies on `.grid2`'s `gap` for spacing between cards, and
-    // this loop used to emit its `<section class="card">`s with no such
-    // wrapper at all, so consecutive profiles' trend charts sat flush against
-    // each other with no visible gap.
+    // Consecutive trend cards need the `.grid2` wrapper for spacing.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -539,7 +471,7 @@ test "the results.tar link is drawn only when there is somewhere to point" {
     try renderIndex(arena, &out, "r1", "t", &profiles, &.{}, url);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), url) != null);
 
-    // A local run has no bucket behind it, and a dead link is worse than none.
+    // A local run has no bucket: no link.
     var buf2: [256 * 1024]u8 = undefined;
     var out2: std.Io.Writer = .fixed(&buf2);
     try renderIndex(arena, &out2, "r1", "t", &profiles, &.{}, "");
@@ -551,12 +483,7 @@ test "the trend plots a degraded night — it is usable data, not a gap" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The bug this covers: the newest run was written to history.ndjson and
-    // then dropped from the trend, so the overview showed nothing for it. The
-    // filter tested `status == "ok"`, which also excluded `degraded` — and
-    // degraded is exactly the state a run lands in for a short ramp, absent
-    // cAdvisor samples, or a stale zoxy build, each of which is a reason to go
-    // looking for that night on this chart.
+    // Degraded nights, including the newest, must appear on the trend.
     const rows = [_]HistoryRow{
         .{ .runid = "20260730-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 40000 },
         .{ .runid = "20260731-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "degraded", .sustained = 41000 },
@@ -573,10 +500,9 @@ test "the trend plots a degraded night — it is usable data, not a gap" {
 test "plottable matches artifact.Status.usable, and distrusts what it cannot parse" {
     try std.testing.expect(plottable("ok"));
     try std.testing.expect(plottable("degraded"));
-    // No numbers to draw.
     try std.testing.expect(!plottable("failed"));
     try std.testing.expect(!plottable("skipped"));
-    // A status written by some other build: not guessed at.
+    // An unknown status is not guessed at.
     try std.testing.expect(!plottable("weird"));
     try std.testing.expect(!plottable(""));
 }
@@ -592,7 +518,7 @@ test "re-publishing a run replaces its history rows rather than doubling them" {
         .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
         .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "haproxy", .status = "ok", .sustained = 21000 },
     };
-    // Re-publishing that same run — the rendering changed, the numbers did not.
+    // Re-publishing that same run with new rendering.
     const fresh = [_]HistoryRow{
         .{ .runid = "20260801-000100", .ts = "t2", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
         .{ .runid = "20260801-000100", .ts = "t2", .profile = "c1k", .proxy = "haproxy", .status = "ok", .sustained = 21000 },
@@ -600,17 +526,14 @@ test "re-publishing a run replaces its history rows rather than doubling them" {
 
     const merged = try mergeHistory(arena, &prior, &fresh);
 
-    // Three rows, not five: the older night survives, the re-published one is
-    // replaced in place.
+    // Three rows, not five: the re-published night is replaced in place.
     try std.testing.expectEqual(@as(usize, 3), merged.len);
     try std.testing.expectEqualStrings("20260731-000100", merged[0].runid);
-    // And the fresh copy won, not the stale one.
+    // And the fresh copy won.
     try std.testing.expectEqualStrings("t2", merged[1].ts);
     try std.testing.expectEqualStrings("t2", merged[2].ts);
 
-    // The trend must therefore never see two points at the same x for one
-    // proxy — which is what a doubled row would produce, and the actual visible
-    // symptom of getting this wrong.
+    // No two points at the same x for one proxy.
     const series = (try trendSeries(arena, merged, "c1k")).series;
     try std.testing.expect(series.len > 0);
     for (series) |s| {
@@ -637,7 +560,7 @@ test "a genuinely new night is appended, not merged away" {
     };
     const fresh = [_]HistoryRow{
         .{ .runid = "20260801-000100", .ts = "t", .profile = "c1k", .proxy = "zoxy", .status = "ok", .sustained = 42000 },
-        // Same night, same proxy, DIFFERENT profile — not the same row.
+        // Same night and proxy, different profile: a different row.
         .{ .runid = "20260801-000100", .ts = "t", .profile = "c10k", .proxy = "zoxy", .status = "ok", .sustained = 20000 },
     };
 

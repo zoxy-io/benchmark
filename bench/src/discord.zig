@@ -1,16 +1,9 @@
-//! Posts the nightly summary to a Discord webhook.
+//! Posts the nightly summary to a Discord webhook: one embed per profile with
+//! the headline table, plus each report.html as an attachment.
 //!
-//! One embed per profile carrying the headline table, plus each profile's
-//! report.html as a file attachment. The table goes in the embed description as
-//! a fenced code block because Discord embeds have no table primitive and
-//! monospace alignment is the standard idiom.
-//!
-//! Two things this must get right, because the channel is public and the message
-//! is the only thing most people will ever read:
-//!
-//! * a failed proxy shows as FAILED with the stage it died at, never as a zero;
-//! * a saturated latency histogram shows as ">=60s", never as a number, since at
-//!   the clamp every tail percentile is the ceiling rather than a measurement.
+//! The channel is public, so:
+//! * a failed proxy shows as FAILED with its stage, never as a zero;
+//! * a saturated histogram shows as ">=60s", never as a number.
 
 const std = @import("std");
 
@@ -23,8 +16,7 @@ const svg = @import("svg.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Amber when every proxy is ok; the alarm hue when any failed. Both are the
-/// report's own palette, so the post and the page read as one artifact.
+/// Amber when every proxy is ok; the alarm hue when any failed (report palette).
 pub const color_ok: u32 = 0xfb9e0e;
 pub const color_fail: u32 = 0xf2705b;
 
@@ -39,18 +31,14 @@ pub const Row = struct {
     mem: ?f64 = null,
     /// Change in sustained throughput against the previous night, as a ratio.
     delta: ?f64 = null,
-    /// The row's leading caveat, printed under the table when the row is not
-    /// plain `ok`. Without it a degraded row is a bare "⚠" that says something
-    /// is wrong but not what — and the caveat this exists for, a stale zoxy
-    /// build, is the one that decides whether the number above it means
-    /// anything at all.
+    /// The row's leading caveat, printed under the table when not `ok`, so a
+    /// "⚠" says what is wrong (e.g. a stale zoxy build).
     note: ?[]const u8 = null,
 };
 
 pub const Embed = struct {
     title: []const u8,
-    /// Reference rate the latency columns were read at; stated because it
-    /// differs per profile.
+    /// Reference rate of the latency columns; differs per profile.
     ref_rate: f64,
     url: []const u8 = "",
     footer: []const u8 = "",
@@ -70,8 +58,7 @@ pub const Attachment = struct {
     bytes: []const u8,
 };
 
-/// Discord's documented per-message caps. Exceeding any of them is a 400, so
-/// they are asserted and the table truncated rather than discovered at runtime.
+/// Discord's per-message caps; exceeding any is a 400, so check up front.
 pub const limits = struct {
     pub const embeds = 10;
     pub const files = 10;
@@ -92,8 +79,7 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
     var num: [64]u8 = undefined;
     for (e.rows) |r| {
         if (!r.status.usable()) {
-            // No columns at all for a proxy that produced nothing — a row of
-            // dashes with a reason, never zeros that read as a measurement.
+            // A proxy that produced nothing: dashes with a reason, never zeros.
             const why = if (r.stage) |s| s.str() else "no data";
             try w.writer.print("{s:<9} {s:>10} · {s}\n", .{ r.name, "FAILED", why });
             continue;
@@ -108,7 +94,7 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
         }
 
         if (r.saturated) {
-            // The histogram clamped; printing a number here would be a fiction.
+            // The histogram clamped; a number here would be fiction.
             try w.writer.print(" {s:>9}", .{"≥60s"});
         } else if (r.p99_ms) |v| {
             try w.writer.print(" {d:>7.2}ms", .{v});
@@ -123,8 +109,7 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
         }
 
         if (r.delta) |d| {
-            // Explicit sign: "+2.4%" and "-3.1%" read as direction at a glance,
-            // where bare numbers do not.
+            // Explicit sign, so direction reads at a glance.
             const pct = d * 100;
             var db: [16]u8 = undefined;
             const txt = std.fmt.bufPrint(&db, "{s}{d:.1}%", .{ if (pct >= 0) "+" else "", pct }) catch "?";
@@ -137,8 +122,7 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
         try w.writer.writeByte('\n');
     }
 
-    // Caveats under the table rather than in it — they are sentences, and the
-    // columns above are aligned to stay readable in Discord's monospace block.
+    // Caveats go under the table, keeping the columns aligned.
     for (e.rows) |r| {
         if (r.status == .ok) continue;
         const n = r.note orelse continue;
@@ -146,27 +130,16 @@ pub fn renderTable(arena: Allocator, e: Embed) ![]const u8 {
     }
     try w.writer.writeAll("```");
 
-    // The embed title is a link, but a bare URL under the table is what people
-    // actually click, and it survives being quoted or copied elsewhere.
+    // A bare link under the table survives quoting and copying.
     if (e.url.len > 0) try w.writer.print("\n[full report]({s})", .{e.url});
 
     var out = w.toArrayList();
     return out.toOwnedSlice(arena);
 }
 
-/// Cut `table` to fit Discord's description limit, if it doesn't already.
-///
-/// A raw `table[0..limits.description]` — the previous behaviour — can land
-/// mid-way through the closing ` ``` ` fence or the `[full report]` link,
-/// leaving an unterminated code block, and can split a multi-byte UTF-8
-/// sequence, which is invalid inside a JSON string. Unreachable at today's
-/// proxy count (~5 rows fits in a few hundred bytes), but silent at the
-/// moment the roster grows past it rather than caught here.
-///
-/// Always drops the tail and rebuilds a clean closing sequence, regardless of
-/// where the cut lands relative to the original fence/link — simpler and
-/// exactly as correct as trying to detect whether the original tail survived
-/// the cut.
+/// Cut `table` to fit Discord's description limit, if needed. Always rebuilds
+/// the closing fence and link, and never splits a UTF-8 sequence (invalid in
+/// JSON).
 fn truncateTable(arena: Allocator, table: []const u8, url: []const u8) ![]const u8 {
     if (table.len <= limits.description) return table;
 
@@ -176,8 +149,7 @@ fn truncateTable(arena: Allocator, table: []const u8, url: []const u8) ![]const 
         "\n```";
 
     var cut = limits.description -| suffix.len;
-    // Never split a multi-byte UTF-8 sequence — a continuation byte has its
-    // top two bits as 10.
+    // Never split a UTF-8 sequence: continuation bytes are 0b10xxxxxx.
     while (cut > 0 and (table[cut] & 0xC0) == 0x80) cut -= 1;
 
     return std.fmt.allocPrint(arena, "{s}{s}", .{ table[0..cut], suffix });
@@ -190,11 +162,8 @@ pub fn renderPayload(
     embeds: []const Embed,
     files: []const Attachment,
 ) ![]const u8 {
-    // Runtime checks, not `std.debug.assert`: the nightly binary ships
-    // ReleaseFast (see .github/workflows/nightly.yml), where `assert`'s
-    // `unreachable` is undefined behavior rather than a caught panic, for a
-    // condition driven by runtime data (how many profiles/proxies ran) that
-    // can plausibly change, not a fixed internal invariant.
+    // Runtime checks, not `assert`: the nightly ships ReleaseFast, where a
+    // failed assert is UB, and these depend on runtime data.
     if (embeds.len > limits.embeds) return error.TooManyEmbeds;
     if (files.len > limits.files) return error.TooManyFiles;
 
@@ -251,16 +220,9 @@ pub fn renderPayload(
     return out.toOwnedSlice(arena);
 }
 
-/// Assemble the full multipart/form-data body.
 /// Add `wait=true` to a webhook URL, so Discord replies 200 with the created
-/// message instead of 204 No Content.
-///
-/// This is for the CONFIRMATION, not for the hang — a 200 means the message was
-/// actually created, where 204 only means the request was accepted. The hang
-/// that 204 used to cause is fixed by `keep_alive = false` at the call site, and
-/// that fix does not depend on Discord honouring this parameter (httpbingo.org
-/// ignores it and answers 204 regardless, which is exactly the case used to
-/// verify the real fix).
+/// message instead of 204. For confirmation only; the hang fix is
+/// `keep_alive = false` at the call site.
 pub fn withWait(arena: Allocator, webhook: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, webhook, "wait=") != null) return webhook;
     const sep: u8 = if (std.mem.indexOfScalar(u8, webhook, '?') != null) '&' else '?';
@@ -281,22 +243,22 @@ test "withWait appends the query the response depends on" {
         "https://x/y?thread_id=9&wait=true",
         try withWait(arena, "https://x/y?thread_id=9"),
     );
-    // Already asked for: left exactly as-is, so no duplicate parameter.
+    // Already present: left as-is, no duplicate parameter.
     try std.testing.expectEqualStrings(
         "https://x/y?wait=true",
         try withWait(arena, "https://x/y?wait=true"),
     );
 }
 
+/// Assemble the full multipart/form-data body.
 pub fn buildMultipart(
     arena: Allocator,
     boundary: []const u8,
     payload_json: []const u8,
     files: []const Attachment,
 ) ![]const u8 {
-    // A boundary occurring inside a part would split the body at the wrong
-    // place. It is random, so this should never fire — but a silently corrupted
-    // upload is worse than a loud failure.
+    // The boundary is random, but a corrupted upload is worse than a loud
+    // failure.
     if (std.mem.indexOf(u8, payload_json, boundary) != null) return error.BoundaryCollision;
     for (files) |f| {
         if (std.mem.indexOf(u8, f.bytes, boundary) != null) return error.BoundaryCollision;
@@ -351,7 +313,7 @@ pub fn post(
     const boundary = randomBoundary(io, &bbuf);
     const body = try buildMultipart(arena, boundary, payload, files);
 
-    // This is published. Refuse to send rather than leak an address.
+    // Published: refuse to send rather than leak an address.
     try redact.assertNoIps("the Discord message", body);
 
     if (dry_run) {
@@ -373,18 +335,13 @@ pub fn post(
             .content_type = ctype,
             .what = "Discord POST",
         }) catch |e| {
-            // A transport-level failure — DNS, connection refused/reset, a TLS
-            // handshake failure. This used to be a bare `try` on the fetch,
-            // which skipped this whole loop: the ONLY retried failure mode was
-            // a response that actually arrived with a bad status. For a
-            // one-shot call from an unattended job, a connection that never
-            // completes is the more likely way for this to fail.
+            // Transport-level failure (DNS, refused/reset, TLS handshake): the
+            // likeliest failure for an unattended job, so it is retried too.
             std.debug.print("bench: Discord POST failed ({s}), attempt {d}/3\n", .{ @errorName(e), attempt + 1 });
             io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
             continue;
         };
-        // `http.fetch` has already printed what timed out; this only adds
-        // which attempt it was.
+        // `http.fetch` already printed what timed out.
         const res = outcome orelse {
             std.debug.print("bench: ...that was attempt {d}/3\n", .{attempt + 1});
             io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
@@ -393,8 +350,7 @@ pub fn post(
         switch (res.status) {
             .ok, .no_content => return,
             .too_many_requests => {
-                // Back off before retrying; hammering straight away just gets
-                // rate limited again.
+                // Back off, or we just get rate limited again.
                 io.sleep(.fromNanoseconds(std.time.ns_per_s * @as(u64, attempt + 1) * 2), .awake) catch {};
                 continue;
             },
@@ -437,7 +393,7 @@ test "a saturated histogram prints as a floor, not a number" {
         .status = .ok,
         .sustained = 20000,
         .p50_ms = 5,
-        // What a real c10k run recorded before the deadline SLO existed.
+        // A real c10k run before the deadline SLO existed.
         .p99_ms = 60014.592,
         .saturated = true,
     }};
@@ -468,7 +424,7 @@ test "embed colour reflects whether anything failed" {
     try std.testing.expect(!(Embed{ .title = "t", .ref_rate = 2000, .rows = &ok_rows }).anyFailed());
     try std.testing.expect((Embed{ .title = "t", .ref_rate = 2000, .rows = &bad_rows }).anyFailed());
 
-    // A skipped proxy is also a reason to flag the run.
+    // A skipped proxy also flags the run.
     const skipped = [_]Row{.{ .name = "zoxy", .status = .skipped }};
     try std.testing.expect((Embed{ .title = "t", .ref_rate = 2000, .rows = &skipped }).anyFailed());
 }
@@ -490,7 +446,7 @@ test "multipart body frames every part and refuses a boundary collision" {
     try std.testing.expect(std.mem.indexOf(u8, body, "name=\"payload_json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "filename=\"report-c1k.html\"") != null);
 
-    // A part containing the boundary would split the body at the wrong place.
+    // A part containing the boundary would split the body.
     const evil = [_]Attachment{.{ .filename = "x", .content_type = "text/html", .bytes = "..BOUNDARY.." }};
     try std.testing.expectError(error.BoundaryCollision, buildMultipart(arena, "BOUNDARY", "{}", &evil));
 }
@@ -527,7 +483,7 @@ test "truncateTable always re-closes the fence and the link, never mid-cut" {
 
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(arena, "```\n");
-    // Comfortably past limits.description so this MUST be cut.
+    // Well past limits.description, so it must be cut.
     var i: usize = 0;
     while (i < 1000) : (i += 1) try buf.appendSlice(arena, "proxy row of table text\n");
     try buf.appendSlice(arena, "```\n[full report](https://example/report)");
@@ -535,8 +491,7 @@ test "truncateTable always re-closes the fence and the link, never mid-cut" {
     const out = try truncateTable(arena, buf.items, "https://example/report");
     try std.testing.expect(out.len <= limits.description);
     try std.testing.expect(std.mem.endsWith(u8, out, "```\n[full report](https://example/report)"));
-    // Still valid UTF-8 — the whole input here is ASCII, but the cut logic
-    // itself must never land on a continuation byte.
+    // Still valid UTF-8.
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
 }
 
@@ -557,8 +512,7 @@ test "randomBoundary is not a constant" {
 
     var a: [32]u8 = undefined;
     var b: [32]u8 = undefined;
-    // A fixed boundary would be guessable from a part's content, and a
-    // collision splits the multipart body at the wrong place.
+    // A fixed boundary would be guessable from content.
     try std.testing.expect(!std.mem.eql(u8, randomBoundary(io, &a), randomBoundary(io, &b)));
 }
 
@@ -578,13 +532,11 @@ test "a degraded row says WHY, not just that it is degraded" {
     };
     const body = try renderTable(arena, .{ .title = "c1k", .ref_rate = 2000, .rows = &rows });
 
-    // The marker AND the reason. A nightly reader sees this post before they
-    // see the report, and a stale build decides whether zoxy's number above
-    // means anything.
+    // The marker AND the reason.
     try std.testing.expect(std.mem.indexOf(u8, body, "⚠") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "STALE BUILD") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "⚠ zoxy:") != null);
 
-    // An ok row contributes no caveat line, even if one were ever attached.
+    // An ok row contributes no caveat line.
     try std.testing.expect(std.mem.indexOf(u8, body, "⚠ haproxy:") == null);
 }

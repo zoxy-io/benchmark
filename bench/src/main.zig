@@ -1,10 +1,8 @@
 //! bench — the benchmark harness: fleet orchestration, load ramp, and report
 //! rendering in one static binary.
 //!
-//! Replaces scripts/zrk-bench.sh (bash orchestration), report/*.py (report
-//! rendering) and loadgen/zrk-runner (the ramp). One binary is built per run and
-//! used both on the CI runner and on the loadgen VM, so "the agent drifted from
-//! the controller" is structurally impossible.
+//! One binary is built per run and used on both the CI runner and the loadgen
+//! VM, so they cannot drift.
 //!
 //! Subcommands and where each runs:
 //!   bench suite   --profile <name>   loadgen VM   drive every proxy, one ramp each
@@ -14,9 +12,8 @@
 //!   bench sweep                      CI runner    delete orphaned VMs by label
 //!   bench wait    <runid>            CI runner    poll for DONE, tail the log
 //!
-//! report/index/notify also build standalone as `bench-publish` (see
-//! render.zig and publish_main.zig) — the reduced binary publish.yml builds,
-//! since that job never touches the fleet and shouldn't pay to compile it.
+//! report/index/notify also build standalone as `bench-publish`
+//! (publish_main.zig) for publish.yml.
 
 const std = @import("std");
 
@@ -62,9 +59,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    // GitHub masks any value passed to ::add-mask::, so registering the fleet's
-    // addresses there covers output this process never sees — a child's stderr,
-    // an action's own logging.
+    // ::add-mask:: also covers output this process never sees (child stderr).
     redact.setCiMasking(std.process.Environ.getPosix(init.minimal.environ, "CI") != null);
 
     const cmd = args[1];
@@ -95,12 +90,8 @@ fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
     if (env.runid.len == 0) return render.fail("bench wait: --runid or BENCH_RUNID is required", .{});
 
     var opts: commands.WaitOptions = .{};
-    // Lets the workflow bound a single invocation to less than the federated
-    // IAM token's ~1h TTL, so it can re-mint a fresh one and call `wait` again
-    // rather than have the SAME invocation's token expire mid-poll — Object
-    // Storage then starts 401ing every `exists`/`get` and the run looks dead
-    // even though the fleet is healthy. Exit code 5 (below) is what tells the
-    // workflow "that was a chunk boundary, not the end" so it knows to retry.
+    // Lets the workflow keep each invocation under the IAM token's ~1h TTL and
+    // re-mint between calls; exit 5 marks the chunk boundary.
     if (try render.flagValue(args, "--max-wait-s")) |v| {
         opts.deadline_s = std.fmt.parseUnsigned(u64, v, 10) catch
             return render.fail("bench wait: --max-wait-s must be a non-negative integer", .{});
@@ -112,16 +103,11 @@ fn cmdWait(init: std.process.Init, args: []const [:0]const u8) !void {
             std.debug.print("bench wait: run complete\n", .{});
             render.exit(0);
         },
-        // Distinguished in the exit code so the workflow can tell "the suite ran
-        // and reported failure" (there may still be partial artifacts worth
-        // publishing) from "nothing ever came back".
-        //
+        // A failed suite may still have partial artifacts worth publishing.
         .failed => render.exit(3),
         .never_booted => render.exit(1),
-        // Distinct from `never_booted`: the fleet may be perfectly healthy and
-        // just still running when THIS invocation's deadline (`--max-wait-s`)
-        // ran out — worth calling `wait` again with a fresh token, unlike
-        // `never_booted`, which no amount of retrying will fix.
+        // `--max-wait-s` ran out; the fleet may still be healthy, so retry
+        // with a fresh token (unlike `never_booted`).
         .timed_out => render.exit(5),
     }
 }
@@ -154,16 +140,8 @@ fn cmdSuite(init: std.process.Init, args: []const [:0]const u8) !void {
     render.exit(try commands.runSuite(init.gpa, arena, init.io, environ, prof, proxies, runid, render.hasFlag(args, "--local")));
 }
 
-/// One proxy's ramp, as its own process.
-///
-/// Spawned by `bench suite` rather than called in-process, so a generator that
-/// stops making progress can be KILLED on a deadline. Once zrk's `runner.run`
-/// blocks there is no way to bound it from inside — zio owns the thread — and the
-/// only previous bound was killing the whole suite, which cost every proxy queued
-/// behind the wedged one.
-///
-/// Not in CONTRACT.md's original command list on purpose: that said "there is no
-/// separate ramp subcommand", and this is the reason that changed.
+/// One proxy's ramp, as its own process, so `bench suite` can kill a wedged
+/// generator on a deadline (zio owns the thread once `runner.run` blocks).
 fn cmdRamp(init: std.process.Init, args: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
 
@@ -189,9 +167,8 @@ fn cmdRamp(init: std.process.Init, args: []const [:0]const u8) !void {
         break :blk try std.Io.net.IpAddress.parse(spec[0..colon], port);
     } else null;
 
-    // Echo what the child actually parsed. The suite hands these across a process
-    // boundary now, so a flag that silently failed to arrive shows up as a
-    // `degraded` result with no cAdvisor samples and no explanation.
+    // Echo parsed flags: a flag lost across the process boundary is otherwise
+    // silent.
     redact.log("bench: [{s}] ramp child: profile={s} cadvisor={s}", .{
         proxy,
         prof.name,

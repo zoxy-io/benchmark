@@ -1,57 +1,28 @@
-# zoxy-benchmark v2 — containers ARE the deploy spec.
-#
-# One file describes every role; compose profiles pick what runs where:
-#   backend     the four-node nginx origin POOL (local: all four containers on
-#               this host; cloud: one container per backend VM, profile backendN)
-#   <proxy>     exactly one proxy-under-test    (zoxy|haproxy|nginx|pingora|envoy)
-# The comparison is zoxy/haproxy/nginx/pingora/envoy. traefik and the `direct`
-# no-proxy origin baseline were removed rather than parked: an unexercised
-# proxy config rots — its TLS/ALPN pinning and its healthcheck probe go stale
-# unnoticed — so git history is a better starting point for re-adding one than
-# a stale file is. envoy and nginx have each been through that removal and come
-# back, each config restored from git history and re-verified end to end, which
-# is the process working rather than an argument against it — see commands.zig's
-# parseProxies.
-# The load generator is not a compose service: the `bench` binary runs directly
-# on the loadgen host (static musl, no container, so no seccomp profile to
-# reconcile with io_uring) and drives this file over ssh.
-# cadvisor carries every profile so each docker host exports
-# per-container CPU/mem and host metrics no matter which role it plays. cAdvisor
-# is no longer optional observability: the run driver polls its /metrics on :8081
-# at 1Hz and folds the proxy container's CPU/memory into the run's own
-# artifacts, which is why there is no Prometheus and no Grafana here.
+# zoxy-benchmark v2: containers are the deploy spec. Profiles pick roles:
+#   backend     the four-node nginx origin pool (cloud: profile backendN per VM)
+#   <proxy>     exactly one proxy-under-test (zoxy|haproxy|nginx|pingora|envoy)
+# Removed proxies live in git history, not here: unexercised configs rot (see
+# commands.zig parseProxies). The loadgen is not a service: `bench` runs on the
+# host (no seccomp vs io_uring) and drives this file over ssh. cadvisor is in
+# every profile; the driver polls its /metrics on :8081 for proxy CPU/memory.
 #
 # Local:  docker compose --profile backend --profile haproxy up -d
-# Cloud:  the same file + compose.cloud.yaml (host networking, cpuset, peer IPs).
-# Resource limits are ENFORCED here (service-level cpus/mem_limit — no swarm
-# needed); they are the fairness mechanism that replaces v1's "identical VMs".
+# Cloud:  + compose.cloud.yaml (host networking, cpuset, peer IPs).
+# The resource limits here are the fairness mechanism.
 
-# Every proxy gets the same box: hard-capped to 1 CPU, with every thread knob
-# below (nbthread / --concurrency / GOMAXPROCS / worker_processes / threads)
-# hardcoded to 1 — one worker/thread each, no cgroup autodetection. zoxy has no
-# thread knob, so it runs a single process (ZOXY_WORKERS=1). The cloud overlay
-# pins the container to core 0 (cpuset).
+# Every proxy: 1 CPU, every thread knob hardcoded to 1 (zoxy: ZOXY_WORKERS=1).
+# The cloud overlay pins it to core 0.
 x-proxy-common: &proxy-common
   cpus: 1
-  # 4g, not 1g: run #25 had zoxy AND haproxy refuse to start at c10k, which
-  # looked memory-shaped (zoxy pre-allocates its conn/upstream slot arrays at
-  # boot, and c10k asks for ~8x c1k's). `reportStartFailure`'s `docker
-  # inspect`/`docker logs` (added the same night) settled it on the VERY NEXT
-  # run: `oom=false` and a literal EADDRINUSE / "cannot bind socket (Address
-  # in use) for [0.0.0.0:8080]" for both — a port-reuse problem, not memory.
-  # See PROXY_PORT below for the actual fix. Left at 4g anyway: it costs
-  # nothing and a real OOM is still exactly what this cap exists to bound
-  # rather than decide the benchmark.
+  # 4g: headroom for zoxy's boot-time slot arrays at c10k. Run #25's start
+  # failure was EADDRINUSE, not OOM (see PROXY_PORT).
   mem_limit: ${PROXY_MEM:-4g}
   ulimits:
     nofile:
       soft: 1048576
       hard: 1048576
   restart: "no"
-  # All four members, because a proxy that starts against a half-ready pool
-  # round-robins a share of its requests into a refused connection. `required:
-  # false` is what makes the same block correct in cloud, where every backend
-  # runs on its own VM and none of these services exists on the proxy host.
+  # All four members: a half-ready pool means refused connections.
   depends_on:
     backend0:
       condition: service_healthy
@@ -66,84 +37,23 @@ x-proxy-common: &proxy-common
       condition: service_healthy
       required: false
 
-# PROXY_PORT: the actual fix for the run #25/#26 start failures. `bench`
-# gives every (profile, proxy) TURN its own host port (see
-# bench/src/suite.zig's `proxyPort`) instead of every turn binding a fixed
-# :8080 — so a proxy's second start in a run never has to reuse the exact
-# port its first start used. Root cause is still open (an isolated,
-# traffic-free bind/teardown/rebind cycle on :8080 under real host networking
-# does NOT reproduce the failure — only a turn that actually served load
-# does), so this makes the question moot rather than answered.
+# PROXY_PORT: `bench` gives each (profile, proxy) turn its own host port
+# (suite.zig proxyPort); rebinding a fixed :8080 after a loaded turn failed with
+# EADDRINUSE in cloud (runs #25/#26, root cause open). Unset locally. Resolved
+# at compose parse time for pingora/envoy, natively by haproxy, and by zoxy's
+# entrypoint.
 #
-# Each proxy resolves it differently because each gets its config a
-# different way: pingora's LISTEN and this default are compose-file values,
-# resolved at PARSE time from bench's shell env. haproxy.cfg and
-# envoy.yaml.template are static mounted files compose interpolation cannot
-# reach, so they resolve it themselves — haproxy natively, at its own
-# startup, from the container env below; envoy has no such mechanism, so
-# its `command` runs `sed` over the template BEFORE compose parsing ever
-# matters, baking the same parse-time value in as a literal. zoxy's
-# entrypoint.sh already renders a template this same way for @BACKEND_ADDRS@,
-# so @PORT@ just rides along.
+# PROXY_TLS_PORT: set only for TLS profiles; empty means no TLS listener at all.
+# zoxy preallocates its TLS session pool (68 vs 234 MiB at 0.8.0), so plaintext
+# turns must not carry one. Healthchecks stay on the plaintext listener; bench's
+# warm probe covers TLS.
 #
-# Local mode never sets this (see runOne's `isLocal` branch) — bridge
-# networking already tears down and rebinds through Docker's own NAT layer,
-# not a raw app bind(), and never reproduced the failure either.
-#
-# PROXY_TLS_PORT: the TLS listener's port for the turn, resolved per proxy the
-# same way and for the same reason — with one difference that shapes every
-# proxy's config below. `bench` sets it ONLY FOR A TLS PROFILE (profile.zig's
-# `tls`; today, c1k-tls) and leaves it EMPTY otherwise, and an empty value means
-# the proxy renders no TLS listener at all rather than binding one on a default
-# port.
-#
-# That conditional is deliberate, and it was measured rather than assumed. An
-# always-bound TLS listener would be simpler here, but zoxy PREALLOCATES its TLS
-# session pool at boot: 68 MiB with no TLS listener against 234 MiB with one at
-# the stock 1024 engines (`zoxy --check`, 0.8.0 — ~92 KiB of engine + a 64 KiB
-# plaintext buffer each, over a 10 MiB shared libcrypto heap). A sixth of a
-# gigabyte added to a published memory number, on profiles that never send a
-# handshake, is not an acceptable price for uniform config. So a
-# plaintext turn renders exactly the configuration it rendered before TLS
-# existed here, and the c1k/c1k-tls pair stays a subtraction.
-#
-# Each proxy expresses the condition in whatever mechanism it has — the same
-# split PROXY_PORT already lives with: zoxy's entrypoint appends a listener to
-# the JSON, haproxy has native `.if !streq(...)`, nginx and envoy carry
-# @TLS_BEGIN@/@TLS_END@ markers that a line-range delete removes (25-tls.sh in
-# nginx's /docker-entrypoint.d, a sed in envoy's `command`), and pingora simply
-# does not call `add_tls` when TLS_LISTEN is empty.
-#
-# The CONTAINER HEALTHCHECK stays on the plaintext listener in every profile,
-# TLS included, which is also why the plaintext listener is never replaced. The
-# probe has to already exist inside each image (see x-healthcheck-wget/-bash
-# below): three of the five carry neither curl nor openssl, and bash's /dev/tcp
-# cannot handshake at all. Nothing is being installed into a container whose
-# memory footprint is a published number just to probe it. What DOES prove the
-# TLS listener serves is `bench`'s own warm probe, which handshakes through
-# zrk's TLS client from the loadgen before the ramp starts.
-#
-# The certificate is NOT in this repo. `bench suite` generates one ECDSA P-256
-# self-signed cert per run on the proxy host, into ./proxies/tls, which every
-# proxy below mounts read-only at /etc/bench/tls (bench.crt + bench.key, plus
-# bench.pem — the concatenation haproxy's `crt` requires). P-256 because zoxy
-# accepts nothing else, and one cert for all five because the signature is per
-# handshake and an RSA key would charge one proxy CPU the others never pay.
-# See suite.zig's `ensureTlsMaterial`.
+# The cert is generated per run into ./proxies/tls (suite.zig
+# ensureTlsMaterial): ECDSA P-256, the only key type zoxy accepts.
 
-# Every proxy is healthchecked, and the check is a real request THROUGH it to
-# the backend's /1k — the very body the benchmark asks for. Without one,
-# `up --wait` returned as soon as the container was *running*: a leftover
-# container from the previous proxy, still holding host :8080, would answer the
-# next proxy's warm probe and the ramp got recorded under the wrong proxy's
-# name. Serving, not merely bound, is the condition worth waiting on; a proxy
-# that listens but cannot reach its upstream is not ready to be measured.
-#
-# One timing block for all five, because the check runs INSIDE the proxy's own
-# cgroup: its fork+exec is charged to the CPU number cAdvisor reports, so the
-# cadence has to be identical for every proxy or it is a fairness leak. Probe
-# hard while starting (start_interval), then back off to 30s ≈ 10 execs across
-# a 5-minute ramp.
+# Healthcheck = a real request through the proxy to /1k, so `up --wait` waits
+# for serving, not merely running (a leftover container could answer instead).
+# It runs in the proxy's cgroup, so the timing must be identical for all five.
 x-healthcheck-timing: &healthcheck-timing
   interval: 30s
   timeout: 2s
@@ -151,20 +61,13 @@ x-healthcheck-timing: &healthcheck-timing
   start_period: 30s
   start_interval: 250ms
 
-# The probe must already exist inside each proxy's own image — no extra package
-# may be installed into a container whose memory footprint is a published
-# number. That splits them in two, checked image by image rather than
-# assumed: the alpine-based ones (haproxy, nginx) carry busybox wget.
+# Probes must already exist in each image (nothing is installed into a measured
+# container): haproxy and nginx (alpine) have busybox wget.
 x-healthcheck-wget: &healthcheck-wget
   <<: *healthcheck-timing
   test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PROXY_PORT:-8080}/1k"]
 
-# The debian-based ones (zoxy, pingora) have neither — zoxy's
-# runtime stage is a bare debian-slim carrying the binary and its entrypoint,
-# and nothing is being added to it just to be probed. What they do have is bash,
-# and Debian/Ubuntu build it WITH network redirections, so /dev/tcp opens the
-# socket and grep reads the status line back. Exec form, so no shell parses
-# this: bash is argv[0] and the whole program is one argument.
+# The rest have no wget, but their bash supports /dev/tcp.
 x-healthcheck-bash: &healthcheck-bash
   <<: *healthcheck-timing
   test:
@@ -174,39 +77,17 @@ x-healthcheck-bash: &healthcheck-bash
     - 'exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT:-8080} && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
 
 # --------------------------------------------------------------- the origin --
-# FOUR backends, not one, because a production proxy fronts a pool: choosing a
-# member per request is part of the job being measured, and a single origin
-# skipped it entirely. Every proxy round-robins across backend0..backend3 (see
-# proxies/*/ — the policy is pinned to round-robin everywhere so the comparison
-# stays proxy-vs-proxy rather than LB-algorithm-vs-LB-algorithm).
-#
-# The four definitions are identical bar the name, which is what the anchor is
-# for — four origins that drifted apart would make a proxy's throughput depend
-# on which member each request drew.
-#
-# TWO profiles each, and the reason is the cloud/local split:
-#
-#   * `backend` starts all four at once. That is the LOCAL shape — one docker
-#     host, four containers, bridge DNS resolving backend0..backend3.
-#   * `backendN` starts exactly one. That is the CLOUD shape — four VMs under
-#     host networking, each running its own container bound to :9000 on its own
-#     address. Bringing up the `backend` profile there would try to bind :9000
-#     four times on one host and fail three of them.
-#
-# Only backend0 publishes a host port: it is the one a human can curl locally
-# to check the origin by hand, and the other three are reached by the proxies
-# over the compose network, which needs no mapping. In cloud, `ports:` is reset
-# by the overlay anyway.
+# Four backends: picking a pool member is part of a proxy's job; every proxy
+# round-robins. Profile `backend` starts all four (local); `backendN` starts one
+# (cloud, one per VM under host networking). Only backend0 publishes a port,
+# for curling by hand.
 x-backend: &backend
   image: nginx:1.31-alpine
-  # 2, matching cloud/variables.tf's backend_cores — it becomes nginx's
-  # worker_processes, so a mismatch means the origin is running more or fewer
-  # workers than the box has cores.
+  # Matches cloud/variables.tf backend_cores; becomes worker_processes.
   cpus: ${BACKEND_CPUS:-2}
   mem_limit: ${BACKEND_MEM:-1g}
   environment:
-    # the image's envsubst hook renders the template into /etc/nginx at
-    # start; BACKEND_CPUS must be an integer (it becomes worker_processes)
+    # rendered by the image's envsubst hook; must be an integer
     BACKEND_CPUS: ${BACKEND_CPUS:-2}
     NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
   volumes:
@@ -245,88 +126,34 @@ services:
     profiles: [backend, backend3]
 
   # ------------------------------------------------------- proxies under test --
-  # All five: listen :8080, L7 HTTP/1.1 reverse proxy (zoxy's phase-1 build adds
-  # an `http` listener, so EVERY proxy now parses requests and reverse-proxies
-  # them), upstream = the backend0..backend3 pool, keep-alive both legs, and an
-  # access log per request. The generator speaks h1 end-to-end; the origin is
-  # nginx.
+  # All five: L7 HTTP/1.1 reverse proxy to the backend0..3 pool, keep-alive
+  # both legs, one access log line per request.
   #
-  # ACCESS LOGS ARE ON, and that is a deliberate change of what this benchmark
-  # measures — a production reverse proxy logs its requests, and a comparison
-  # with logging off measures a configuration nobody deploys. Four things travel
-  # with it and none of them is a detail:
-  #
-  #   1. Numbers before and after this change are NOT comparable. Every proxy
-  #      now does per-request formatting and a write it did not do before, so a
-  #      drop across this commit on the trend chart is this commit, not a
-  #      regression in anything.
-  #
-  #   2. The sink is a FILE, /tmp/access.log, not the container's stdout.
-  #      Stdout is a pipe that dockerd drains; when dockerd falls behind, the
-  #      64K pipe buffer fills and the proxy BLOCKS inside its own event loop on
-  #      the log write. That turns the ramp into a measurement of docker's log
-  #      driver, and it is not a hazard a production deployment has to accept.
-  #      A file write lands in page cache and returns. /tmp specifically because
-  #      it is the one path writable by every image's user with no mkdir and no
-  #      chown — envoy and haproxy both run non-root. The container is removed
-  #      after each turn, so the file goes with it.
-  #
-  #      haproxy is the one exception in MECHANISM, not in result: it has no
-  #      file-path log target at all — its log targets are syslog, a socket, a
-  #      ring or a file DESCRIPTOR — so its fd 1 is redirected to the same file
-  #      (see its `command` below). The other four are told the path directly.
-  #
-  #   3. Each proxy logs in ITS OWN stock format, not a common one — haproxy's
-  #      `option httplog`, nginx's `main`, envoy's default line, zoxy's fixed
-  #      JSON, and a chosen one for pingora, which ships none. That is the line
-  #      each proxy's operators actually read, but the formats differ in length
-  #      (roughly 90-250 bytes), so part of the spread is format verbosity and
-  #      has to be read that way.
-  #
-  #   4. They still disagree about BACKPRESSURE, which the file sink narrows but
-  #      does not erase. nginx, haproxy and pingora write once per request and
-  #      wear whatever the write costs. envoy buffers and flushes on a timer.
-  #      zoxy DROPS lines rather than stall its event loop. Dropping is cheaper
-  #      than writing, so zoxy would look faster for free unless the drops are
-  #      counted; `bench` reads `zoxy_access_log_dropped` off its admin endpoint
-  #      after every ramp (see suite.zig's accessLogDropped), and a nonzero
-  #      value is noted on the proxy's row rather than left in the numbers.
-  # container_name == service name == the `name` label cAdvisor exports, which
-  # is how the report joins CPU/mem to a proxy.
+  # Access logs (numbers before they were enabled are not comparable):
+  #   - Sink is /tmp/access.log, not stdout: a stalled docker log pipe blocks
+  #     the event loop. haproxy has no file target, so its fd 1 is redirected.
+  #   - Each proxy uses its own stock format (~90-250 bytes per line).
+  #   - zoxy drops lines instead of stalling; bench reports
+  #     zoxy_access_log_dropped (suite.zig accessLogDropped).
+  # container_name == service name == cAdvisor's `name` label (report join).
   zoxy:
     <<: *proxy-common
     build:
       context: ./proxies/zoxy
       args:
-        # `bench` passes all three explicitly; the defaults here are what a bare
-        # `docker compose build` gets — a source build of main, which is what
-        # this file meant before there was a choice.
-        #
-        # `release` fetches the published tarball for the tag in ZOXY_REF
-        # instead of compiling; `bench` resolves profile.zig's `zoxy_ref` into
-        # the pair and never passes the word `release` as a ref.
+        # Defaults are a source build of main; `bench` always passes all three.
         ZOXY_FLAVOUR: ${ZOXY_FLAVOUR:-source}
         ZOXY_REF: ${ZOXY_REF:-main}
         ZOXY_OPTIMIZE: ${ZOXY_OPTIMIZE:-ReleaseFast}
-        # SIMD on: zoxy ships SIMD-enabled binaries, so a baseline build would
-        # measure something no user runs. Pin to a concrete model for a build
-        # reproducible off this host. The release flavour is upstream's
-        # x86_64_v3 whatever this says — `bench` passes that value so the tag
-        # below stays true, and /etc/zoxy/build-info is the authority either way.
+        # SIMD on, as zoxy ships. The release flavour is x86_64_v3 regardless;
+        # /etc/zoxy/build-info is authoritative.
         ZOXY_CPU: ${ZOXY_CPU:-native}
-    # Ref, optimize mode and cpu model are the inputs that change the binary, so
-    # they are the whole tag — a native build on one host must not be mistaken
-    # for a native build on another. Slot ceilings used to be here too, patched into
-    # zoxy's source at build time and encoded in the tag; they are runtime config
-    # now (entrypoint.sh writes conn_slots/upstream_slots), so the same image
-    # serves c1k and c10k.
+    # The tag is every input that changes the binary.
     image: zoxy-bench/zoxy:${ZOXY_REF:-main}-${ZOXY_FLAVOUR:-source}-${ZOXY_OPTIMIZE:-ReleaseFast}-${ZOXY_CPU:-native}
     container_name: zoxy
     profiles: [zoxy]
-    # Docker's default seccomp profile denies io_uring_* since engine 25.0.
-    # This is the default profile PLUS the three io_uring syscalls — NOT
-    # unconfined, so zoxy keeps the same syscall-filter overhead as the rest.
-    # (libxev's Linux backend is io_uring; there is no epoll fallback.)
+    # Default seccomp plus the io_uring syscalls (denied since engine 25.0), not
+    # unconfined, so filter overhead matches. libxev has no epoll fallback.
     security_opt:
       - seccomp=./proxies/zoxy/seccomp-iouring.json
     ulimits:
@@ -334,45 +161,23 @@ services:
         soft: 1048576
         hard: 1048576
       memlock: -1 # io_uring ring memory counts against memlock on kernels <5.12
-    # zoxy (libxev) has NO thread knob: one event loop per PROCESS. Capped to 1
-    # CPU it runs a SINGLE process (ZOXY_WORKERS=1), pinned to core 0 by the cloud
-    # overlay — thread parity with the others (all = 1). On the phase-1 L7 path
-    # concurrency is capped PER PROCESS at a configurable limits.conn_slots
-    # (default 1386, ~32 MiB; ZOXY_CONN_SLOTS below opts up toward the comptime
-    # c10k ceiling, 11457 by default) with a shared upstream keep-alive pool of
-    # limits.upstream_slots (default 1311, deliberately NOT tracking its own
-    # ceiling — an operator opts up explicitly via ZOXY_UPSTREAM_SLOTS). The
-    # two ceilings are pinned equal (11457/11457 as of zoxy #108: an upstream
-    # is leased per admitted connection at saturation, not per in-flight
-    # request, so a higher conn ceiling than upstream ceiling was admission
-    # capacity that couldn't be served). Past the admission ceiling zoxy sheds
-    # with a static error. Every other proxy has no such cap.
-    # It also does no DNS — endpoints must be IP literals, so the entrypoint
-    # resolves each name in BACKENDS (below) once at start and renders the
-    # template. `pick` is pinned to round-robin in config.template.json; zoxy's
-    # own default is p2c.
+    # One process (ZOXY_WORKERS=1) for thread parity. zoxy caps admission at
+    # limits.conn_slots and sheds past it; no other proxy has such a cap. No
+    # DNS: the entrypoint resolves BACKENDS to IPs. `pick` is pinned to
+    # round-robin (zoxy's default is p2c).
     environment:
       BACKENDS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
       ZOXY_WORKERS: 1
       ZOXY_CONN_SLOTS: ${ZOXY_CONN_SLOTS:-}
       ZOXY_UPSTREAM_SLOTS: ${ZOXY_UPSTREAM_SLOTS:-}
-      # The TLS session pool, set by the TLS profiles only. It is the largest
-      # object zoxy holds — ~92 KiB plus a 64 KiB plaintext buffer each,
-      # preallocated at boot — so it is both why the TLS listener is not left
-      # bound on plaintext turns (68 MiB against 234 MiB, priced at 0.8.0)
-      # and why the profile has to size it: one engine is held per admitted
-      # connection, so anything under conn_slots sheds by admission policy.
+      # TLS session pool, set by TLS profiles only. One engine per admitted
+      # connection, so anything under conn_slots sheds.
       ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
-      # entrypoint.sh renders these into config.template.json — see
-      # x-proxy-common for why the cloud overlay varies them per turn.
-      # PROXY_TLS_PORT is empty on a plaintext turn, and that is what leaves
-      # the TLS listener out of the rendered config entirely.
+      # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS.
       PROXY_PORT: ${PROXY_PORT:-8080}
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
-      # The run's own ECDSA P-256 cert, generated on this host before any proxy
-      # starts. zoxy's tls block wants the chain and the key as separate files.
       - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
@@ -385,43 +190,25 @@ services:
     container_name: haproxy
     profiles: [haproxy]
     environment:
-      # hostnames locally (bridge DNS + runtime resolver); the cloud overlay
-      # replaces each with an IP literal because 127.0.0.11 doesn't exist there.
-      # One variable per pool member rather than a list: haproxy.cfg needs a
-      # `server` line per backend anyway, and its native env expansion has no
-      # way to split a delimited string.
+      # Hostnames locally; the cloud overlay swaps in IPs (no 127.0.0.11).
+      # One var per member: haproxy's env expansion cannot split a list.
       BACKEND0_ADDR: backend0:9000
       BACKEND1_ADDR: backend1:9000
       BACKEND2_ADDR: backend2:9000
       BACKEND3_ADDR: backend3:9000
-      # haproxy.cfg's two `bind` lines read these via its OWN native env-var
-      # expansion (same mechanism BACKENDn_ADDR already uses) — haproxy.cfg is a
-      # static mounted file, so compose's `${}` interpolation never reaches it.
+      # Expanded natively by haproxy.cfg; compose cannot reach a mounted file.
       PROXY_PORT: ${PROXY_PORT:-8080}
-      # Empty on a plaintext turn; haproxy.cfg's `.if !streq(...)` leaves the
-      # whole TLS frontend out when it is.
+      # Empty on plaintext turns: haproxy.cfg's `.if` drops the TLS frontend.
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
-    # haproxy is the only proxy here that cannot be told to log to a PATH — its
-    # log targets are syslog, a socket, a ring or a file descriptor, and
-    # haproxy.cfg's `log stdout` is its alias for fd 1. So the file sink every
-    # other proxy configures for itself is made here, by redirecting fd 1.
-    #
-    # Only stdout is redirected. haproxy's startup [NOTICE] lines go to stderr,
-    # so `docker logs haproxy` still explains a container that failed to start —
-    # which is exactly what reportStartFailure reads.
-    #
-    # `exec docker-entrypoint.sh` rather than re-spelling haproxy's own flags:
-    # the image's entrypoint is what adds `-W -db` (master-worker, foreground),
-    # and a hand-written copy of that would drift the day the image changes it.
-    # `exec` so haproxy still ends up as PID 1 and takes the stop signal
-    # directly.
+    # haproxy cannot log to a path, so fd 1 (`log stdout`) goes to the file;
+    # stderr still reaches `docker logs` for reportStartFailure. The image
+    # entrypoint adds -W -db; `exec` keeps haproxy as PID 1.
     entrypoint: ["sh", "-c"]
     command:
       - exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg >> /tmp/access.log
     volumes:
       - ./proxies/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      # haproxy's `crt` takes ONE file holding the chain and the key, which is
-      # why the generator writes bench.pem alongside the split pair.
+      # haproxy's `crt` needs chain and key in one file: bench.pem.
       - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
@@ -436,23 +223,10 @@ services:
     image: envoyproxy/envoy:v1.36-latest
     container_name: envoy
     profiles: [envoy]
-    # --concurrency 1: envoy sizes its worker threads from the visible CPU count,
-    # not the cgroup quota, so on a 4-core VM it would start four workers inside a
-    # 1-CPU box. Every proxy here is pinned to one worker.
-    #
-    # envoy.yaml has no native env-var substitution and is a static mounted
-    # file, so compose's `${}` interpolation cannot reach its listener port
-    # either — unlike haproxy.cfg's `bind`, there is no runtime mechanism to
-    # lean on. `${PROXY_PORT:-8080}` below IS interpolated, but at COMPOSE
-    # PARSE time (this string lives in compose.yaml itself), which bakes the
-    # literal port into the sed command before the container ever starts —
-    # see x-proxy-common for why the port varies per turn at all.
-    #
-    # On a plaintext turn PROXY_TLS_PORT is empty and the template's
-    # @TLS_BEGIN@..@TLS_END@ range — the whole TLS listener — is deleted, so
-    # envoy parses exactly the configuration it parsed before TLS existed here.
-    # On a TLS turn the range is kept and its @TLS_PORT@ substituted. `$$` is
-    # compose's escape for a dollar the SHELL should see, not compose.
+    # --concurrency 1: envoy sizes workers from host CPUs, not the cgroup.
+    # envoy.yaml has no env substitution, so sed bakes the ports in at compose
+    # parse time; plaintext turns delete @TLS_BEGIN@..@TLS_END@. `$$` escapes a
+    # dollar for the shell.
     entrypoint: ["sh", "-c"]
     command:
       - >-
@@ -471,31 +245,21 @@ services:
 
   nginx:
     <<: *proxy-common
-    # nginx runs as an HTTP reverse proxy (proxy_pass) over a four-server
-    # upstream with a keepalive pool — the stock official image, no custom
-    # build. The image's envsubst hook renders the template into /etc/nginx at
-    # start; worker_processes is hardcoded to 1 (1 CPU) and the listener port
-    # comes from PROXY_PORT below.
+    # Stock image: proxy_pass to a keepalive upstream, worker_processes 1.
     image: nginx:1.31-alpine
     container_name: nginx
     profiles: [nginx]
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
-      # Read by envsubst when it renders the template, NOT by compose
-      # interpolation into the mounted file — see the `listen` lines there.
+      # Read by envsubst when rendering the template, not by compose.
       PROXY_PORT: ${PROXY_PORT:-8080}
-      # Empty on a plaintext turn, which is what 25-tls.sh keys off to delete
-      # the TLS server block from the rendered config.
+      # Empty on plaintext turns: 25-tls.sh deletes the TLS server block.
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
     volumes:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
-      # The `location` both server blocks include, so the plaintext and TLS
-      # listeners cannot drift into proxying differently. Mounted straight into
-      # /etc/nginx rather than through templates/ — it has nothing to
-      # substitute.
+      # Shared by both server blocks so plaintext and TLS proxy identically.
       - ./proxies/nginx/origin-location.conf:/etc/nginx/origin-location.conf:ro
-      # Runs after the image's own envsubst hook (name order) and strips the TLS
-      # server block unless this is a TLS turn.
+      # Runs after the image's envsubst hook (name order).
       - ./proxies/nginx/25-tls.sh:/docker-entrypoint.d/25-tls.sh:ro
       - ./proxies/tls:/etc/bench/tls:ro
     ports:
@@ -505,10 +269,8 @@ services:
 
   pingora:
     <<: *proxy-common
-    # Cloudflare Pingora is a framework, not a proxy — proxies/pingora builds a
-    # tiny L7 HTTP reverse-proxy binary on it (src/main.rs), hardcoded to 1
-    # worker thread; each UPSTREAMS member is resolved once at startup, pooled
-    # and kept alive, and picked round-robin per request.
+    # Pingora is a framework: proxies/pingora builds a minimal L7 proxy on it
+    # (1 worker thread, upstreams resolved once, round-robin).
     build:
       context: ./proxies/pingora
       args:
@@ -517,22 +279,10 @@ services:
     container_name: pingora
     profiles: [pingora]
     environment:
-      # Baked at compose PARSE time (this whole value lives in compose.yaml,
-      # unlike haproxy.cfg/envoy.yaml which are static mounted files) — pingora
-      # reads LISTEN once at its own startup, so the resolved literal is all it
-      # ever needs. See x-proxy-common for why the port varies per turn.
+      # Interpolated at compose parse time; see PROXY_PORT above.
       LISTEN: 0.0.0.0:${PROXY_PORT:-8080}
-      # The TLS listener, added with the same `add_tls` pingora's own docs use;
-      # the cert and key are the mount below, and the one HTTP proxy service
-      # serves both listeners, so nothing about the request path differs.
-      #
-      # EMPTY on a plaintext turn, and main.rs adds no TLS endpoint at all when
-      # it is — the port half of this string is `${PROXY_TLS_PORT}`, so the
-      # whole value collapses to nothing rather than to a bind on a default
-      # port. See x-proxy-common for why a plaintext turn must not carry one.
+      # Empty on plaintext turns, so main.rs adds no TLS endpoint.
       TLS_LISTEN: ${PROXY_TLS_PORT:+0.0.0.0:}${PROXY_TLS_PORT:-}
-      # Comma-separated pool; main.rs resolves each once at startup and
-      # round-robins across them with an atomic counter.
       UPSTREAMS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
     volumes:
       - ./proxies/tls:/etc/bench/tls:ro
@@ -546,22 +296,13 @@ services:
     image: gcr.io/cadvisor/cadvisor:v0.52.1
     container_name: cadvisor
     profiles: [monitoring, backend, zoxy, haproxy, envoy, nginx, pingora]
-    # The proxy host's cAdvisor is the run's ONLY source of container CPU and
-    # memory — the driver polls /metrics on :8081 at 1Hz — so this service is
-    # part of the measurement, not a convenience. It also names the container it
-    # is reporting, which is how a ramp catches an imposter still holding :8080.
-    # Disk metrics off — only cpu/memory/network matter here. NOTE: the
-    # docker host must run the classic overlay2 graphdriver
-    # ({"features":{"containerd-snapshotter":false}} in daemon.json — see
-    # cloud/cloud-init.yaml.tftpl); under the containerd image store
-    # cAdvisor's docker handler breaks and every container loses its name
-    # label. Keep this list in sync with compose.cloud.yaml (the override
-    # replaces command wholesale).
+    # The proxy host's cAdvisor is the run's only source of container CPU and
+    # memory, and its name label catches an imposter on :8080. Needs the
+    # overlay2 graphdriver (see cloud/cloud-init.yaml.tftpl), else names are
+    # lost. Keep in sync with compose.cloud.yaml, which replaces command.
     command:
       - --disable_metrics=advtcp,cpu_topology,disk,diskIO,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
-      # hard 1s sampling: dynamic housekeeping backs off (up to 60s) on "stable"
-      # containers, which would flatten the run's 1Hz CPU curve to the backoff
-      # cadence no matter how often the driver polls
+      # fixed 1s sampling; dynamic housekeeping backs off up to 60s
       - --housekeeping_interval=1s
       - --allow_dynamic_housekeeping=false
     privileged: true

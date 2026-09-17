@@ -1,8 +1,5 @@
-//! bench-publish — the `report`/`index`/`notify` subset of `bench`, built as
-//! its own binary so publish.yml doesn't pay to compile the fleet path
-//! (`suite`/`remote`/`ramp`/`ycs`) or the `zio` dependency those pull in,
-//! neither of which this job ever touches. `render.zig` is the shared
-//! implementation; `main.zig` is the full CLI built for nightly.zig.
+//! bench-publish: the `report`/`index`/`notify` subset of `bench`, built
+//! without the fleet path or `zio`. `render.zig` is the shared implementation.
 
 const std = @import("std");
 const redact = @import("redact.zig");
@@ -28,8 +25,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    // Same reasoning as main.zig: registering masks covers output this
-    // process never sees itself.
+    // Same as main.zig: masks cover output this process never sees.
     redact.setCiMasking(std.process.Environ.getPosix(init.minimal.environ, "CI") != null);
 
     const cmd = args[1];

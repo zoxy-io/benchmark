@@ -1,45 +1,17 @@
 .{
     .name = .bench,
     .version = "0.0.0",
-    // Regenerated for this package (the old zrk_runner fingerprint belongs to
-    // loadgen/zrk-runner, which this replaces — reusing it would claim its
-    // identity).
+    // Regenerated; the old zrk_runner fingerprint belongs to loadgen/zrk-runner.
     .fingerprint = 0x66d8e325bc180f27,
     .minimum_zig_version = "0.16.0",
     // Bump with `zig fetch --save=zrk git+https://github.com/zoxy-io/zrk#<ref>`,
     // or fetch without `--save` and hand-edit url+hash to keep these comments.
-    // The zio pin MUST match whatever zio commit that zrk ref depends on (check
-    // the fetched zrk package's own build.zig.zon), or the `Io` type won't unify
-    // across the module boundary — the failure is
-    // "file exists in modules 'zio_options' and 'zio_options0'", which reads
-    // like a build-system bug rather than the two-copies-of-zio problem it is.
-    // v2.4.2 pins the same zio and the same zurl v2.2.2 did, so neither moved
-    // with it — checked, not assumed, because that is the bump where they would.
-    //
-    // No fork left as of zrk v1.4.1 (zoxy-io/zrk#48). zio used to drop a
-    // cancel when the io_uring submission queue is full, leaving the target
-    // completion stuck `.running` forever and the awaiting task blocked with
-    // it — c10k reaches this reliably (10k connections' per-operation
-    // timeouts expiring together submit thousands of cancels against a
-    // 256-entry ring) and it wedged a nightly run for 115 minutes. Filed as
-    // lalinsky/zio#623, fixed upstream in #628 ("flush a full submission
-    // queue instead of dropping SQEs", merged as b822fda).
-    //
-    // That fix is still here: 3820667 is 137 commits ahead of b822fda and zero
-    // behind, checked with `compare/b822fda...3820667` before moving. "The fix
-    // is still in there" is exactly the assumption a bump is where you lose.
-    //
-    // The libcrypto question that used to live here — OpenSSL, never BoringSSL —
-    // is settled a layer down as of zrk v2.4.0 (zoxy-io/zrk#3183923): zrk pins
-    // zssl, which carries its own, so there is no system OpenSSL to agree about
-    // and no second libcrypto to link twice. zoxy 0.8.0 terminates through zssl
-    // too, at a different commit, and that is fine HERE — this binary links zrk
-    // and talks to zoxy over a socket. The rule still binds in zoxy's own repo,
-    // whose profile harness links both modules into one binary.
-    //
-    // zurl is pinned to whatever zrk pins, not bumped independently: zrk's own
-    // graph carries it, and two copies would be two incompatible `zurl` types
-    // the moment either exposes one across the module boundary.
+    // The zio pin MUST match the zio that zrk ref depends on (see its
+    // build.zig.zon), or `Io` won't unify: "file exists in modules
+    // 'zio_options' and 'zio_options0'".
+    // zio must include b822fda (lalinsky/zio#628, a dropped-cancel wedge at
+    // c10k); check `compare/b822fda...<new>` on every bump.
+    // zurl is pinned to whatever zrk pins; two copies would be incompatible.
     .dependencies = .{
         .zrk = .{
             .url = "git+https://github.com/zoxy-io/zrk?ref=v2.4.2#63d345286d563af82660b4ab02c970ef58999b2d",

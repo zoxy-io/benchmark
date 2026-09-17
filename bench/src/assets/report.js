@@ -34,10 +34,8 @@ document.querySelectorAll('.hover-capture[data-chart]').forEach(cap => {
       rows += `<div class="trow"><span class="tname"><span class="swatch s-${s.name}"></span>${s.name}</span>` +
               `<span class="tval">${fmt(best, data.yfmt)}</span></div>`;
     }
-    // What x IS depends on the chart, so the blob says rather than the script
-    // assuming: offered load on the run report, a run on the nightly trend.
-    // `labels` means x is an ordinal position — show the label (the run id),
-    // not a formatted number with a unit that chart has no axis for.
+    // The blob says what x is: offered load, or (with `labels`) an ordinal run
+    // shown by its label.
     const xa = data.x || {name: 'offered', unit: 'req/s', labels: []};
     const head = (xa.labels && xa.labels.length)
       ? (xa.labels[Math.min(Math.max(Math.round(x), 0), xa.labels.length - 1)] || '')
@@ -53,10 +51,8 @@ document.querySelectorAll('.hover-capture[data-chart]').forEach(cap => {
   cap.addEventListener('mouseleave', () => { tip.hidden = true; cross.setAttribute('hidden',''); });
 });
 
-// Distribution-chart tooltip: same crosshair/tip mechanics as above, but a
-// LOG x-scale (percentile, n = 1/(1-p)) and one series instead of several
-// named ones, so it is not the same data shape or scale function — kept as
-// its own small block rather than folded into the handler above.
+// Distribution-chart tooltip: log x-scale and a single series, hence its own
+// handler.
 document.querySelectorAll('.hover-capture[data-hist]').forEach(cap => {
   const id = cap.dataset.hist;
   const data = JSON.parse(document.getElementById('data-hist-'+id).textContent);

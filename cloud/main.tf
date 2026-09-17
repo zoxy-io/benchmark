@@ -1,32 +1,15 @@
-# Six stock Ubuntu 24.04 hosts — loadgen, proxy, and a four-node backend pool —
-# in one zone, one subnet, with NO public addresses.
-#
-# The fleet is ephemeral and self-driving: CI creates it, the loadgen runs the
-# whole suite itself and ships the results out through Object Storage, CI
-# destroys it. Nothing outside the VPC can dial in, and nothing on a host holds
-# a cloud credential — the payload comes down, and the results go up, on IAM
-# tokens minted by the metadata service against an attached service account.
-#
-# Terraform state is per-run and lives in the CI workspace, so it is NOT the
-# recovery mechanism: a run cancelled between apply and destroy is cleaned up by
-# `bench sweep`, which deletes by the bench=nightly label below.
-#
-# Still no custom images: cloud-init installs a PINNED docker-ce + compose
-# plugin (so local and cloud run the same compose implementation), applies the
-# sysctl and fd tuning, and unpacks payload.tar. Editing a proxy config never
-# means rebuilding an image.
+# Six Ubuntu 24.04 hosts (loadgen, proxy, four backends) in one zone and subnet,
+# with no public addresses. CI creates the fleet, the loadgen runs the suite and
+# ships results via Object Storage, CI destroys it. `bench sweep` cleans up
+# orphans of cancelled runs by the bench=nightly label. No custom images:
+# cloud-init installs pinned docker and unpacks payload.tar.
 
 resource "yandex_vpc_network" "bench" {
   name = "bench-${var.runid}"
 }
 
-# Outbound-only internet. With nat = false on every interface there is no
-# address anyone can dial, but the hosts still have to reach apt, Docker Hub,
-# GitHub and storage.yandexcloud.net. A shared egress gateway plus a default
-# route does exactly that, one way.
-#
-# shared_egress_gateway is the only gateway kind this provider models and it
-# takes no arguments — the empty block IS the whole configuration.
+# Outbound-only internet (apt, Docker Hub, GitHub, Object Storage).
+# shared_egress_gateway takes no arguments.
 resource "yandex_vpc_gateway" "egress" {
   name = "bench-egress-${var.runid}"
 
@@ -49,9 +32,7 @@ resource "yandex_vpc_subnet" "bench" {
   network_id     = yandex_vpc_network.bench.id
   v4_cidr_blocks = [local.subnet_cidr]
 
-  # Attaching the table here is also what orders the apply: instances depend on
-  # the subnet, the subnet on the table, the table on the gateway, so egress is
-  # already routable by the time the first host runs `apt-get update`.
+  # Also orders the apply, so egress is routable before the first apt-get.
   route_table_id = yandex_vpc_route_table.bench.id
 }
 
@@ -59,10 +40,7 @@ resource "yandex_vpc_security_group" "bench" {
   name       = "bench-${var.runid}"
   network_id = yandex_vpc_network.bench.id
 
-  # No ssh, no grafana, no prometheus from outside — there is no outside any
-  # more. The only ingress that still has to exist is fleet-internal: the
-  # loadgen ssh'ing into its peers to bring proxies up, and scraping the proxy
-  # host's cAdvisor on :8081.
+  # Fleet-internal only: loadgen ssh to peers, cAdvisor scrapes on :8081.
   ingress {
     protocol       = "ANY"
     description    = "all intra-fleet"
@@ -81,19 +59,14 @@ resource "yandex_vpc_security_group" "bench" {
 
 # --------------------------------------------------------------- identities --
 
-# The per-run ssh identity the loadgen uses to drive its peers. Generated here,
-# handed to the loadgen through its own cloud-init, and destroyed with the
-# workspace when the job ends: it never reaches Object Storage, never reaches a
-# log, and there is no key on anyone's laptop that opens a benchmark fleet.
+# Per-run ssh identity for the loadgen; never leaves terraform state and the
+# loadgen's cloud-init.
 resource "tls_private_key" "fleet" {
   algorithm = "ED25519"
 }
 
-# One ssh HOST key for the whole fleet, injected via cloud-init so the loadgen
-# can carry a known_hosts that is correct before the peers have even booted —
-# StrictHostKeyChecking against a known key instead of trust-on-first-use.
-# Per-host keys would be stricter, but the fleet is created and destroyed by one
-# apply and shares one trust domain, so there is nothing left to separate.
+# One fleet-wide ssh host key, so the loadgen's known_hosts is correct before
+# peers boot. Per-host keys buy nothing within one apply's trust domain.
 resource "tls_private_key" "host" {
   algorithm = "ED25519"
 }
@@ -102,32 +75,14 @@ locals {
   subnet_cidr  = "10.10.0.0/24"
   ssh_key_path = "/home/ubuntu/.ssh/bench_ed25519" # the contract's SSH_KEY
 
-  # One loadgen: the open-loop zrk generator saturates a 1-CPU proxy from a
-  # single 4-core box well under its own limit (it hits the proxy's
-  # concurrency-collapse wall first). loadgen also hosts prometheus/grafana.
-  # (Tried 6 cores 2026-07-24 to give zrk's threads more headroom — reverted:
-  # loadgen's Grafana CPU% is dominated by iowait-accounting noise from
-  # Prometheus's 1s scrape interval hitting the network-ssd disk, not real
-  # compute pressure, so the extra cores didn't buy anything measurable.)
+  # One 4-core loadgen saturates the 1-CPU proxy well under its own limit.
   #
-  # Addresses are PINNED, not allocated. The loadgen's cloud-init has to carry
-  # PROXY_IP/BACKEND_IPS and a known_hosts keyed by address, and it cannot read
-  # those off its own for_each siblings — that is a self-reference, and
-  # terraform rejects it. Yandex reserves the first four addresses of a subnet,
-  # so the fleet starts at .11. Each run gets its own network, so fixed
-  # addresses cannot collide across concurrent runs.
+  # Addresses are pinned: the loadgen's cloud-init needs peer IPs, and reading
+  # them off its for_each siblings is a self-reference. Yandex reserves the
+  # first addresses of a subnet, hence .11.
   #
-  # FOUR backends, not one. A production proxy fronts a POOL and spends real
-  # work choosing a member per request; one origin measured only the forwarding
-  # path. Each is deliberately SMALLER than the old single box (2 cores, was 4)
-  # while the pool is larger in total (8 cores, was 4), so no proxy is ever
-  # waiting on the origin — see the sizing note in variables.tf for the
-  # reasoning, and for what was given up to stop measuring it every night.
-  #
-  # The count is 4 in three places that cannot read each other: here, the
-  # `backend0..backend3` services in compose.yaml, and the endpoint lists in
-  # proxies/*/. Changing it means changing all three — bench/src/suite.zig
-  # iterates whatever it is handed, so it is the one place that does not care.
+  # Four 2-core backends (sizing: variables.tf). The count also lives in the
+  # compose.yaml services and proxies/*/ endpoint lists; change all three.
   backend_names = ["backend0", "backend1", "backend2", "backend3"]
 
   backends = {
@@ -143,9 +98,7 @@ locals {
     proxy   = { cores = var.proxy_cores, memory = var.proxy_memory, ip = "10.10.0.12" }
   }, local.backends)
 
-  # Ordered, so BACKEND_IPS[n] is backendN everywhere: the compose profile, the
-  # extra_hosts entry and the terraform host must all name the same machine, and
-  # a map's iteration order must not decide which.
+  # Ordered, so BACKEND_IPS[n] is always backendN.
   backend_ips = [for name in local.backend_names : local.backends[name].ip]
 
   known_hosts = join("\n", [
@@ -157,31 +110,24 @@ locals {
 resource "yandex_compute_instance" "host" {
   for_each = local.hosts
 
-  # Names carry the runid so an orphaned fleet from a cancelled run is obvious
-  # in the console and cannot get in the next apply's way. The guest hostname
-  # stays the bare role: the compose overlay addresses peers by IP, and role
-  # names are what show up in logs.
+  # runid in the name marks orphans; hostname stays the bare role for logs.
   name        = "${each.key}-${var.runid}"
   hostname    = each.key
   platform_id = var.platform_id
   zone        = var.zone
 
-  # bench=nightly IS the recovery path (bench/CONTRACT.md): per-run state dies
-  # with the runner, so a job cancelled between apply and destroy leaves VMs
-  # that nothing can `tofu destroy`. `bench sweep` deletes by this label.
+  # bench=nightly is the recovery path: `bench sweep` deletes by this label
+  # (bench/CONTRACT.md).
   labels = {
     bench = "nightly"
     runid = var.runid
     role  = each.key
   }
 
-  # Lets the guest ask the metadata service for an IAM token instead of holding
-  # a key. Nothing else on the instance authenticates to the cloud.
+  # Metadata-service IAM tokens instead of a key on the host.
   service_account_id = var.service_account_id
 
-  # in-place stop→resize→start when cores/memory change, instead of destroy+
-  # recreate — preserves the disk. Near-vestigial for a fleet that is recreated
-  # nightly, but it is what keeps a laptop-driven fleet alive across a sizing edit.
+  # Resize in place instead of destroy+recreate (matters for laptop fleets).
   allow_stopping_for_update = true
 
   resources {
@@ -201,19 +147,13 @@ resource "yandex_compute_instance" "host" {
   network_interface {
     subnet_id  = yandex_vpc_subnet.bench.id
     ip_address = each.value.ip
-    # No public address on any role. Outbound still works through the shared
-    # egress gateway; inbound has no path at all, which is the point.
+    # No public address: egress via the gateway, no inbound path.
     nat                = false
     security_group_ids = [yandex_vpc_security_group.bench.id]
   }
 
-  # This is what CONTRACT.md means by "the gce-http-token metadata key": the
-  # GCE-flavoured metadata endpoint that serves
-  # /computeMetadata/v1/instance/service-accounts/default/token. In this
-  # provider it is a first-class block, not a key in `metadata` — there is no
-  # such key in the schema. 1 = enabled. The AWS-flavoured pair is left
-  # unspecified so the API keeps its own defaults; nothing here speaks it, and
-  # turning it off would be a guess about what the image's own agents use.
+  # CONTRACT.md's "gce-http-token metadata key" is this block, not a
+  # `metadata` key. The AWS-flavoured options keep API defaults.
   metadata_options {
     gce_http_endpoint = 1
     gce_http_token    = 1
@@ -222,10 +162,8 @@ resource "yandex_compute_instance" "host" {
   metadata = {
     ssh-keys = "ubuntu:${trimspace(tls_private_key.fleet.public_key_openssh)}"
 
-    # One template for every role — see the header comment in the template for
-    # why. The two secrets are passed only to the role that may hold them, so
-    # the private key is absent from the peers' rendered user-data, not merely
-    # unused by it.
+    # One template for every role. Secrets go only to the loadgen, so they are
+    # absent from the peers' user-data.
     user-data = templatefile("${path.module}/cloud-init.yaml.tftpl", {
       role                 = each.key
       docker_version       = var.docker_version
@@ -243,8 +181,7 @@ resource "yandex_compute_instance" "host" {
       backend_ips          = join(",", local.backend_ips)
     })
 
-    # With no public address and no inbound rule, the serial console is the only
-    # way to look at a host that failed before it could write `boot-ok`.
+    # The only way to inspect a host that never wrote boot-ok.
     serial-port-enable = "1"
   }
 }

@@ -1,12 +1,5 @@
-# Internal addresses only — there are no public ones any more, and the run
-# drives itself from inside the VPC, so this is a debugging aid (and what a
-# laptop-driven run still reads with `tofu output -json inventory`) rather than
-# something the nightly needs.
-#
-# sensitive because the nightly prints its apply output into a public CI log,
-# and because no benchmark artifact is allowed to contain an address at all
-# (bench/CONTRACT.md, redact.assertNoIps). `tofu output -json inventory` still
-# emits the value when asked for it by name.
+# Internal addresses, for debugging and laptop runs. sensitive: no address may
+# reach the public CI log (bench/CONTRACT.md, redact.assertNoIps).
 output "inventory" {
   sensitive = true
   value = {

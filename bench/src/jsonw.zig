@@ -1,36 +1,18 @@
-//! A tiny streaming JSON writer, with number formatting chosen to line up with
-//! report/report.py's `json.dumps(..., separators=(",", ":"))`.
+//! A tiny streaming JSON writer matching report/report.py's
+//! `json.dumps(..., separators=(",", ":"))`, so report.json diffs against it.
 //!
-//! Why this exists rather than `std.json.Stringify`: report.json is the Phase 0
-//! gate for the Zig rewrite, so its shape has to be comparable to the Python's
-//! output. Two things matter and neither is the default anywhere.
+//! Key order is insertion order; the report UI depends on it.
 //!
-//! **Key order is data.** Python dicts preserve insertion order and json.dumps
-//! honours it, so `proxies[]` rows and the `palette`/`hist` maps come out in a
-//! meaningful order (sustained-descending, display order). A writer that sorted
-//! or reordered keys would still be valid JSON but would no longer be diffable
-//! against the reference, and the ordering is load-bearing for the report UI.
-//!
-//! **Rounding is display, not measurement.** Python's `round()` is
-//! round-half-to-even applied to the exact binary value; Zig's `{d:.N}` rounds
-//! half-away-from-zero and, worse, is not correctly rounded for the exact value
-//! (`{d:.6}` of 0.1234565 yields 0.123457 where the true value is
-//! 0.12345649999...). So `float()` here rounds the SHORTEST round-tripping
-//! decimal representation, half-to-even, by string manipulation — exact,
-//! predictable, and free of dtoa reimplementation. That agrees with Python
-//! except when the shortest repr sits exactly on a tie while the underlying
-//! binary value does not (`round(2.675, 2)`: Python 2.67, here 2.68). Such cases
-//! differ by one unit in the last emitted decimal and are a rendering artifact,
-//! never a measurement one — the gate script compares numerically with a
-//! one-last-place tolerance for exactly this reason.
+//! `float()` rounds the shortest round-tripping decimal half-to-even, like
+//! Python's `round()` (Zig's `{d:.N}` rounds half-away and is not correctly
+//! rounded). It can differ from Python by one last-place unit when the
+//! shortest repr is a tie but the binary value is not (`round(2.675, 2)`).
 
 const std = @import("std");
 
 pub const Writer = struct {
     w: *std.Io.Writer,
-    /// Whether the current container already holds an element, so the next one
-    /// needs a comma. One flag suffices because a comma is only ever needed
-    /// immediately after a value, and `key`/`beginX` reset it appropriately.
+    /// Whether the next value needs a comma; `key`/`beginX` reset it.
     need_comma: bool = false,
 
     pub fn beginObject(self: *Writer) !void {
@@ -89,9 +71,8 @@ pub const Writer = struct {
         if (v) |x| try self.int(x) else try self.nullValue();
     }
 
-    /// Emit a float rounded to `digits` decimals, half-to-even, printed the way
-    /// Python prints it (always at least one decimal place, so 284.0 does not
-    /// become the integer 284 and change the JSON type).
+    /// Emit a float rounded to `digits` decimals, half-to-even, always with a
+    /// decimal point (284.0 must not become the integer 284).
     pub fn float(self: *Writer, v: f64, digits: u8) !void {
         if (self.need_comma) try self.w.writeByte(',');
         var buf: [512]u8 = undefined;
@@ -114,10 +95,8 @@ fn writeQuoted(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// Round `v` to `digits` decimal places, half-to-even, and render it with a
-/// mandatory decimal point. Operates on the shortest round-tripping decimal
-/// representation — see the module docs for why, and for the one case where
-/// this differs from Python by a single unit in the last place.
+/// Round `v` to `digits` decimals, half-to-even, with a mandatory decimal
+/// point. See the module docs for the one divergence from Python.
 pub fn formatRounded(buf: []u8, v: f64, digits: u8) ![]const u8 {
     if (std.math.isNan(v)) return "null";
     if (std.math.isInf(v)) return if (v > 0) "1e999" else "-1e999";
@@ -132,9 +111,7 @@ pub fn formatRounded(buf: []u8, v: f64, digits: u8) ![]const u8 {
     const int_part = if (dot) |d| body[0..d] else body;
     const frac_part = if (dot) |d| body[d + 1 ..] else "";
 
-    // Already short enough: pad to at least one decimal and emit as-is. This is
-    // the common case (284.0 -> "284.0", 0.5 -> "0.5") and it is what keeps the
-    // output identical to Python's, which also prints the shortest repr.
+    // Already short enough: pad to at least one decimal and emit as-is.
     if (frac_part.len <= digits) {
         return std.fmt.bufPrint(buf, "{s}{s}.{s}", .{
             if (neg) "-" else "",
@@ -155,8 +132,7 @@ pub fn formatRounded(buf: []u8, v: f64, digits: u8) ![]const u8 {
     if (first_dropped > '5') {
         round_up = true;
     } else if (first_dropped == '5') {
-        // Exactly half only if every remaining digit is zero; otherwise it is
-        // strictly greater than half and always rounds up.
+        // Exactly half only if every remaining digit is zero.
         var rest_nonzero = false;
         for (digs[keep + 1 .. n]) |c| {
             if (c != '0') rest_nonzero = true;
@@ -188,9 +164,8 @@ pub fn formatRounded(buf: []u8, v: f64, digits: u8) ![]const u8 {
     return renderDigits(buf, neg, digs[0..n], int_part.len, digits);
 }
 
-/// Assemble `digits` (a bare digit string) into `int.frac`, trimming trailing
-/// fractional zeros the way Python's shortest repr does but always leaving at
-/// least one decimal place.
+/// Assemble a bare digit string into `int.frac`, trimming trailing zeros but
+/// keeping at least one decimal place.
 fn renderDigits(buf: []u8, neg: bool, digs: []const u8, int_len: usize, digits: u8) ![]const u8 {
     _ = digits;
     var frac = digs[int_len..];

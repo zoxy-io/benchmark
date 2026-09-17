@@ -2,17 +2,13 @@
 .env.cloud
 results/
 cloud/.terraform/
-# cloud/.terraform.lock.hcl is COMMITTED on purpose — see cloud/versions.tf
+# cloud/.terraform.lock.hcl is committed (see cloud/versions.tf)
 cloud/terraform.tfstate*
 cloud/terraform.tfvars
 cloud/sa-key.json
 .DS_Store
 
-# The proxies' TLS certificate and key, generated per run on the proxy host by
-# `bench suite` (suite.zig's ensureTlsMaterial) and mounted into every proxy.
-# Never committed: it is a throwaway self-signed pair for a fleet that lives
-# about an hour, and a private key in a public repo is a permanent alarm for
-# something with no secret in it. A local run writes it here.
+# Per-run self-signed TLS pair from `bench suite` (suite.zig ensureTlsMaterial).
 proxies/tls/
 
 # devenv
@@ -22,17 +18,12 @@ devenv.local.nix
 # direnv
 .direnv
 
-# zig build artifacts — build.zig.zon pins the zrk/zio deps by url AND hash, so
-# no committed lockfile-equivalent is needed beyond that.
+# zig build artifacts (build.zig.zon pins deps by hash)
 bench/.zig-cache/
 bench/zig-out/
-# Vestigial. Nothing builds against this any more: the Makefile used to pass
-# `--system zig-pkg` while CI did not, and no target or doc ever created it, so
-# zig silently fell back to the global cache. Still ignored because the
-# directory exists on machines that hand-populated it once; safe to delete.
+# Vestigial: no build uses it any more; safe to delete.
 bench/zig-pkg/
 
-# rust build artifacts (proxies/pingora) — Cargo.toml floats on "0.8", no
-# committed lockfile on purpose (see its comment)
+# rust build artifacts (proxies/pingora); lockfile not committed
 proxies/pingora/target/
 proxies/pingora/Cargo.lock

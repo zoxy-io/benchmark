@@ -1,17 +1,10 @@
 //! Inline SVG line charts, ported from report/charts.py.
 //!
-//! Same geometry constants and the same axis rules, because the report's visual
-//! grammar is already settled and this is a language change, not a redesign. Two
-//! of those rules are load-bearing and easy to "simplify" wrongly:
-//!
-//! * the y-axis fits only the points inside the cropped x window, so a tail that
-//!   was cropped out cannot inflate the scale and flatten everything else;
-//! * latency uses whole-decade log gridlines, because it spans sub-millisecond
-//!   when healthy to hundreds of milliseconds at the knee, and a linear axis
-//!   crushes every curve but the tallest into the baseline.
-//!
-//! Output is written straight into an `Io.Writer` rather than assembled in a
-//! list of strings as the Python did.
+//! Two load-bearing axis rules:
+//! * the y-axis fits only points inside the cropped x window, so a cropped
+//!   tail cannot flatten everything else;
+//! * latency uses whole-decade log gridlines; a linear axis crushes all but
+//!   the tallest curve into the baseline.
 
 const std = @import("std");
 
@@ -28,9 +21,8 @@ pub const mr: f64 = 16;
 pub const mt: f64 = 22;
 pub const mb: f64 = 40;
 
-/// Marker geometry for `Options.markers`. r=4 is the 8px minimum a data point
-/// needs to read as a point; the 2px ring in the surface colour (`.dot` in the
-/// stylesheet) is what keeps it legible where two series cross.
+/// Marker geometry for `Options.markers`: r=4 (8px) plus a 2px surface-colour
+/// ring (`.dot`) so dots stay legible where series cross.
 const dot_r: f64 = 4;
 const dot_ring: f64 = 2;
 
@@ -47,37 +39,21 @@ pub const Options = struct {
     yfmt: YFormat = .si,
     y_unit: []const u8 = "",
     ylog: bool = false,
-    /// Crop the offered axis, e.g. to where the last real proxy stops keeping
-    /// up. Lines running past it are clipped at the plot edge.
+    /// Crop the x axis; lines past it are clipped at the plot edge.
     xmax: ?f64 = null,
     x_label: []const u8 = "offered load (req/s)",
     /// Draw a dot on every data point as well as the line.
     ///
-    /// For a chart whose points are DISCRETE OBSERVATIONS rather than a dense
-    /// sampled curve — the nightly trend is one point per night. Two reasons it
-    /// is not optional there:
-    ///
-    /// * a `<polyline>` with a single point draws NOTHING, so a profile with
-    ///   one night of history rendered a completely empty chart;
-    /// * with several nights the line is visible but the nights are not, and
-    ///   "which run was that" is the only question the trend is asked.
-    ///
-    /// Left off for the run report's charts, where each series is hundreds of
-    /// samples of a continuous ramp and a dot per sample is just ink.
+    /// Required for discrete observations (the nightly trend): a one-point
+    /// `<polyline>` draws nothing, and single nights must be identifiable.
     markers: bool = false,
-    /// x is an ORDINAL position — the Nth observation — not a measured quantity.
-    ///
-    /// Changes two things, both because a fraction of a run means nothing: the
-    /// axis ends exactly on the last observation instead of being rounded up to
-    /// a round number, and ticks land on whole runs, counted from 1.
-    ///
-    /// Must be set together with `XAxis.labels` on the same chart's data blob,
-    /// or the crosshair maps to a different x range than the drawing.
+    /// x is an ordinal position (the Nth observation): the axis ends on the
+    /// last observation and ticks land on whole runs, counted from 1.
+    /// Must be paired with `XAxis.labels`, or the crosshair x range differs.
     x_ordinal: bool = false,
 };
 
-/// A small fixed-capacity tick list. 24 is far more than a readable axis ever
-/// carries, so overflow means a bug upstream rather than a legitimate chart.
+/// Fixed-capacity tick list; overflowing 24 means a bug upstream.
 pub const Ticks = struct {
     buf: [24]f64 = undefined,
     len: usize = 0,
@@ -111,8 +87,7 @@ pub fn niceTicks(lo: f64, hi_in: f64, n: usize) Ticks {
     }
 
     var t = @floor(lo / step) * step;
-    // Step up to the first tick at or above hi, so the axis always COVERS the
-    // data rather than stopping just short of the last point.
+    // Step up to the first tick >= hi, so the axis always covers the data.
     while (t < hi - step * 1e-9) {
         out.append(roundTo(t, 10)) catch return out;
         t += step;
@@ -121,22 +96,17 @@ pub fn niceTicks(lo: f64, hi_in: f64, n: usize) Ticks {
     return out;
 }
 
-/// Integer tick positions 0..hi, thinned so the axis never carries more labels
-/// than it can show.
-///
-/// For an axis whose x is a COUNT of observations, where a fractional tick is
-/// meaningless — `niceTicks` happily labels run 0.5.
+/// Integer tick positions 0..hi, thinned to a readable count. For count axes,
+/// where `niceTicks` would label run 0.5.
 pub fn ordinalTicks(hi: f64) Ticks {
     var out: Ticks = .{};
     const n: usize = @intFromFloat(@max(hi, 0));
-    // At most ~9 labels, and always a whole number of runs apart.
     const stride: usize = @max(1, (n + 8) / 8);
     var i: usize = 0;
     while (i <= n) : (i += stride) {
         out.append(@floatFromInt(i)) catch return out;
     }
-    // The last run always gets a tick, even when the stride skipped it: it is
-    // the one a reader is looking for.
+    // The last run always gets a tick: it is the one a reader looks for.
     if ((n % stride) != 0) out.append(@floatFromInt(n)) catch {};
     return out;
 }
@@ -146,9 +116,8 @@ fn roundTo(v: f64, digits: u32) f64 {
     return @round(v * m) / m;
 }
 
-/// Axis tick labels, matching report/charts.py's `fmt_si` exactly — including
-/// its last branch, which is `%.2g` (TWO SIGNIFICANT FIGURES) rather than a
-/// shortest-form print. 0.123456 renders as "0.12", not "0.123456".
+/// Axis tick labels, matching report/charts.py's `fmt_si` exactly, including
+/// its `%.2g` last branch: 0.123456 renders as "0.12".
 pub fn fmtSi(out: []u8, v: f64) []const u8 {
     var scratch: [64]u8 = undefined;
     if (v >= 1e9) return std.fmt.bufPrint(out, "{s}G", .{trimG(&scratch, v / 1e9)}) catch "?";
@@ -158,18 +127,13 @@ pub fn fmtSi(out: []u8, v: f64) []const u8 {
     return std.fmt.bufPrint(out, "{s}", .{sigFigs(&scratch, v, 2)}) catch "?";
 }
 
-/// Python's `%g` with its default precision: round to 6 SIGNIFICANT figures,
-/// then strip trailing zeros and a trailing point. `v` here is real measured
-/// data (e.g. a windowed achieved rate), not a clean decimal, so printing it
-/// via `{d}` (shortest round-tripping repr) instead of rounding first used to
-/// surface float noise as long digit runs like "43.11999999999999" — this
-/// rounds first, matching what `%g` does.
+/// Python's `%g`: round to 6 significant figures, then strip trailing zeros.
+/// Rounding first keeps float noise ("43.11999999999999") off the axis.
 fn trimG(buf: []u8, v: f64) []const u8 {
     return sigFigs(buf, v, 6);
 }
 
-/// Python's `%.<n>g` for the 0 < v < 10 range: round to `n` significant
-/// figures, then strip as `%g` does.
+/// Python's `%.<n>g` for 0 < v < 10.
 fn sigFigs(buf: []u8, v: f64, n: u32) []const u8 {
     if (v == 0) return "0";
     const exp = @floor(std.math.log10(@abs(v)));
@@ -206,9 +170,7 @@ fn fmtTick(out: []u8, v: f64, yfmt: YFormat) []const u8 {
     return switch (yfmt) {
         .bytes => fmtBytes(out, v),
         .pct => std.fmt.bufPrint(out, "{s}%", .{trimG(out[32..], v * 100)}) catch "?",
-        // Latency series are in SECONDS; the tick POSITIONS stay in seconds so
-        // round values like 0.01s land on round labels like 10ms, instead of the
-        // 0.0050-style labels a millisecond axis would produce.
+        // Latency is in seconds; ticks stay in seconds so 0.01s labels as 10ms.
         .ms => fmtSi(out, v * 1000),
         .si => fmtSi(out, v),
     };
@@ -216,24 +178,14 @@ fn fmtTick(out: []u8, v: f64, yfmt: YFormat) []const u8 {
 
 // --- markup shared between `chart` and `histChart` ---------------------
 //
-// Only the pieces that need no chart-specific TRANSFORM function are shared
-// here — `y`/`label` below are already-computed values, not callbacks, so
-// this stays plain data in, markup out. The point-scaling loops in `chart`
-// and `histChart` are deliberately NOT unified with each other: chart's
-// (possibly log) y-scale and histChart's log-x/linear-y decade scale are
-// different enough that forcing them through one shared callback-based
-// abstraction would cost more in indirection than the ~4 lines it would save,
-// and would require materializing a scaled-points array where both currently
-// stream straight into `out` with no allocation at all.
+// The point-scaling loops are not shared: the two scales differ enough that
+// a callback abstraction would cost more than it saves.
 
 fn writeSvgOpen(out: *std.Io.Writer) !void {
     try out.print("<svg viewBox=\"0 0 {d:.0} {d:.0}\" role=\"img\">", .{ w, h });
 }
 
-/// One y-axis gridline plus its tick label, at a Y COORDINATE the caller has
-/// already scaled (`ctx.y(t)` or `Y.f(t, ymaxt)`) and a label it has already
-/// formatted (`fmtTick` or `fmtSi`) — the two charts differ only in how they
-/// get to those two values, not in how the line and label are drawn.
+/// One y gridline plus tick label, at an already-scaled y and formatted label.
 fn writeYGridLine(out: *std.Io.Writer, y: f64, label: []const u8) !void {
     try out.print("<line class=\"grid\" x1=\"{d:.0}\" y1=\"{d:.1}\" x2=\"{d:.0}\" y2=\"{d:.1}\"/>", .{ ml, y, w - mr, y });
     try out.print("<text class=\"tick\" x=\"{d:.0}\" y=\"{d:.1}\" text-anchor=\"end\">{s}</text>", .{ ml - 8, y + 4, label });
@@ -274,11 +226,8 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
 
     const xticks = if (opts.x_ordinal) ordinalTicks(xmax) else niceTicks(0, xmax, 5);
     const xt = xticks.slice();
-    // An ordinal axis ends ON the last observation. `niceTicks` rounds up to a
-    // round number, which for 8 runs (x = 0..7) puts the axis end at 8 — a tick
-    // for a night that does not exist, with the newest run stranded 12% short of
-    // the right edge. It reads as the latest run being missing, which is exactly
-    // how it was reported.
+    // An ordinal axis ends ON the last observation; `niceTicks` would round up
+    // and leave a tick for a run that does not exist.
     const xmaxt = if (opts.x_ordinal) @max(xmax, 1) else xt[xt.len - 1];
 
     // The y scale is fitted to the VISIBLE window only.
@@ -333,11 +282,8 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     };
 
     try writeSvgOpen(out);
-    // The clip crops lines that run past the axis. With markers on it has to be
-    // let out by a marker's radius plus its ring, or the points ON the axis get
-    // sliced in half — and on the trend those are the first night and, worse,
-    // the LATEST one, which is the point the chart exists to show. A 6px
-    // overhang is invisible for the cropping the clip is actually for.
+    // With markers, let the clip out by marker radius + ring, or points on the
+    // axis (including the latest run) get sliced in half.
     const pad: f64 = if (opts.markers) dot_r + dot_ring else 0;
     try out.print(
         "<clipPath id=\"clip-{s}\"><rect x=\"{d:.0}\" y=\"{d:.0}\" width=\"{d:.0}\" height=\"{d:.0}\"/></clipPath>",
@@ -349,9 +295,7 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
         try writeYGridLine(out, ctx.y(t), fmtTick(&buf, t, opts.yfmt));
     }
     for (xt) |t| {
-        // An ordinal axis counts from 1: the eighth night is "8", not "7". The
-        // tooltip names the actual run, so this only has to agree with how a
-        // person counts them.
+        // An ordinal axis counts from 1.
         const label = if (opts.x_ordinal)
             std.fmt.bufPrint(&buf, "{d:.0}", .{t + 1}) catch "?"
         else
@@ -364,20 +308,9 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     try out.print("<g clip-path=\"url(#clip-{s})\">", .{opts.id});
     for (series) |s| {
         if (s.pts.len == 0) continue;
-        // A missing observation has to READ as missing.
-        //
-        // `trendSeries` omits a night a proxy failed, on the stated grounds
-        // that "a failed night leaves a GAP rather than a zero" — but ONE
-        // polyline over the surviving points draws a straight segment across
-        // the hole, which invents a value for that night instead. That is
-        // worse than the zero the gap exists to avoid: a zero at least looks
-        // wrong, where an interpolated segment looks like data. haproxy failed
-        // run 3 of 8 and its line ran through it unbroken.
-        //
-        // So the line is cut into contiguous stretches, one polyline each.
-        // A stretch of a single point draws nothing on its own — the marker is
-        // what makes an isolated night visible, which is the other reason
-        // `markers` is not optional on this chart.
+        // A missing observation must read as missing: one polyline over the
+        // surviving points would interpolate across the gap. Split into
+        // contiguous stretches; a lone point is shown only by its marker.
         var start: usize = 0;
         while (start < s.pts.len) {
             var end = start + 1;
@@ -396,9 +329,7 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
         }
     }
     if (opts.markers) {
-        // After every line, so a dot is never buried under a later series'
-        // stroke. r=4 (8px) with a 2px surface-coloured ring, which is what
-        // keeps dots legible where two proxies cross.
+        // Dots after every line, so no dot is buried under a later stroke.
         for (series) |s| {
             for (s.pts) |p| {
                 try out.print(
@@ -418,35 +349,20 @@ pub fn chart(out: *std.Io.Writer, opts: Options, series: []const Series) !bool {
     return true;
 }
 
-/// The JSON blob `report.js`'s hover handler reads for chart `id`: each
-/// series' name and points, the y-value formatter, the plot geometry (so the
-/// browser can invert screen coordinates back to data space) and xmax (so the
-/// crosshair's x maps to an offered rate). `xmax_opt`/the geometry constants
-/// must be computed exactly as `chart` computes them for the SAME `series` and
-/// `id`, or the hover crosshair lands on the wrong point — the two are always
-/// called together for that reason.
-///
-/// Every embedder of a line chart (html.zig's per-run cards, index.zig's
-/// nightly trend) calls this rather than writing its own copy, so the JSON
-/// shape can't drift out of sync between them the way the chart geometry
-/// nearly did once already (see histCard's note on `decades`).
-/// What the hover tooltip should call the x value, and how to render it.
-///
-/// Carried in the data blob rather than assumed by the script, which used to
-/// hardcode "offered … req/s" for every chart. That is right for the run
-/// report, where x IS offered load, and wrong for the nightly trend, where x is
-/// a run index and the tooltip claimed a request rate that no axis on the page
-/// showed.
+/// What the hover tooltip calls the x value, and how to render it. Carried in
+/// the data blob: x is offered load in the run report but a run index in the
+/// nightly trend.
 pub const XAxis = struct {
     name: []const u8 = "offered",
     unit: []const u8 = "req/s",
-    /// Labels indexed by x, for a chart whose x is an ordinal position rather
-    /// than a measured quantity. When set, the tooltip shows `labels[x]` and
-    /// the unit is not used — the trend passes its run ids, so hovering a night
-    /// names the run instead of reporting "run 3".
+    /// Per-x labels for an ordinal axis; when set the tooltip shows
+    /// `labels[x]` (e.g. run ids) and `unit` is unused.
     labels: []const []const u8 = &.{},
 };
 
+/// JSON blob read by `report.js`'s hover handler for chart `id`. Geometry and
+/// xmax must match what `chart` computed for the same series, or the
+/// crosshair lands on the wrong point. Shared by every line-chart embedder.
 pub fn writeChartData(
     out: *std.Io.Writer,
     id: []const u8,
@@ -492,9 +408,8 @@ pub fn writeChartData(
         break :blk @max(m, 1);
     };
     if (xmax <= 0) xmax = 1;
-    // Must match `chart`'s own xmaxt exactly, or the crosshair reads a
-    // different x than the one drawn. `labels` is what makes the axis ordinal —
-    // the same signal `Options.x_ordinal` carries on the drawing side.
+    // Must match `chart`'s xmaxt. `labels` marks the axis ordinal, like
+    // `Options.x_ordinal` on the drawing side.
     try j.key("xmax");
     if (x.labels.len > 0) {
         try j.float(@max(xmax, 1), 4);
@@ -542,8 +457,8 @@ const Scale = struct {
     }
 };
 
-/// The per-proxy latency distribution card: x is n = 1/(1-percentile) on a log
-/// scale, so p50/p90/p99/p99.9 land on even decades.
+/// Per-proxy latency distribution: x is n = 1/(1-percentile) on a log scale,
+/// so p50/p90/p99/p99.9 land on even decades.
 pub fn histChart(out: *std.Io.Writer, id: []const u8, pts: []const Point) !bool {
     if (pts.len == 0) {
         try out.writeAll("<p class='empty'>no data</p>");
@@ -593,11 +508,8 @@ pub fn histChart(out: *std.Io.Writer, id: []const u8, pts: []const Point) !bool 
     }
     try out.writeAll("\" fill=\"none\" stroke-width=\"2\"/>");
 
-    // `data-hist`, not `data-chart`: report.js's line-chart hover handler
-    // assumes a linear x-scale and several named series, neither true here
-    // (log-x percentile scale, one series) — a distinct attribute routes this
-    // rect to its own handler instead of silently misbehaving under the
-    // wrong one.
+    // `data-hist`, not `data-chart`: the line-chart hover handler assumes a
+    // linear x and named series, neither true here.
     try out.print(
         "<rect class=\"hover-capture\" data-hist=\"{s}\" x=\"{d:.0}\" y=\"{d:.0}\" width=\"{d:.0}\" height=\"{d:.0}\" fill=\"transparent\"/>",
         .{ id, ml, mt, w - ml - mr, h - mt - mb },
@@ -611,7 +523,7 @@ test "niceTicks covers the data and ends at or above hi" {
     const s = t.slice();
     try std.testing.expect(s.len >= 2);
     try std.testing.expectEqual(@as(f64, 0), s[0]);
-    // The axis must COVER the data, never stop just short of the last point.
+    // The axis must cover the data.
     try std.testing.expect(s[s.len - 1] >= 43120);
 }
 
@@ -621,7 +533,7 @@ test "niceTicks handles a degenerate range" {
 }
 
 test "fmtSi reproduces report/charts.py's fmt_si" {
-    // Every expectation here was taken from the Python, not assumed.
+    // Expectations taken from the Python.
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("43.12k", fmtSi(&buf, 43120));
     try std.testing.expectEqualStrings("1M", fmtSi(&buf, 1_000_000));
@@ -630,8 +542,7 @@ test "fmtSi reproduces report/charts.py's fmt_si" {
     try std.testing.expectEqualStrings("0", fmtSi(&buf, 0));
     try std.testing.expectEqualStrings("43", fmtSi(&buf, 43.12));
 
-    // The sub-10 branch is %.2g — two SIGNIFICANT figures, not shortest form.
-    // Printing 0.123456 here would put six digits on an axis tick.
+    // The sub-10 branch is %.2g: two significant figures.
     try std.testing.expectEqualStrings("0.12", fmtSi(&buf, 0.123456));
     try std.testing.expectEqualStrings("0.4", fmtSi(&buf, 0.4));
     try std.testing.expectEqualStrings("0.05", fmtSi(&buf, 0.05));
@@ -641,11 +552,7 @@ test "fmtSi reproduces report/charts.py's fmt_si" {
 }
 
 test "fmtSi rounds float noise instead of printing it" {
-    // Real measured throughput (a windowed division) rarely lands on a clean
-    // decimal — 43120 achieved over a slightly-off window comes back as
-    // something like 43119.999999999993. `{d}`'s shortest round-tripping repr
-    // would print that noise verbatim; fmtSi must round it away like Python's
-    // `%g` does.
+    // Measured values carry float noise; fmtSi must round it away like `%g`.
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("43.12k", fmtSi(&buf, 43119.999999999993));
     try std.testing.expectEqualStrings("3M", fmtSi(&buf, 2_999_999.999999999));
@@ -666,8 +573,7 @@ test "chart reports an empty state rather than drawing axes over nothing" {
 }
 
 test "chart fits y to the cropped window, not the whole series" {
-    // A tail far past the crop must not inflate the y scale — that is what
-    // flattens every visible curve into the baseline.
+    // A tail past the crop must not inflate the y scale.
     const pts = [_]Point{
         .{ .x = 1000, .y = 10 },
         .{ .x = 2000, .y = 20 },
@@ -677,7 +583,6 @@ test "chart fits y to the cropped window, not the whole series" {
     var out: std.Io.Writer = .fixed(&buf);
     _ = try chart(&out, .{ .id = "rps", .xmax = 3000 }, &.{.{ .name = "zoxy", .pts = &pts }});
 
-    // The largest y tick should be near 20, not near 100000.
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "100k") == null);
 }
 
@@ -700,9 +605,6 @@ test "histChart draws percentile decades" {
     const s = out.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "percentile") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "p0") != null);
-    // The hover-capture target for report.js's histogram tooltip handler,
-    // distinguished from the line-chart one by `data-hist` rather than
-    // `data-chart` — the two charts' x-scales are not interchangeable.
     try std.testing.expect(std.mem.indexOf(u8, s, "data-hist=\"zoxy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "data-chart=") == null);
 }
@@ -712,8 +614,7 @@ test "the hover blob says what x is, so the tooltip stops assuming offered load"
     const pts = [_]Point{ .{ .x = 0, .y = 40000 }, .{ .x = 1, .y = 43000 } };
     const series = [_]Series{.{ .name = "zoxy", .pts = &pts }};
 
-    // Run report: x IS offered load, which is what the script used to hardcode
-    // for every chart.
+    // Run report: x is offered load.
     {
         var out: std.Io.Writer = .fixed(&buf);
         try writeChartData(&out, "rps", &series, .si, null, .{});
@@ -723,9 +624,7 @@ test "the hover blob says what x is, so the tooltip stops assuming offered load"
         try std.testing.expect(std.mem.indexOf(u8, s, "\"labels\":[]") != null);
     }
 
-    // Nightly trend: x is a run index. Reporting it as a req/s figure was
-    // inventing a quantity the chart has no axis for; the run ids let the
-    // tooltip name the night instead.
+    // Nightly trend: x is a run index; labels name the run.
     {
         var out: std.Io.Writer = .fixed(&buf);
         const runids = [_][]const u8{ "20260731-000100", "20260801-000100" };
@@ -742,9 +641,7 @@ test "the hover blob says what x is, so the tooltip stops assuming offered load"
 test "markers are drawn for discrete observations, and let out of the clip" {
     var buf: [8192]u8 = undefined;
 
-    // A single point: a `<polyline>` with one vertex has no segment and paints
-    // NOTHING, which is how a profile with one night of history rendered a
-    // completely empty trend.
+    // A one-vertex `<polyline>` paints nothing; the marker must show it.
     {
         var out: std.Io.Writer = .fixed(&buf);
         const one = [_]Point{.{ .x = 0, .y = 43000 }};
@@ -754,8 +651,7 @@ test "markers are drawn for discrete observations, and let out of the clip" {
         try std.testing.expect(std.mem.indexOf(u8, s, "r=\"4\"") != null);
     }
 
-    // The clip has to be let out by the marker radius, or the points sitting ON
-    // the axis — the first night and, worse, the newest — render as half dots.
+    // The clip is let out by the marker radius, so edge points are whole.
     {
         var out: std.Io.Writer = .fixed(&buf);
         const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 2, .y = 2 } };
@@ -766,8 +662,7 @@ test "markers are drawn for discrete observations, and let out of the clip" {
         try std.testing.expect(std.mem.indexOf(u8, s, "width=\"654\"") != null);
     }
 
-    // Off by default: the run report's series are hundreds of samples of a
-    // continuous ramp, where a dot per sample is just ink.
+    // Off by default: dense ramp samples do not need dots.
     {
         var out: std.Io.Writer = .fixed(&buf);
         const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 2, .y = 2 } };
@@ -781,10 +676,7 @@ test "markers are drawn for discrete observations, and let out of the clip" {
 test "an ordinal axis ends on the last observation, not on a round number" {
     var buf: [8192]u8 = undefined;
 
-    // Eight nights occupy x = 0..7. niceTicks rounds that up to 8 — a tick for
-    // a ninth night that does not exist — and strands the newest run 12% short
-    // of the right edge, which is exactly how "we still don't have run 8 on the
-    // chart" was reported.
+    // Eight nights occupy x = 0..7; niceTicks would round the axis up to 8.
     const pts = [_]Point{
         .{ .x = 0, .y = 40000 }, .{ .x = 1, .y = 41000 },
         .{ .x = 2, .y = 42000 }, .{ .x = 3, .y = 43000 },
@@ -797,9 +689,9 @@ test "an ordinal axis ends on the last observation, not on a round number" {
     _ = try chart(&out, .{ .id = "t", .markers = true, .x_ordinal = true }, &series);
     const s = out.buffered();
 
-    // The newest run lands ON the right edge of the plot (w - mr = 704).
+    // The newest run lands on the right edge (w - mr = 704).
     try std.testing.expect(std.mem.indexOf(u8, s, "cx=\"704.0\"") != null);
-    // Counted from 1, so the eighth night is labelled "8" — and there is no "9".
+    // Counted from 1: "8" present, no "9".
     try std.testing.expect(std.mem.indexOf(u8, s, ">8</text>") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, ">9</text>") == null);
 
@@ -810,8 +702,7 @@ test "an ordinal axis ends on the last observation, not on a round number" {
 }
 
 test "the ordinal axis and its hover blob agree on xmax" {
-    // They are computed in two different functions; disagreeing puts the
-    // crosshair on a different x than the one drawn.
+    // Computed in two functions; they must agree.
     var buf: [8192]u8 = undefined;
     const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 3 } };
     const series = [_]Series{.{ .name = "zoxy", .pts = &pts }};
@@ -819,33 +710,27 @@ test "the ordinal axis and its hover blob agree on xmax" {
 
     var out: std.Io.Writer = .fixed(&buf);
     try writeChartData(&out, "trend", &series, .si, null, .{ .name = "run", .labels = &runids });
-    // 2, the last observation — not niceTicks' rounded-up 2.5.
+    // 2, the last observation, not niceTicks' 2.5.
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "\"xmax\":2.0") != null);
 }
 
 test "ordinalTicks stays whole-numbered and always marks the last run" {
-    // Small: every run gets a tick.
     const few = ordinalTicks(3);
     try std.testing.expectEqual(@as(usize, 4), few.slice().len);
     try std.testing.expectApproxEqAbs(@as(f64, 3), few.slice()[3], 1e-9);
 
-    // Large: thinned, but the last run is never the one dropped — it is the one
-    // a reader is looking for.
+    // Large: thinned, but the last run is never dropped.
     const many = ordinalTicks(30);
     const t = many.slice();
     try std.testing.expect(t.len <= 10);
     try std.testing.expectApproxEqAbs(@as(f64, 30), t[t.len - 1], 1e-9);
-    // Whole runs only; `niceTicks` would happily label run 0.5.
     for (t) |v| try std.testing.expectApproxEqAbs(v, @round(v), 1e-9);
 }
 
 test "a night with no data breaks the line instead of being drawn through" {
     var buf: [8192]u8 = undefined;
 
-    // Five nights; the proxy failed on the third, so trendSeries omits it.
-    // One polyline over the survivors would run a straight segment from night
-    // 2 to night 4, straight across the night that has no data — which is what
-    // the live chart did for haproxy.
+    // Five nights, the third missing: must not be bridged by one polyline.
     const pts = [_]Point{
         .{ .x = 0, .y = 20000 },
         .{ .x = 1, .y = 21000 },
@@ -859,13 +744,11 @@ test "a night with no data breaks the line instead of being drawn through" {
     _ = try chart(&out, .{ .id = "t", .markers = true, .x_ordinal = true }, &series);
     const s = out.buffered();
 
-    // Two stretches, not one line bridging the hole.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "<polyline class=\"line s-haproxy\""));
-    // Four nights of data, four dots — the gap has none.
+    // Four nights of data, four dots.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, s, "<circle class=\"dot s-haproxy\""));
 
-    // A continuous series is still ONE polyline — the split only happens at a
-    // real gap.
+    // A continuous series is still one polyline.
     const whole = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 3 } };
     var out2: std.Io.Writer = .fixed(&buf);
     _ = try chart(&out2, .{ .id = "t", .markers = true, .x_ordinal = true }, &.{.{ .name = "zoxy", .pts = &whole }});
@@ -873,8 +756,7 @@ test "a night with no data breaks the line instead of being drawn through" {
 }
 
 test "gap-splitting is ordinal-only — a sampled ramp is never cut" {
-    // The run report's x is offered load: consecutive samples are hundreds of
-    // req/s apart, and every one of those is a legitimate step, not a gap.
+    // Run report x is offered load: wide sample spacing is not a gap.
     var buf: [8192]u8 = undefined;
     const pts = [_]Point{ .{ .x = 0, .y = 1 }, .{ .x = 900, .y = 2 }, .{ .x = 1800, .y = 3 } };
     var out: std.Io.Writer = .fixed(&buf);

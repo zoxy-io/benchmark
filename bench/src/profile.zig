@@ -1,12 +1,8 @@
 //! Ramp profiles, compiled in.
 //!
-//! The old loadgen/zrk-runner read eleven parameters from the environment, each
-//! with a silent `catch default` fallback (its main.zig:45). That is how a real
-//! run ended up with `TIMEOUT_S=0` while .env.example documented 1, and nothing
-//! anywhere noticed. Ramp parameters are the fairness contract of this
-//! benchmark — "never compare runs with different MAX_RATE, RAMP_SECONDS or
-//! CONNECTIONS" — so they are constants here, and `validate()` runs before any
-//! measurement. An unknown profile name is a hard error, not a default.
+//! Ramp parameters are the fairness contract, so they are constants, not env
+//! (the old runner's silent `catch default` produced `TIMEOUT_S=0`).
+//! `validate()` runs before any measurement; an unknown name is a hard error.
 
 const std = @import("std");
 
@@ -15,89 +11,40 @@ pub const Pair = struct { key: []const u8, value: []const u8 };
 pub const Profile = struct {
     name: []const u8,
 
-    /// Open connections = in-flight concurrency cap (the open-loop guard; zrk
-    /// keeps one request in flight per connection).
+    /// In-flight concurrency cap (zrk keeps one request per connection).
     connections: u32,
-    /// OS threads driving zrk's zio coroutine engine. Match the loadgen VM's
-    /// core count (cloud/variables.tf loadgen_cores), NOT `connections`.
+    /// zio threads. Match loadgen cores (cloud/variables.tf), NOT connections.
     threads: u8,
 
     start_rate: u64,
     max_rate: u64,
     ramp_seconds: u64,
 
-    /// Per-request WIRE timeout (bytes-out -> bytes-in). A hung-connection
-    /// guard, NOT a bound on coordinated-omission latency: past saturation a
-    /// request waits for a free connection but completes fast once it has one,
-    /// so it never trips this while its scheduled->response latency balloons.
+    /// Per-request wire timeout: a hung-connection guard, NOT a bound on
+    /// coordinated-omission latency (queued requests never trip it).
     timeout_s: u64,
 
-    /// Coordinated-omission deadline (0 = off). A request already staler than
-    /// this is SHED BEFORE SENDING — never touches the wire, counted as
-    /// `deadline_errors`, never recorded in the histogram — so overload surfaces
-    /// as a bounded, directly comparable error rate instead of an unbounded tail.
-    ///
-    /// This is what keeps c10k's histogram off zrk's 60s ceiling
-    /// (zrk/src/stats.zig:35), where every tail percentile degenerates to
-    /// ">=60s". It also makes the proxies comparable at all: without it each
-    /// proxy's own timeout config decides the outcome (haproxy bounds an
-    /// exchange at 60s and returns 504s, zoxy has no request_ms configured,
-    /// pingora has no request timeout whatsoever).
-    ///
-    /// NEVER pair this with zrk's `deadline_abort`. That aborts requests already
-    /// on the wire by resetting the connection, which under saturation storms
-    /// the target with reconnects — we measured pingora/envoy/traefik blowing
-    /// from tens of MiB to 380-440 MiB and collapsing (2026-07-20). zrk made
-    /// shed-before-send the default precisely because of that report.
+    /// Coordinated-omission deadline (0 = off). Staler requests are shed
+    /// before sending and counted as `deadline_errors`, so overload is a
+    /// bounded error rate instead of a tail pinned at zrk's 60s clamp.
+    /// NEVER pair with zrk's `deadline_abort`: resetting in-flight connections
+    /// storms the target with reconnects and collapses proxies.
     deadline_ms: u64,
 
     req_path: []const u8,
 
-    /// Offer the load over TLS, terminated by the proxy under test.
+    /// Offer the load over TLS (1.3 only, ALPN http/1.1, no resumption).
     ///
-    /// INBOUND ONLY. Every proxy's upstream leg stays plaintext, because zoxy's
-    /// 0.2.0 TLS is inbound-only by design ("the upstream leg stays plaintext"),
-    /// and letting the other four also encrypt to the origin would measure a job
-    /// zoxy cannot do rather than the one they share.
-    ///
-    /// Each proxy carries BOTH listeners at all times — plaintext on
-    /// `PROXY_PORT`, TLS on `PROXY_TLS_PORT` (see compose.yaml) — and this flag
-    /// only decides which one the ramp is pointed at. That is what keeps the
-    /// container healthcheck on the plaintext port for every profile: three of
-    /// the five images have neither curl nor openssl, and bash's /dev/tcp cannot
-    /// speak TLS at all, so a healthcheck through the TLS listener is not
-    /// available in the images this comparison is allowed to use.
-    ///
-    /// What the generator is, and is not, exercising — zrk terminates through
-    /// zssl as of 2.4.0 (it drove Zig's std TLS client before), so all three of
-    /// these travel with any number this profile produces:
-    ///
-    ///   * TLS 1.3 ONLY. Nothing here measures 1.2 — zssl implements no other
-    ///     version — and every proxy's listener is pinned to 1.3 so the
-    ///     negotiation cannot silently differ.
-    ///   * ALPN offers `http/1.1` AND NOTHING ELSE, so every proxy speaks the
-    ///     same protocol the plaintext profiles measure. zrk can offer `h2`
-    ///     (`cfg.http2`, which this harness never sets); nothing here is
-    ///     HTTP/2.
-    ///   * NO SESSION RESUMPTION. zssl can resume, and zrk declines to: it
-    ///     offers no PSK and discards the tickets a server issues, so every
-    ///     connection is a full handshake and zoxy's ticket support is never
-    ///     exercised. Handshakes are paid at CONNECT time — all `connections`
-    ///     of them in the first seconds of the ramp — and the steady state that
-    ///     `ref_rate` reads is record-layer crypto on a kept-alive connection,
-    ///     not handshake throughput.
+    /// Inbound only: zoxy's upstream leg is plaintext, so every proxy's is.
+    /// Proxies always carry both listeners (see compose.yaml PROXY_TLS_PORT);
+    /// this picks the ramp's target, keeping healthchecks on plaintext.
+    /// Handshakes all land at connect time, so `ref_rate` reads record-layer
+    /// crypto, not handshake throughput.
     tls: bool = false,
 
-    /// SUMMARY-latency reference offered rate: a shared, light, sub-knee load
-    /// where a single per-proxy latency number is actually fair, because it
-    /// reflects per-request COST rather than standing-queue wait.
-    ///
-    /// Per-profile because the connect storm moves. On a 200->100000/300s ramp
-    /// (the compiled-in `start_rate`/`max_rate`/`ramp_seconds` below), offered
-    /// 2000 rps at c1k's +/-20% band is t~=[4.2, 6.6]s — and at 10000
-    /// connections zrk is still ESTABLISHING connections then
-    /// (zrk/src/runner.zig:153-156 launches them all at once), so a 2000 rps
-    /// reading at c10k measures connection setup, not proxying.
+    /// Summary-latency reference rate: a light, sub-knee load where latency
+    /// reflects per-request cost rather than queueing. Per-profile because it
+    /// must land after the connect storm (zrk/src/runner.zig:153-156).
     ref_rate: f64,
     /// Merge windows with offered within +/-ref_band of ref_rate.
     ref_band: f64,
@@ -112,18 +59,8 @@ pub const Profile = struct {
         if (self.ramp_seconds == 0) return error.InvalidRampSeconds;
         if (self.connections == 0) return error.InvalidConnections;
         if (self.threads == 0) return error.InvalidThreads;
-        // A zero wire timeout is ALLOWED, but only as a compiled-in constant.
-        //
-        // The original rule rejected it outright, and the reason was sound: the
-        // env-var plumbing this replaced silently produced `TIMEOUT_S=0` from a
-        // `catch default`, and nothing noticed. That argument is about a value
-        // arriving unnoticed from ambient state — it does not apply to a
-        // constant in this file, which cannot change without a reviewed commit
-        // explaining itself, as c10k's does.
-        //
-        // Rejecting it here would instead mean the harness cannot express the
-        // only configuration known to complete a 10k ramp, which is a worse
-        // failure than the one the rule was guarding against.
+        // A zero wire timeout is allowed: as a compiled-in constant it cannot
+        // arrive unnoticed the way the old env var's did.
 
         // The reference rate must be reachable on this ramp and land after the
         // t>=3 warmup exclusion, or every proxy reports a null latency.
@@ -146,49 +83,16 @@ pub const Profile = struct {
     }
 };
 
-/// Shared ramp shape. Identical across profiles by design — the offered axis
-/// every chart shares depends on it, so only `connections` (and what that
-/// forces) differs between c1k and c10k.
-///
-/// At 100k req/s of 1 KiB bodies the offered load is ~820 Mbps, which is at or
-/// past what a 2-vCPU standard-v3 NIC sustains. That is deliberate: the ramp has
-/// to extend past every proxy's knee for the knee to be visible at all.
-///
-/// It does mean the rig has a ceiling of its own, somewhere near line rate, and
-/// NOTHING measures it any more: the `direct` baseline used to top out on the
-/// network rather than on the origin and so marked exactly where the rig
-/// saturated. Read proxies against each other, never as a fraction of line rate
-/// — and if two proxies ever converge on the same suspiciously round plateau,
-/// suspect this ceiling and restore `direct` from git history to find it.
-/// Which zoxy every profile measures.
-///
-/// `release` is not a git ref. It means "the latest published release", which
-/// `suite.resolveZoxySource` turns into a concrete tag before anything is
-/// built, and which then arrives as an upstream tarball rather than a compile
-/// (see proxies/zoxy/Dockerfile). Three things follow from that and they are
-/// the reason for the setting:
-///
-///   * It measures the binary users actually download — the same standing the
-///     stock haproxy, nginx and envoy images have here. A source build is our
-///     build of their code; a release is theirs.
-///   * It removes the longest, most failure-prone step of the night. The
-///     source path compiles on the fleet and fetches four git dependencies
-///     over NAT egress; run 30749146321 lost zoxy entirely to one transient
-///     failure in there, on a commit that built fine before and after.
-///   * The trend chart's points become versions rather than commits. That is
-///     the real cost: a regression is now bisectable only to a release, and it
-///     surfaces the night after it SHIPS, not the night after it lands.
-///
-/// Set this to `main` (or any branch, tag or sha) to get the old behaviour
-/// back — the source path is unchanged and still the only way to bench an
-/// unreleased commit or a PR. A floating ref only means anything if the clone
-/// is actually fresh, so that path keeps its cache-bust; see the Dockerfile.
-///
-/// Passed explicitly rather than left to compose's `${ZOXY_REF:-main}` default,
-/// so what gets measured is a stated intent rather than something that happens
-/// because nobody set the variable.
+/// Which zoxy every profile measures. `release` = latest published release,
+/// resolved to a tag by `suite.resolveZoxySource` and installed from the
+/// upstream tarball (proxies/zoxy/Dockerfile): it measures what users run and
+/// skips the flaky source build (run 30749146321). Cost: regressions bisect
+/// only to a release. Set a branch/tag/sha to build from source.
 pub const zoxy_ref = "release";
 
+// Shared ramp shape: the offered axis every chart shares. 100k rps of 1 KiB is
+// ~820 Mbps, near the rig's NIC limit, which nothing measures now; compare
+// proxies to each other, not to line rate (`direct` in git history finds it).
 const start_rate: u64 = 200;
 const max_rate: u64 = 100_000;
 const ramp_seconds: u64 = 300;
@@ -207,81 +111,30 @@ pub const c1k: Profile = .{
     .ref_band = 0.20,
     .cooldown_s = 8,
     .proxy_env = &.{
-        // zoxy leases an upstream slot per admitted connection at saturation, so
-        // the stock 1024 upstream slots against 1000 offered connections leaves
-        // 2.4% headroom — close enough that zoxy could shed for a reason that
-        // has nothing to do with its proxying. Pin upstream to the conn_slots
-        // default so the two agree. (zoxy is fixing this default upstream.)
+        // Stock slots leave only 2.4% headroom over 1000 connections; pin to
+        // the conn_slots default so zoxy never sheds on the cap.
         .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
-        // FOUR TIMES conn_slots, not equal to it, since the origin became a
-        // four-node pool. zoxy's upstream pool is process-wide but parked PER
-        // ENDPOINT on keep-alive, and the pick policy is round-robin per
-        // request — so a single downstream connection rotates through all four
-        // backends and wants a warm upstream parked at each. Held at 1386 the
-        // pool would be ~1/4 of what steady state asks for, and zoxy would shed
-        // on `zoxy_l7_shed_upstream_slots`: a number that measures the pool
-        // rather than the proxy, and one that reads as a regression against
-        // every pre-pool run.
-        //
-        // 5544 = 4 x 1386, comfortably under the 11457 comptime ceiling.
-        // Watch `zoxy_shed_upstream_slots` in the run artifacts — nonzero means
-        // this arithmetic is still wrong.
+        // 4 x conn_slots: upstreams park per endpoint and round-robin rotates
+        // through the four-node origin. Nonzero `zoxy_shed_upstream_slots` in
+        // the artifacts means this is still too small (ceiling 11457).
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
     },
 };
 
-/// c1k with TLS on the client leg, and NOTHING else changed.
-///
-/// Derived from `c1k` rather than spelled out, which is the whole design of it:
-/// same ramp, same connection count, same reference rate, same zoxy slot
-/// tuning, so the pair isolates the cost of terminating TLS instead of
-/// measuring two different experiments. A field that has to be tuned differently
-/// here (it has not been needed yet) should be set below, visibly, as a
-/// deliberate divergence.
-///
-/// `ref_rate` is inherited at 2000 rps deliberately. Reading both profiles'
-/// summary latency at the same offered rate is what makes "TLS costs X" a
-/// subtraction rather than a comparison of two unrelated points, and 2000 rps of
-/// 1 KiB bodies is ~2.6 MB/s of AEAD — nowhere near a bulk-crypto ceiling on any
-/// of these proxies, so it stays the sub-knee reference it is at c1k.
-///
-/// The name carries a dash, like nothing else here: it is a directory under the
-/// run, a path segment on the published site and a series in the trend chart, so
-/// `c1k-tls` sorts and reads next to `c1k` in all three.
+/// c1k with TLS on the client leg and nothing else changed, so the pair
+/// isolates the cost of TLS. Diverge only visibly, below. `ref_rate` stays
+/// 2000 so "TLS costs X" is a subtraction (~2.6 MB/s AEAD, well sub-knee).
 pub const c1k_tls: Profile = blk: {
     var p = c1k;
     p.name = "c1k-tls";
     p.tls = true;
-    // c1k's tuning, plus the one knob that only exists when a listener
-    // terminates TLS.
-    //
-    // ZOXY_TLS_ENGINES is 1024 because that is ALL ZOXY ALLOWS: it is both the
-    // shipped default and the comptime ceiling — 2048 and 4096 are rejected at
-    // startup with `LimitTlsEnginesOutOfRange`, measured against the v0.2.0
-    // release binary and still the ceiling at 0.8.0. So unlike conn_slots and
-    // upstream_slots, this is not a number this profile gets to choose, and it
-    // is pinned rather than left implicit for the same reason c1k pins
-    // conn_slots to ITS default: the run record should state the pool the
-    // numbers came from.
-    //
-    // zoxy holds one preallocated engine per admitted TLS connection and sheds
-    // past the pool, where the other four allocate per connection with no such
-    // ceiling. 1024 against this profile's 1000 offered connections is 2.4%
-    // headroom — the same too-close-to-call margin that made c1k widen the
-    // upstream pool, except here there is nothing to widen. It holds because zrk
-    // opens exactly `connections` and keeps them; churn is what would break it.
-    // `bench` reads `zoxy_shed_tls_engines` off the admin endpoint after every
-    // TLS ramp, and a nonzero value means this ramp measured zoxy's admission
-    // cap rather than its TLS — which is a finding about zoxy's ceiling, not a
-    // number to publish as its TLS throughput.
-    //
-    // It is also most of zoxy's memory here: ~92 KiB of engine plus a 64 KiB
-    // plaintext buffer each, preallocated at boot, over a 10 MiB shared
-    // libcrypto heap — so this profile prices at ~270 MiB against ~104 MiB for
-    // the same proxy with no TLS listener (`zoxy --check`, 0.8.0; it was ~136
-    // KiB per engine under the ztls engine 0.8.0 replaced with zssl). That is a
-    // real property of terminating TLS this way, and it is why the TLS listener
-    // is not left bound on the plaintext profiles — see compose.yaml.
+    // ZOXY_TLS_ENGINES = 1024 is both zoxy's default and its ceiling
+    // (`LimitTlsEnginesOutOfRange` above it, through 0.8.0); pinned so the run
+    // record states it. One engine per TLS connection, 2.4% headroom over 1000:
+    // holds because zrk never churns connections. Nonzero
+    // `zoxy_shed_tls_engines` means the ramp measured the cap, not TLS.
+    // Engines cost ~270 MiB vs ~104 MiB plaintext, hence no TLS listener on
+    // plaintext profiles (compose.yaml).
     p.proxy_env = &.{
         .{ .key = "ZOXY_CONN_SLOTS", .value = "1386" },
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "5544" },
@@ -290,20 +143,10 @@ pub const c1k_tls: Profile = blk: {
     break :blk p;
 };
 
-/// c1k with a different canned response body, and NOTHING else changed.
-///
-/// Same derivation argument as `c1k_tls`: same ramp, connections, reference
-/// rate and zoxy slot tuning, so the family isolates how each proxy scales with
-/// the size of what it relays. The bodies are the ones backend/10-gen-bodies.sh
-/// already generates; `c1k` itself is the 1 KiB point of the series.
-///
-/// Read the large bodies against the rig's own ceiling (see the ramp-shape note
-/// above `zoxy_ref`): 100k req/s of 1 KiB is already ~820 Mbps. At 10 KiB the
-/// wire saturates near ~10k req/s, and at 100 KiB near ~1k req/s — BELOW the
-/// 2000 rps `ref_rate`. `c1k-100k` therefore mostly measures the network, and
-/// its summary latency is read past line rate. It is kept at c1k's `ref_rate`
-/// anyway so the family stays a set of one-variable changes; a proxy that
-/// diverges from the others there is still a finding.
+/// c1k with a different response body and nothing else changed (bodies from
+/// backend/10-gen-bodies.sh). Large bodies hit the rig's line rate (see the
+/// ramp-shape note above `start_rate`): c1k-100k saturates near ~1k rps, below
+/// `ref_rate`, so it mostly measures the network.
 fn c1kBody(comptime name: []const u8, comptime path: []const u8) Profile {
     var p = c1k;
     p.name = name;
@@ -325,20 +168,12 @@ pub const c100: Profile = .{
     .timeout_s = 1,
     .deadline_ms = 0,
     .req_path = "/1k",
-    // Same as c1k's: 100 connections is nowhere near a throughput ceiling
-    // (zrk reuses each connection for many sequential requests, so c1k's 1000
-    // connections already sustained 50-90k rps in practice — connections cap
-    // in-flight CONCURRENCY, not completions/sec), and a shared ref_rate keeps
-    // this profile's summary latency directly comparable to c1k's.
+    // c1k's ref_rate, for direct comparison; connections cap concurrency, not
+    // throughput.
     .ref_rate = 2000,
     .ref_band = 0.20,
     .cooldown_s = 8,
-    // No override: 100 offered connections sit at ~10% of zoxy's stock 1024
-    // conn_slots default, nowhere near the headroom pressure that made c1k
-    // pin ZOXY_UPSTREAM_SLOTS to its conn_slots. This profile exists to be
-    // the cheap, fast-turnaround control while c10k's start failures (run
-    // #25) are being chased — it should exercise zoxy's SHIPPED defaults, not
-    // a bespoke config.
+    // No override: exercises zoxy's shipped defaults (100 conns ~10% of slots).
     .proxy_env = &.{},
 };
 
@@ -349,102 +184,40 @@ pub const c10k: Profile = .{
     .start_rate = start_rate,
     .max_rate = max_rate,
     .ramp_seconds = ramp_seconds,
-    // Restored: turning this off is what wedged haproxy's c10k ramp in run #14.
-    //
-    // With `timeout_s = 0` zrk never arms `watchTimer` (connection.zig gates it
-    // on `timeout_ns != 0`), so nothing breaks a read that never completes. The
-    // task blocks forever, zrk's end-of-run `group.cancel` waits on it, and the
-    // ramp never returns — the proxy watchdog aborted it at 900s with
-    // "stuck at stage ramp". direct and zoxy finished the same run cleanly
-    // because their reads completed; haproxy at 10k connections left reads
-    // outstanding past the end of the run.
-    //
-    // This is the hung-connection guard the field docs describe, and it is why
-    // ten of the twelve old working 10k runs carried `timeout_ms: 1000`. It was
-    // only ever zeroed to match the last known-good config while the c10k
-    // failure was unexplained; that cause turned out to be a memory leak.
+    // Hung-connection guard: with 0, zrk never arms `watchTimer`
+    // (connection.zig), and an outstanding read wedged haproxy's ramp (run #14).
     .timeout_s = 1,
 
-    // One SLO, enforced by the load generator, identical for every proxy.
-    //
-    // Restored after the c10k failure turned out to be a memory leak in
-    // `ramp.run` (a zio runtime per proxy from a process-lifetime arena, which
-    // OOM-killed the loadgen). The deadline was suspected and reverted; it was
-    // never implicated.
-    //
-    // Without it every tail percentile at c10k degenerates to zrk's 60s clamp —
-    // measured on the old fleet, p90/p99/p99.9/p99.99/max ALL 60.0s, five
-    // identical constants carrying no information, so proxies cannot be ranked
-    // by tail at all. It is also the only thing that makes them answer the same
-    // question: with no loadgen bound each proxy's own config decides the
-    // outcome (haproxy `timeout client/server 60s` returns 504s, pingora has no
-    // request timeout whatsoever).
-    //
-    // It sheds hard past the knee — ~90% of scheduled requests at the top of a
-    // ramp that deliberately runs to 100k. That does not corrupt the headline
-    // latency, which is read at `ref_rate` (8000 rps, comfortably under the
-    // ~16.7k zoxy sustained here), where shedding is negligible. Past the knee
-    // it converts an unbounded tail into a bounded, comparable error rate.
+    // One SLO for every proxy. Without it every c10k tail percentile is zrk's
+    // 60s clamp and each proxy's own timeouts decide the outcome. It sheds ~90%
+    // at the top of the ramp, but is negligible at `ref_rate`.
     .deadline_ms = 1000,
     .req_path = "/1k",
-    // Past the connect storm: ~8000 rps is t~=47s on this ramp, by which point
-    // all 10k connections are long established.
+    // ~t=47s: past the connect storm for all 10k connections.
     .ref_rate = 8000,
     .ref_band = 0.15,
     .cooldown_s = 8,
     .proxy_env = &.{
-        // The comptime ceiling for both, pinned equal as of zoxy #108. Without
-        // this zoxy sheds ~1/3 of responses by admission policy at 10k
-        // connections and the number measures the cap, not the proxy.
-        //
-        // 11457, not the 11464 this file carried: the ceiling is derived from
-        // the ⅞-CQ budget and moves whenever the worst-case op count does —
-        // zoxy #132 reserved ring ops for the concurrent health-probe sweep
-        // and took nine slots off it in v0.5.0. A stale value here is not a
-        // silent drift: the loader refuses `LimitConnSlotsOutOfRange` and the
-        // turn fails at startup, which is what it did until this line moved.
-        // `zoxy --check <rendered config>` re-reads the ceiling in a second,
-        // and is the thing to run after a zoxy bump.
+        // Comptime ceiling for both (zoxy #108); below it zoxy sheds ~1/3 by
+        // admission policy. The ceiling moves between zoxy versions (#132): run
+        // `zoxy --check <rendered config>` after a bump, or startup fails with
+        // `LimitConnSlotsOutOfRange`.
         .{ .key = "ZOXY_CONN_SLOTS", .value = "11457" },
-        // NOT 4x conn_slots, unlike c1k — there is no room. The pool is already
-        // AT the comptime ceiling, so with a four-node origin this profile
-        // cannot park a warm upstream per (connection, endpoint) the way c1k
-        // can; round-robin will evict and redial instead. That is a real
-        // handicap and it is the honest one available: the alternative is
-        // lowering conn_slots, which trades admission capacity zoxy demonstrably
-        // needs at 10k for pool depth. If `zoxy_shed_upstream_slots` shows up
-        // here, this profile is measuring the ceiling and not the proxy, and the
-        // fix is upstream in zoxy rather than in this file.
+        // Not 4x conn_slots like c1k: already at the ceiling, so round-robin
+        // redials instead of parking per endpoint. Nonzero
+        // `zoxy_shed_upstream_slots` here is a zoxy limit, not a tuning bug.
         .{ .key = "ZOXY_UPSTREAM_SLOTS", .value = "11457" },
     },
 };
 
-/// The CI gate: a real ramp, small enough to run on a shared GitHub runner.
+/// The CI gate: the full production path in ~35s per proxy on a GitHub runner.
 ///
-/// This profile exists so that `zig build test` is not the only thing standing
-/// between a broken `suite.zig` and a wasted night. It drives the entire
-/// production path — compose bring-up, the warm probe, `zrk.runner.run`, the
-/// cAdvisor poller, teardown, `report`, `index`, `notify` — in about 35 seconds
-/// per proxy, against the two stock-image proxies that need no `docker build`.
-///
-/// **It is not a measurement, and it is structurally incapable of becoming
-/// one.** Every other profile shares one `start_rate`/`max_rate`/`ramp_seconds`
-/// so their offered axes line up and their points can go on one chart; this one
-/// deliberately does not, which is what makes a `smoke` number uncomparable to
-/// anything by construction rather than by convention. On top of that it only
-/// ever runs under `--local` (the CI job passes `--local`), and a local run is
-/// already recorded `fleet: local`, banner-marked in the report, and refused by
-/// the trend chart.
-///
-/// The rates are sized for a 4-core GitHub runner sharing itself with two
-/// containers and the generator: 5 000 req/s peak, not 100 000. A gate that
-/// flakes because the runner could not offer the load is a gate that gets
-/// disabled.
+/// Not a measurement: its ramp shape differs from every other profile, so its
+/// numbers are incomparable by construction, and it runs only under `--local`.
 pub const smoke: Profile = .{
     .name = "smoke",
     .connections = 50,
-    // Two, not four: the runner has 4 cores total and is also hosting the
-    // proxy and the origin pool it is measuring.
+    // The 4-core runner also hosts the proxy and origin pool.
     .threads = 2,
     .start_rate = 200,
     .max_rate = 5_000,
@@ -452,23 +225,16 @@ pub const smoke: Profile = .{
     .timeout_s = 1,
     .deadline_ms = 0,
     .req_path = "/1k",
-    // t=11.25s on this ramp — clear of the t>=3 warmup exclusion, and far
-    // enough from the end that the +/-20% band is whole.
+    // t=11.25s: clear of the t>=3 warmup, with the +/-20% band whole.
     .ref_rate = 2000,
     .ref_band = 0.20,
-    // Two seconds. The cooldown exists to let a proxy's connections drain
-    // before the next turn's container starts; there is no next turn worth
-    // eight seconds of CI wall clock here.
+    // Only needs to drain connections before the next turn.
     .cooldown_s = 2,
     .proxy_env = &.{},
 };
 
-/// APPEND-ONLY, and the reason is `suite.proxyPort`: it keys each profile's
-/// block of per-turn host ports off this array's index, so inserting a profile
-/// anywhere but the end renumbers every profile after it. Ports are per
-/// (profile, proxy) turn precisely so no turn ever rebinds a port a previous
-/// turn used (runs #25/#26), and a renumbering would hand tonight's turns ports
-/// that an earlier turn in the same dispatch had already served load on.
+/// APPEND-ONLY: `suite.proxyPort` keys per-turn host ports off the index, and
+/// renumbering reuses ports an earlier turn served load on (runs #25/#26).
 pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_64, c1k_10k, c1k_100k };
 
 pub fn byName(name: []const u8) ?Profile {
@@ -495,9 +261,6 @@ test "byName is exhaustive and rejects unknown names" {
 }
 
 test "c1k-tls is c1k with TLS on, and nothing else" {
-    // The point of the profile is the subtraction: anything that differs beyond
-    // the name and the transport makes "TLS costs X" a comparison of two
-    // unrelated experiments instead.
     try std.testing.expect(c1k_tls.tls);
     try std.testing.expect(!c1k.tls);
 
@@ -513,9 +276,7 @@ test "c1k-tls is c1k with TLS on, and nothing else" {
     try std.testing.expectEqual(c1k.cooldown_s, c1k_tls.cooldown_s);
     try std.testing.expectEqualStrings(c1k.req_path, c1k_tls.req_path);
 
-    // Same zoxy admission/pool tuning — the TLS row must not be measuring a
-    // different slot configuration as well as a different transport — plus
-    // exactly one knob that has no meaning without a TLS listener.
+    // Same slot tuning, plus exactly one TLS-only knob.
     for (c1k.proxy_env) |want| {
         for (c1k_tls.proxy_env) |got| {
             if (std.mem.eql(u8, want.key, got.key)) {
@@ -526,11 +287,7 @@ test "c1k-tls is c1k with TLS on, and nothing else" {
     }
     try std.testing.expectEqual(c1k.proxy_env.len + 1, c1k_tls.proxy_env.len);
 
-    // And the engine pool covers the load this profile offers: one engine is
-    // held per admitted TLS connection, so a pool smaller than `connections`
-    // sheds by policy and the ramp measures zoxy's admission cap instead of its
-    // TLS. Derived from the profile rather than hardcoded, so raising
-    // `connections` past the pool fails HERE rather than in a night's numbers.
+    // One engine per TLS connection; a smaller pool measures the cap.
     var tls_engines: u32 = 0;
     for (c1k_tls.proxy_env) |kv| {
         if (std.mem.eql(u8, kv.key, "ZOXY_TLS_ENGINES")) {
@@ -538,17 +295,12 @@ test "c1k-tls is c1k with TLS on, and nothing else" {
         }
     }
     try std.testing.expect(tls_engines >= c1k_tls.connections);
-    // zoxy rejects anything above this at startup (LimitTlsEnginesOutOfRange —
-    // `constants.tls_engines_max`, unchanged from v0.2.0 through 0.8.0), so a
-    // profile that needs more headroom needs a zoxy that allows it.
+    // zoxy's startup ceiling (`constants.tls_engines_max`).
     try std.testing.expect(tls_engines <= 1024);
 }
 
 test "only a TLS profile sizes the TLS session pool" {
-    // `tls_engines` is "zero exactly when no listener terminates TLS" — setting
-    // it on a plaintext profile would preallocate ~156 KiB per engine for a
-    // listener that does not exist, and put ~166 MiB on a published memory
-    // number.
+    // An engine pool on a plaintext profile would inflate published memory.
     for (all) |p| {
         if (p.tls) continue;
         for (p.proxy_env) |kv| {
@@ -558,17 +310,13 @@ test "only a TLS profile sizes the TLS session pool" {
 }
 
 test "the plaintext profiles stay plaintext" {
-    // A profile silently acquiring TLS would change what every historical
-    // trend point means without changing its name.
+    // Acquiring TLS would silently change what historical trend points mean.
     try std.testing.expect(!c100.tls);
     try std.testing.expect(!c1k.tls);
     try std.testing.expect(!c10k.tls);
 }
 
 test "profile.all is append-only, because proxyPort keys off its index" {
-    // Renumbering a profile's port block would hand a turn the port an earlier
-    // turn in the same dispatch had already served load on — the exact
-    // condition runs #25/#26 died of.
     try std.testing.expectEqualStrings("c100", all[0].name);
     try std.testing.expectEqualStrings("c1k", all[1].name);
     try std.testing.expectEqualStrings("c10k", all[2].name);
@@ -580,8 +328,6 @@ test "profile.all is append-only, because proxyPort keys off its index" {
 }
 
 test "the body-size profiles are c1k with the body swapped, and nothing else" {
-    // Same subtraction argument as c1k-tls: anything beyond the name and the
-    // body makes "a bigger body costs X" a comparison of two experiments.
     for ([_]Profile{ c1k_64, c1k_10k, c1k_100k }) |p| {
         try std.testing.expect(!std.mem.eql(u8, c1k.req_path, p.req_path));
         try std.testing.expectEqual(c1k.tls, p.tls);
@@ -600,10 +346,7 @@ test "the body-size profiles are c1k with the body swapped, and nothing else" {
 }
 
 test "smoke shares no ramp shape with a published profile" {
-    // The guard on the CI gate. `smoke` is the one profile whose offered axis
-    // is deliberately different, so a number from it cannot be plotted against
-    // a real one by accident — and this fails the moment someone "fixes" it to
-    // match, which would make it silently comparable.
+    // Fails if someone "fixes" smoke to match, making it comparable.
     for (all) |p| {
         if (std.mem.eql(u8, p.name, "smoke")) continue;
         try std.testing.expect(p.max_rate != smoke.max_rate or
@@ -614,9 +357,7 @@ test "smoke shares no ramp shape with a published profile" {
 test "validate rejects the misconfigurations the env plumbing used to allow" {
     var p = c1k;
 
-    // A zero wire timeout is no longer rejected: it is the only configuration
-    // known to complete a 10k ramp, and as a compiled-in constant it cannot
-    // arrive unnoticed the way the old TIMEOUT_S=0 did.
+    // A zero wire timeout is allowed as a compiled-in constant.
     p.timeout_s = 0;
     try p.validate();
 
@@ -624,8 +365,7 @@ test "validate rejects the misconfigurations the env plumbing used to allow" {
     p.max_rate = p.start_rate;
     try std.testing.expectError(error.InvalidRampBounds, p.validate());
 
-    // A reference rate down in the warmup would silently null out every
-    // proxy's summary latency, since refHist excludes t<3.
+    // refHist excludes t<3, so this would null every summary latency.
     p = c1k;
     p.ref_rate = 250;
     try std.testing.expectError(error.RefRateInsideWarmup, p.validate());
@@ -636,20 +376,14 @@ test "validate rejects the misconfigurations the env plumbing used to allow" {
 }
 
 test "c10k carries the deadline SLO and c1k does not" {
-    // Without it, c10k produced p90=p99=p99_9=p99_99=max=60s — five identical
-    // clamp values, a saturated histogram rather than a measurement. It also
-    // makes the proxies answer one question instead of each applying its own
-    // timeout policy.
+    // Without it c10k's tail percentiles all read zrk's 60s clamp.
     try std.testing.expect(c10k.deadline_ms > 0);
     try std.testing.expectEqual(@as(u64, 0), c1k.deadline_ms);
 }
 
 test "profiles share one ramp shape so the offered axis is comparable" {
     for (all) |p| {
-        // `smoke` is the deliberate exception and the only one allowed: it is
-        // the CI gate, it runs only under `--local`, and its whole point is to
-        // finish in seconds rather than to produce a comparable number. The
-        // companion test below asserts it stays incomparable.
+        // `smoke` is the one exception; see its own test above.
         if (std.mem.eql(u8, p.name, smoke.name)) continue;
         try std.testing.expectEqual(start_rate, p.start_rate);
         try std.testing.expectEqual(max_rate, p.max_rate);

@@ -30,8 +30,7 @@ variable "runid" {
   EOT
 
   validation {
-    # Length caps at 40 so the longest derived name ("backend0-<runid>") stays
-    # inside Yandex's 63-character limit with room to spare.
+    # 40 keeps "backend0-<runid>" within Yandex's 63-character name limit.
     condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$", var.runid))
     error_message = "runid must be 1-40 characters of [a-z0-9-], starting and ending alphanumeric."
   }
@@ -66,10 +65,7 @@ variable "bench_profiles" {
 
 variable "bench_proxies" {
   type = string
-  # Matches nightly.yml's own default. traefik and the `direct` no-proxy
-  # baseline were deleted rather than parked (commands.zig's parseProxies
-  # rejects them outright); envoy and nginx each came back after being
-  # temporarily out of the comparison.
+  # Matches nightly.yml's default (see commands.zig parseProxies).
   default     = "zoxy,haproxy,nginx,pingora,envoy"
   description = "BENCH_PROXIES — comma-separated, passed straight to `bench suite --proxies`."
 }
@@ -119,22 +115,11 @@ variable "image_id" {
   EOT
 }
 
-# Sizing: the proxy container is capped to 1 CPU on cpuset 0 (compose.cloud.yaml)
-# whatever the VM has, so core count does NOT change what the proxy under test
-# gets. Spare cores buy two things instead: the OS, dockerd, sshd and cAdvisor are
-# unpinned, so more of them stay off core 0, and `docker build` — which runs HERE,
-# driven over ssh — gets to use them.
-#
-# That build is most of a nightly. The fleet is ephemeral, so there is no layer
-# cache and zoxy is compiled from source every run: measured at ~13 min of a
-# 37-min run, against 5-min ramps. haproxy and nginx, stock images, build in 1s.
-#
-# CAVEAT worth re-checking after any change here: Yandex standard-v3 scales the
-# NETWORK allowance with vCPU count, and that is benchmark-visible. Proxied
-# traffic crosses this NIC twice (loadgen->proxy->backend and back), so at 24.9k
-# rps of 1 KiB zoxy was already pushing ~408 Mbps through it. If proxy numbers
-# RISE after this bump, they were NIC-limited before and the old ones were not
-# measuring the proxy.
+# Sizing: the proxy container gets 1 CPU on cpuset 0 whatever the VM size;
+# spare cores keep OS/dockerd/cAdvisor off core 0 and speed up `docker build`.
+# CAVEAT: standard-v3 scales NIC bandwidth with vCPUs, and proxied traffic
+# crosses it twice (~408 Mbps at 24.9k rps of 1 KiB). If numbers rise after a
+# core change, they were NIC-limited.
 variable "proxy_cores" {
   type    = number
   default = 4
@@ -143,26 +128,9 @@ variable "proxy_memory" {
   type    = number
   default = 8
 }
-# PER BACKEND, and there are four of them (local.backend_names in main.tf) — so
-# the pool is 8 cores against the 4 a single origin used to have, while each
-# member is deliberately half the size. Both halves of that matter:
-#
-#   * Smaller members make the pool a real pool. Four origins that each dwarf
-#     the 1-CPU proxy would be four ways of measuring the same thing; at 2 cores
-#     a member is small enough that spreading load across them is load
-#     BALANCING and not just fan-out.
-#   * A bigger pool keeps the origin off the critical path. In a proxied run
-#     each member takes ~1/4 of the offered load, so the pool has to be wrong by
-#     4x before it can bottleneck anything.
-#
-# That second claim is ASSERTED from this sizing, not measured. A `direct`
-# pseudo-proxy used to ramp straight at backend0 every night and prove it —
-# removed once the origin became a pool, because it cost a full ramp per profile
-# to re-answer a question a 4x-oversized origin no longer raises.
-#
-# The cost of that removal: nothing now bounds the origin OR the network path
-# empirically. If a proxy plateaus at a suspiciously round number, restore
-# `direct` from git history before concluding the plateau belongs to the proxy.
+# PER BACKEND, four of them: 2 cores each so the pool really balances, 8 total
+# so it stays off the critical path. That is asserted, not measured: if a proxy
+# plateaus at a round number, restore `direct` from git history.
 variable "backend_cores" {
   type    = number
   default = 2

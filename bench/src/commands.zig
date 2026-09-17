@@ -1,10 +1,6 @@
 //! The subcommands that talk to the cloud: `sweep`, `wait`, `fetch`, `suite`.
-//!
-//! Split out of main.zig so the argument plumbing stays readable and each
-//! command's failure policy is stated next to it. The policies differ on
-//! purpose: `sweep` tolerates almost everything (it is a best-effort cleanup and
-//! must never block a run), while `wait` fails loudly (a run that produced no
-//! marker produced no data, and pretending otherwise publishes nothing).
+//! Failure policies differ: `sweep` is best-effort and never blocks a run;
+//! `wait` fails loudly, since no marker means no data.
 
 const std = @import("std");
 const Io = std.Io;
@@ -43,15 +39,9 @@ pub const Env = struct {
 };
 
 /// Delete every instance labelled `bench=nightly`.
-///
-/// This is the recovery path for a run cancelled between `apply` and `destroy`,
-/// where terraform's per-run state died with the runner and nothing else knows
-/// those VMs exist. Keying off a LABEL rather than state is the whole point:
-/// state can be lost, a label cannot.
-///
-/// Never fatal. A sweep failure must not stop tonight's benchmark — worst case
-/// a few orphans cost money until the next run, which is much better than a
-/// permanently red nightly.
+/// Delete every instance labelled `bench=nightly`: recovers VMs whose
+/// terraform state died with a cancelled runner (labels survive, state may
+/// not). Never fatal; orphans cost less than a red nightly.
 pub fn sweep(gpa: Allocator, arena: Allocator, io: Io, env: Env) !u8 {
     if (env.token.len == 0 or env.folder.len == 0) {
         std.debug.print("bench sweep: YC_TOKEN and YC_FOLDER_ID are required\n", .{});
@@ -71,7 +61,7 @@ pub fn sweep(gpa: Allocator, arena: Allocator, io: Io, env: Env) !u8 {
         const label = inst.bench_label orelse continue;
         if (!std.mem.eql(u8, label, "nightly")) continue;
 
-        // Never print the instance's addresses — only its name and run id.
+        // Never print the instance's addresses.
         std.debug.print("bench sweep: deleting orphan {s} (runid {s})\n", .{
             inst.name,
             inst.runid_label orelse "unknown",
@@ -92,22 +82,18 @@ pub fn sweep(gpa: Allocator, arena: Allocator, io: Io, env: Env) !u8 {
 }
 
 pub const WaitOptions = struct {
-    /// Overall bound. Past this the run is declared failed whatever the fleet is
-    /// doing, so a wedged VM cannot hold the workflow to its own timeout.
+    /// Overall bound, so a wedged VM cannot hold the workflow to its own timeout.
     deadline_s: u64 = 110 * 60,
     poll_s: u64 = 30,
-    /// If no VM has written its boot marker by here, cloud-init failed and no
-    /// amount of further waiting will help. This closes the gap where a loadgen
-    /// whose payload fetch failed writes NOTHING — no boot-ok, no FAILED — and
-    /// the runner would otherwise poll for its full deadline with no signal.
+    /// No boot marker by here means cloud-init failed. Catches a loadgen whose
+    /// payload fetch failed and writes nothing at all.
     boot_deadline_s: u64 = 15 * 60,
 };
 
 pub const WaitResult = enum { done, failed, timed_out, never_booted };
 
 /// Poll Object Storage for the run's terminal marker, echoing the uploaded log
-/// as it grows so the Actions console shows progress rather than 45 minutes of
-/// silence.
+/// as it grows.
 pub fn wait(
     gpa: Allocator,
     arena: Allocator,
@@ -127,15 +113,8 @@ pub fn wait(
     var shown: usize = 0;
     var booted = false;
 
-    // Measured against a monotonic start time, NOT accumulated in fixed
-    // `poll_s` increments: the loop body's own `client.get`/`exists` calls
-    // take real time too, and counting only the sleeps let this deadline
-    // drift arbitrarily far behind the wall clock. A workflow chunks `wait`
-    // into back-to-back invocations sized just under this deadline so it can
-    // refresh its IAM token between them (see main.zig's `--max-wait-s`); if
-    // the drift is large enough, `wait` is still running when the CALLER's
-    // own timeout fires, which kills it before it can exit(5) and hand off to
-    // the next chunk.
+    // Monotonic elapsed, not summed sleeps: the polls take time too, and drift
+    // would outlast the caller's chunk timeout (see main.zig `--max-wait-s`).
     const started = Io.Timestamp.now(io, .awake);
     const deadline_ns = opts.deadline_s * std.time.ns_per_s;
     const boot_deadline_ns = opts.boot_deadline_s * std.time.ns_per_s;
@@ -144,14 +123,8 @@ pub fn wait(
         const elapsed_ns = started.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
         if (elapsed_ns >= deadline_ns) break;
 
-        // Echo whatever new log the loadgen has uploaded. This is the only
-        // window into a run that is otherwise completely unreachable.
-        //
-        // Scrubbed with `logAnyIp`, not `redact.log`: this process runs on the
-        // CI runner, relaying a log object a DIFFERENT machine (the loadgen)
-        // wrote, so it never had a `redact.register` call to learn the
-        // fleet's addresses from — `redact.log`'s scrub table would be empty
-        // here regardless of what the log actually contains.
+        // Echo new log. `logAnyIp`, not `redact.log`: this runs on the CI runner,
+        // which never registered the fleet's addresses.
         if (client.get(arena, env.bucket, log_key)) |maybe| {
             if (maybe) |text| {
                 if (text.len > shown) {
@@ -229,8 +202,7 @@ pub fn runSuite(
     local: bool,
 ) !u8 {
     const fleet: suite.Fleet = if (local) blk: {
-        // Everything is this machine: the base compose file publishes 8080 and
-        // 9000 on the host, and cAdvisor on 8081.
+        // Local: the base compose file publishes 8080, 9000 and cAdvisor 8081.
         std.debug.print(
             "bench suite: LOCAL run — the generator shares this machine with the proxy it is\n" ++
                 "  measuring and the network is loopback, so these numbers are not comparable to a\n" ++
@@ -239,10 +211,8 @@ pub fn runSuite(
         );
         break :blk .{
             .proxy_ip = "127.0.0.1",
-            // One entry: locally the whole pool is four containers on this
-            // machine, reached by the proxies over docker DNS rather than by
-            // address. The driver only needs somewhere to send `backend up`,
-            // and locally that one call starts the entire pool.
+            // One entry: locally one `backend up` starts the whole pool, reached
+            // over docker DNS.
             .backend_ips = &.{"127.0.0.1"},
             .ssh = null,
             .remote_dir = ".",
@@ -256,8 +226,7 @@ pub fn runSuite(
             return 2;
         }
 
-        // Registered so any address that reaches a log line is scrubbed, and so
-        // CI masks them if this ever runs somewhere with a console.
+        // Scrub these from logs (and CI-mask them).
         redact.register(proxy_ip);
         for (backend_ips) |ip| redact.register(ip);
 
@@ -285,9 +254,7 @@ pub fn runSuite(
 
     var ok: usize = 0;
     var bad: usize = 0;
-    // The SUBJECT of the comparison, tracked apart from the count. Every other
-    // proxy here is a yardstick; a night without zoxy has no headline, no trend
-    // point, and nothing to catch a regression with.
+    // Tracked apart: a night without zoxy has no headline or trend point.
     var zoxy_lost = false;
     for (res.records) |r| {
         if (r.status.usable()) ok += 1 else bad += 1;
@@ -296,31 +263,16 @@ pub fn runSuite(
     std.debug.print("bench suite [{s}]: {d} usable, {d} failed/skipped\n", .{ prof.name, ok, bad });
     if (zoxy_lost) std.debug.print("bench suite [{s}]: zoxy produced no usable data\n", .{prof.name});
 
-    // Exit 3 means "it ran, but the result is incomplete" — distinct from a
-    // crash, so the workflow can still publish what there is while making the
-    // run visibly red.
-    //
-    // `zoxy_lost` is in here because red is what triggers a retry, and run
-    // 30749146321 is the case for it: zoxy failed to build, the other four
-    // ramped fine, `ok == 4` so this returned 0, the Verdict step saw four
-    // green stages, and nightly-retry.yml — which fires on `conclusion ==
-    // 'failure'` — sat out a night that had lost the only proxy the benchmark
-    // exists to measure. A failed envoy still does NOT redden the run: it costs
-    // a yardstick, and a second fleet is not worth one.
+    // Exit 3: ran but incomplete, so the workflow publishes and still goes red.
+    // A lost zoxy reddens the run so nightly-retry.yml fires (run 30749146321);
+    // a lost yardstick proxy does not.
     if (res.aborted or ok == 0 or zoxy_lost) return 3;
     return 0;
 }
 
-/// Split `BACKEND_IPS` (cloud-init writes it from terraform's pinned addresses)
-/// into the origin pool, preserving order — entry N is `backendN`, which is the
-/// host terraform named, the compose profile started, and the `BACKENDn_IP`
-/// override points at.
-///
-/// Empty entries are dropped rather than kept as blanks: a trailing comma would
-/// otherwise become a fifth "backend" at the empty address, and the failure
-/// would be a compose invocation with `BACKEND4_IP=` in it rather than anything
-/// that names the real problem. An entirely empty spec yields an empty slice,
-/// which the caller turns into a usage error.
+/// Split `BACKEND_IPS` into the origin pool, preserving order: entry N is
+/// `backendN` / `BACKENDn_IP`. Blank entries are dropped (a trailing comma
+/// must not become an empty backend); an empty spec yields an empty slice.
 pub fn parseBackendIps(arena: Allocator, spec: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, spec, ',');
@@ -339,21 +291,18 @@ test "parseBackendIps keeps pool order and drops blanks" {
 
     const ips = try parseBackendIps(arena, "10.10.0.13,10.10.0.14, 10.10.0.15 ,10.10.0.16,");
     try std.testing.expectEqual(@as(usize, 4), ips.len);
-    // Order matters: entry N must stay backendN, or a proxy is pointed at the
-    // wrong host by BACKENDn_IP.
+    // Order matters: entry N must stay backendN.
     try std.testing.expectEqualStrings("10.10.0.13", ips[0]);
     try std.testing.expectEqualStrings("10.10.0.15", ips[2]);
     try std.testing.expectEqualStrings("10.10.0.16", ips[3]);
 
-    // The caller turns this into "BACKEND_IPS is required" rather than running
-    // a suite with no origin.
+    // The caller turns this into a usage error.
     try std.testing.expectEqual(@as(usize, 0), (try parseBackendIps(arena, "")).len);
     try std.testing.expectEqual(@as(usize, 0), (try parseBackendIps(arena, " , ")).len);
 }
 
-/// Split a comma-separated list, rejecting names the suite does not know.
-/// A typo must be a loud error, not a silently-skipped proxy that leaves a gap
-/// in the comparison nobody notices.
+/// Split a comma-separated list, rejecting names the suite does not know, so
+/// a typo is loud rather than a silent gap in the comparison.
 pub fn parseProxies(arena: Allocator, spec: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, spec, ',');
@@ -370,14 +319,8 @@ pub fn parseProxies(arena: Allocator, spec: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// `direct` was removed here the same way traefik was: deleted, not parked, so
-/// a leftover `BENCH_PROXIES=direct,...` in a dispatch or a saved command line
-/// fails loudly instead of quietly measuring nothing.
-///
-/// It was a pseudo-proxy that ramped straight at the origin to prove the origin
-/// itself saturated above the proxies. With a four-node pool at 8 cores against
-/// a 1-CPU proxy that claim stopped being in doubt, and the check cost a full
-/// ramp per profile per night.
+/// Removed proxies (`direct`, traefik) are deleted, not parked, so a stale
+/// `BENCH_PROXIES` fails loudly.
 const all_proxies = [_][]const u8{
     "zoxy", "haproxy", "nginx", "pingora", "envoy",
 };
@@ -405,16 +348,13 @@ test "parseProxies rejects direct, which is no longer part of the comparison" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A stale dispatch input or a saved command line naming it must fail, not
-    // silently run a shorter comparison.
+    // A stale dispatch input naming it must fail.
     try std.testing.expectError(error.UnknownProxy, parseProxies(arena, "direct,zoxy"));
 }
 
 test "parseProxies rejects a typo rather than silently dropping it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // Silently skipping "zoxyy" would leave a hole in the comparison that
-    // nobody would notice until the report came out short.
     try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "zoxyy"));
     try std.testing.expectError(error.NoProxies, parseProxies(arena_state.allocator(), ""));
 }
@@ -422,18 +362,13 @@ test "parseProxies rejects a typo rather than silently dropping it" {
 test "parseProxies rejects proxies whose configs were removed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // traefik was deleted rather than parked. Naming it must fail here — at
-    // argument parsing, with the name in the message — rather than later as a
-    // compose service that does not exist. envoy and nginx both came BACK
-    // (each config restored from git history and re-verified end to end),
-    // which is why neither is in this list any more.
+    // Must fail at argument parsing, not later as a missing compose service.
     try std.testing.expectError(error.UnknownProxy, parseProxies(arena_state.allocator(), "traefik"));
 }
 
 // ---------------------------------------------------------------------------
-// Publishing: `notify` and `index`. Both read a completed run directory —
-// `<dir>/<profile>/{profile.json,report.json,report.html}` — so they depend on
-// `bench report` having run, and on nothing else.
+// Publishing: `notify` and `index`. Both read a completed run directory
+// (`<dir>/<profile>/{profile.json,report.json,report.html}`) from `bench report`.
 // ---------------------------------------------------------------------------
 
 const discord = @import("discord.zig");
@@ -451,10 +386,8 @@ pub const ProfileView = struct {
 };
 
 /// Read `<dir>/<name>/` back into the shape both publishers want.
-///
-/// Deliberately reads the ARTIFACTS rather than recomputing: report.json is the
-/// canonical measured-data record, so the Discord table and the Pages page can
-/// never quote a different number than the report does.
+/// Read `<dir>/<name>/` back into the shape both publishers want. Reads the
+/// artifacts, not recomputing, so Discord and Pages quote the report's numbers.
 pub fn readProfile(
     arena: Allocator,
     io: Io,
@@ -483,8 +416,7 @@ pub fn readProfile(
     var ok: usize = 0;
     var failed: usize = 0;
 
-    // report.json's `proxies` is already ordered by sustained descending, which
-    // is the order the summary table and the embed should both use.
+    // Already ordered by sustained descending.
     if (rv.object.get("proxies")) |arr| {
         for (arr.array.items) |item| {
             const o = item.object;
@@ -502,11 +434,8 @@ pub fn readProfile(
                 if (strOf(so.get("stage"))) |v| {
                     stage = std.meta.stringToEnum(artifact.Stage, v);
                 }
-                // The leading note, which suite.zig orders so the most serious
-                // one is first. A bare "⚠" in the post says something is wrong
-                // without saying what, and a stale zoxy build — the one caveat
-                // that invalidates the headline number — has to be readable
-                // without opening the report.
+                // Leading note (suite.zig puts the most serious first), so e.g. a stale
+                // zoxy build is readable in the post, not just a bare "⚠".
                 if (so.get("notes")) |v| {
                     if (v == .array and v.array.items.len > 0 and v.array.items[0] == .string) {
                         note = v.array.items[0].string;
@@ -551,13 +480,8 @@ fn numOf(v: ?std.json.Value) ?f64 {
     };
 }
 
-/// Like `numOf`, for a string field. `readProfile` reads a `profile.json`
-/// written by THIS binary and should never see the wrong JSON type in
-/// practice, but this is production's ReleaseFast build: an unguarded
-/// `.string` access on an unexpected type is undefined behavior there, not a
-/// safe panic, and this feeds both `notify` (Discord) and `buildIndex`
-/// (Pages) — the whole nightly publish path, for a malformed or legacy
-/// profile.json.
+/// Like `numOf`, for a string field. Guards the type: an unchecked `.string`
+/// on unexpected JSON is UB in ReleaseFast, on the whole publish path.
 fn strOf(v: ?std.json.Value) ?[]const u8 {
     const x = v orelse return null;
     return switch (x) {
@@ -594,19 +518,9 @@ pub fn notify(
     var embeds: std.ArrayList(discord.Embed) = .empty;
     var any_failed = false;
 
-    // The report is LINKED rather than attached. A Discord HTML attachment
-    // cannot be previewed — it has to be downloaded and opened from disk, which
-    // nobody does — so the artifact that took the whole night to produce goes
-    // unread. A link opens in a browser.
-    //
-    // The link points at the GitHub Pages copy, which the same publish workflow
-    // deploys from the very same HTML. It used to point at a public-read copy
-    // uploaded to Object Storage, which bought per-run immutable links at the
-    // price of a cloud credential in a job that otherwise touches no cloud at
-    // all — `notify` runs on artifacts already on the runner's disk. Not worth
-    // it: Pages holds only the LATEST run, so an old post's link now shows
-    // tonight's numbers, but the embed names its own run id and the trend chart
-    // carries the history, so nothing is actually lost.
+    // Link the report rather than attach it: Discord can't preview HTML
+    // attachments. Links go to Pages, which holds only the latest run; the embed
+    // names its run id and the trend carries history.
     for (profile.all) |p| {
         const view = (try readProfile(arena, io, dir, p.name)) orelse continue;
         if (view.failed > 0) any_failed = true;
@@ -615,8 +529,7 @@ pub fn notify(
             r.delta = index.delta(r.sustained, index.previousSustained(history, p.name, r.name, runid));
         }
 
-        // A profile with no rendered report has nothing to link; the table is
-        // the part that has to arrive either way.
+        // No rendered report, no link; the table still goes out.
         var link: []const u8 = "";
         if (view.html.len > 0 and base_url.len > 0) {
             link = try std.fmt.allocPrint(arena, "{s}{s}/", .{ base_url, p.name });
@@ -628,10 +541,7 @@ pub fn notify(
             .url = link,
             .footer = try std.fmt.allocPrint(
                 arena,
-                // The load generator that produced these numbers, read from the
-                // package actually linked in. It was a hardcoded "zrk 1.3.1"
-                // literal, so the footer kept asserting a version whatever was
-                // built — provenance that quietly goes stale is worse than none.
+                // From the linked package, never a literal, so provenance can't go stale.
                 "{s} · p50/p99 read at {d:.0} req/s · zrk {s}",
                 .{ runid, p.ref_rate, zrk.cli.version },
             ),
@@ -695,10 +605,8 @@ pub fn buildIndex(
             .tls = p.tls,
         });
 
-        // A local run contributes NOTHING to history. Its numbers are not
-        // comparable to a fleet run, and the trend is exactly where an
-        // incomparable point would do the most damage — it would read as a
-        // regression or a win rather than as a different experiment.
+        // A local run never enters history: incomparable points would read as a
+        // regression or a win in the trend.
         if (view.origin == .local) {
             std.debug.print(
                 "bench index: {s} was a local run; excluded from history and the trend\n",
@@ -720,8 +628,7 @@ pub fn buildIndex(
             });
         }
 
-        // Copy the profile's artifacts across so the page's links resolve and
-        // every number stays independently re-derivable from the raw data.
+        // Copy artifacts so the page's links resolve and numbers are re-derivable.
         const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ out_dir, p.name });
         try Io.Dir.cwd().createDirPath(io, sub);
         try copyInto(arena, io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, p.name }), sub);
@@ -740,20 +647,10 @@ pub fn buildIndex(
         return 1;
     }
 
-    // history = everything we had + tonight, republished because deploy-pages
-    // replaces the site wholesale. Built into memory first (like index.html
-    // below) so `assertNoIps` runs before anything reaches disk — this is the
-    // longest-lived artifact of any this harness produces, since it carries
-    // forward every prior night's rows rather than aging out with its own run,
-    // so a leak here would be the worst case of any artifact in the system.
-    //
-    // `full` (prior + tonight) is also what the trend chart below renders from
-    // — using `prior` alone there would leave the trend a night stale, missing
-    // the very run this page was just built for.
-    // Merged, not concatenated: `bench index` also runs when RE-publishing a
-    // run whose rows are already in the fetched history, and appending would
-    // give that run two rows per proxy (and the trend two points at the same
-    // x). See index.mergeHistory.
+    // Built in memory so `assertNoIps` runs before disk: history is the
+    // longest-lived artifact. Merged, not appended, so re-publishing a run
+    // doesn't duplicate its rows (see index.mergeHistory). The trend renders from
+    // `full` so it includes tonight.
     const full = try index.mergeHistory(arena, prior, tonight.items);
 
     {
@@ -791,12 +688,8 @@ pub fn buildIndex(
 }
 
 /// Artifact kinds that may be published.
-///
-/// An ALLOWLIST, not a denylist, because this copies into a public website.
-/// Copying whatever happens to be in the directory would have published a
-/// legacy `meta.json` — the very file that recorded the loadgen's PUBLIC IP in
-/// every run of the old harness. A new artifact kind should have to be added
-/// here deliberately, having been looked at.
+/// An ALLOWLIST, since this copies into a public website: new artifact kinds
+/// must be added deliberately (a legacy meta.json once carried a public IP).
 const publishable = [_][]const u8{
     ".ndjson", // raw per-window series, so every number is re-derivable
     ".hgrm", // whole-run percentile distribution
@@ -805,9 +698,8 @@ const publishable = [_][]const u8{
 };
 
 fn isPublishable(name: []const u8) bool {
-    // profile.json and report.json are the only JSON the new harness writes,
-    // and both are IP-free by construction. meta.json is the legacy file and is
-    // named explicitly so it can never ride along.
+    // meta.json is the legacy file that carried an IP; named so it never rides
+    // along.
     if (std.mem.eql(u8, name, "meta.json")) return false;
     for (publishable) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return true;
@@ -837,8 +729,7 @@ fn copyInto(arena: Allocator, io: Io, from: []const u8, to: []const u8) !void {
 fn copyFile(arena: Allocator, io: Io, from: []const u8, to: []const u8) !void {
     const bytes = Io.Dir.cwd().readFileAlloc(io, from, arena, .limited(256 << 20)) catch return;
 
-    // Everything reaching the site is checked, not just the files this binary
-    // wrote. The .ndjson and .hgrm come straight from zrk.
+    // Check everything reaching the site, including zrk's .ndjson and .hgrm.
     try redact.assertNoIps(from, bytes);
 
     const f = try Io.Dir.cwd().createFile(io, to, .{});
@@ -850,15 +741,14 @@ fn copyFile(arena: Allocator, io: Io, from: []const u8, to: []const u8) !void {
 }
 
 test "the publish allowlist excludes the legacy meta.json" {
-    // meta.json recorded "prom": "http://<loadgen public ip>:9090" in every run
-    // of the old harness, so it must never reach a public site.
+    // meta.json carried the loadgen's public IP in the old harness.
     try std.testing.expect(!isPublishable("meta.json"));
     try std.testing.expect(isPublishable("profile.json"));
     try std.testing.expect(isPublishable("report.json"));
     try std.testing.expect(isPublishable("zoxy.ndjson"));
     try std.testing.expect(isPublishable("zoxy.hgrm"));
     try std.testing.expect(isPublishable("report.html"));
-    // Anything unrecognised stays put rather than being published by default.
+    // Anything unrecognised stays put.
     try std.testing.expect(!isPublishable("id_ed25519"));
     try std.testing.expect(!isPublishable(".env"));
 }

@@ -1,20 +1,8 @@
 #cloud-config
-# ONE template for every host, switched on ${role}. Everything above the
-# switch — the docker pin, the sysctls, the fd limits, the payload — has to be
-# provably identical on loadgen/proxy/backend0..backend3, or the benchmark is
-# measuring hosts instead of proxies. That matters more with a POOL than it did
-# with a single origin: four backends that drifted apart would make the proxy's
-# throughput depend on which member each request drew. Keeping it in a single
-# file is how that stays true under editing; separate templates would drift the
-# first time someone fixed a bug in some of them. Only the tail differs, behind
-# one `if role == "loadgen"`.
+# One template for every host, switched on ${role}: everything outside the
+# loadgen tail must be identical on all hosts, or we measure hosts, not proxies.
 #
-# ${role} is the bare role name — "loadgen", "proxy", "backend0".."backend3" —
-# so `boot-ok.${role}` names exactly which host failed to come up, and the
-# `if` above is the ONLY place the value is interpreted.
-#
-# NOTE: this file is templatefile() input, so every `$${...}` a shell would
-# expand has to be written with a doubled dollar. Bare `$VAR` is untouched.
+# templatefile() input: a shell `$${...}` needs a doubled dollar.
 
 users:
   - name: ubuntu
@@ -24,11 +12,8 @@ users:
     ssh_authorized_keys:
       - ${ssh_public_key}
 
-# Host keys come from terraform instead of first boot, so the loadgen's
-# known_hosts is already correct before its peers have finished booting and it
-# can drive them with ssh's default StrictHostKeyChecking rather than accepting
-# whatever answers on :22. Only ed25519 is generated, so there is exactly one
-# key a peer can offer and no algorithm negotiation to reason about.
+# Host keys come from terraform, so the loadgen's known_hosts is correct before
+# peers boot (strict checking, no TOFU). ed25519 only.
 ssh_keys:
   ed25519_private: |
     ${indent(4, ssh_host_private_key)}
@@ -36,16 +21,13 @@ ssh_keys:
 ssh_genkeytypes: [ed25519]
 
 write_files:
-  # Classic overlay2 graphdriver: cAdvisor's docker handler cannot resolve
-  # container rw-layers under the containerd image store (no per-container
-  # cpu/mem metrics). write_files runs before runcmd, so the daemon reads
-  # this on first start.
+  # overlay2 graphdriver: under the containerd image store cAdvisor loses
+  # per-container metrics.
   - path: /etc/docker/daemon.json
     content: |
       { "features": { "containerd-snapshotter": false } }
 
-  # v1's tuning list, ported: without these the kernel caps a fast proxy (and
-  # the loadgen's ephemeral ports) far below the hardware ceiling.
+  # Without these the kernel caps the proxy and the loadgen's ephemeral ports.
   - path: /etc/sysctl.d/99-bench.conf
     content: |
       net.core.somaxconn = 65535
@@ -56,13 +38,8 @@ write_files:
       fs.file-max = 2097152
       fs.nr_open = 2097152
 
-  # The c10k profile wants ~10k sockets on the loadgen and two per connection on
-  # the proxy. `ulimit -n` in a script can only ever LOWER the hard limit, so
-  # the inline bump zrk-bench.sh used to do silently no-op'd whenever the login
-  # session's hard limit was smaller — set it where it actually takes effect.
-  # pam_limits governs LOGIN sessions only; systemd units inherit the manager's
-  # limits and ignore this file entirely, which is why bench-suite.service below
-  # restates LimitNOFILE/LimitMEMLOCK.
+  # fd limits for c10k. pam_limits covers login sessions only; systemd units
+  # ignore it, hence LimitNOFILE/LimitMEMLOCK in bench-suite.service.
   - path: /etc/security/limits.d/99-bench.conf
     content: |
       ubuntu soft nofile 1048576
@@ -70,21 +47,14 @@ write_files:
       ubuntu soft memlock unlimited
       ubuntu hard memlock unlimited
 
-  # `package_update: true` is needed to install the pinned docker, but Ubuntu's
-  # needrestart then RESTARTS services whose libraries were updated — including
-  # docker — and it does so minutes into the boot, i.e. underneath a run that has
-  # already started. Run #15 was killed 31 seconds in that way.
-  #
-  # `l` = list what would need restarting, restart nothing. The fleet is torn
-  # down after every run, so a service running against an older library for the
-  # next 40 minutes is exactly what we want.
+  # needrestart restarts docker mid-run after package_update (killed run #15).
+  # `l` = list only; the fleet is torn down after the run anyway.
   - path: /etc/needrestart/conf.d/99-bench.conf
     content: |
       $nrconf{restart} = 'l';
       $nrconf{kernelhints} = 0;
 
-  # The contract's VM-side environment, in one file so the scripts below and the
-  # systemd unit read the same thing. Nothing secret lives here.
+  # VM-side contract env for the scripts and the unit. Nothing secret.
   - path: /etc/bench/env
     content: |
       BENCH_BUCKET=${bench_bucket}
@@ -92,22 +62,15 @@ write_files:
       BENCH_PROFILES=${bench_profiles}
       BENCH_PROXIES=${bench_proxies}
       PROXY_IP=${proxy_ip}
-      # Comma-separated and ORDERED: the first entry is backend0, which is the
-      # host `direct` calibrates against. Every consumer splits on the comma
-      # rather than assuming a count.
+      # Comma-separated and ordered: entry n is backendN.
       BACKEND_IPS=${backend_ips}
       SSH_KEY=${ssh_key_path}
       BENCH_ROLE=${role}
-      # Not in the contract, which names only SSH_KEY — but remote.Ssh passes
-      # UserKnownHostsFile explicitly, so it needs to be told where the pinned
-      # file is. It is also in ssh's default location, so a bare `ssh` works too.
+      # Not in the contract: remote.Ssh passes UserKnownHostsFile explicitly.
       BENCH_KNOWN_HOSTS=/home/ubuntu/.ssh/known_hosts
 
-  # Object Storage over an IAM token minted by the metadata service — the whole
-  # reason the instances carry a service account and no key file. Tokens are
-  # short-lived and a run outlives one by a wide margin, so every call mints a
-  # fresh one rather than caching. Yandex accepts the bearer token directly:
-  # no SigV4, no access key, nothing to leak.
+  # Object Storage via a metadata-service IAM token, so no key on the VM.
+  # Tokens are short-lived: every call mints a fresh one.
   - path: /usr/local/bin/bench-os
     permissions: "0755"
     content: |
@@ -115,8 +78,7 @@ write_files:
       set -euo pipefail
       set -a; . /etc/bench/env; set +a
       bucket="https://storage.yandexcloud.net/$BENCH_BUCKET"
-      # A run's own artifacts are namespaced by RUNID; `shared` objects
-      # deliberately are NOT — see the `-shared` verbs below.
+      # Run artifacts are namespaced by RUNID; the `-shared` verbs are not.
       base="$bucket/runs/$BENCH_RUNID"
       tok=$(curl -sfS -H 'Metadata-Flavor: Google' \
         http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token \
@@ -125,41 +87,18 @@ write_files:
         get) curl -sfS -H "Authorization: Bearer $tok" -o "$3" "$base/$2" ;;
         put) curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary "@$3" "$base/$2" ;;
         say) printf '%s\n' "$3" | curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary @- "$base/$2" ;;
-        # Outside the run prefix, at the bucket root. Anything that must
-        # OUTLIVE the run that wrote it goes here, and so far that is exactly
-        # the image cache: written under `runs/$BENCH_RUNID/` it was written
-        # into a prefix that, by construction, no later run ever looks in — a
-        # cache that could not hit even once. Runs 30749146321 and
-        # 30749896005 each rebuilt pingora from scratch (443s) and the zig
-        # toolchain (131s and 196s), and each then wrote both images to a
-        # folder nothing would ever read again.
+        # Bucket root, for objects that must outlive the run (image cache):
+        # nothing reads another run's runs/<runid>/ prefix.
         get-shared) curl -sfS -H "Authorization: Bearer $tok" -o "$3" "$bucket/$2" ;;
         put-shared) curl -sfS -X PUT -H "Authorization: Bearer $tok" --data-binary "@$3" "$bucket/$2" ;;
         *)   echo "usage: bench-os get|put|say|get-shared|put-shared <object> <file|text>" >&2; exit 2 ;;
       esac
 
-  # Restore/save a built proxy image through Object Storage, so an ephemeral
-  # fleet stops paying to rebuild a DETERMINISTIC one every night.
-  #
-  # pingora costs 469s to build and is fully pinned — Cargo.toml, Cargo.lock and
-  # a local src/ — so its image is identical run after run and the cache hits
-  # every time. zoxy is deliberately NOT cached: it tracks floating `main`, which
-  # is the whole point of the nightly, so a correctly-keyed cache would miss on
-  # exactly the nights that matter, for 179s.
-  #
-  # The key is the danger, not the plumbing. A key that misses an input restores
-  # a stale image and the run silently benchmarks the wrong binary — the same
-  # class of bug as the cached `git clone` that made ZOXY_REF=main mean a frozen
-  # commit. So it hashes everything that reaches the build: the Dockerfile, the
-  # whole build context, and the CPU MODEL, because PINGORA_TARGET_CPU is
-  # `native` and an image built for one model must never be loaded on another.
-  #
-  # …and the plumbing was still where it broke. For its first weeks this cache
-  # never hit ONCE: it stored through `bench-os put`, which namespaces objects
-  # by BENCH_RUNID, so every save landed in the writing run's own prefix and
-  # every restore looked under a brand-new one. The suite said so every night —
-  # "[pingora] built in 443s", never "restored from cache" — which is the line
-  # to watch when changing any of this.
+  # Restore/save deterministic proxy images via Object Storage. pingora (fully
+  # pinned, ~470s build) is cached; zoxy tracks floating main and is not.
+  # The key must hash every build input plus the CPU model (native builds), or
+  # a stale image gets benchmarked silently. Watch the suite log for "restored"
+  # vs "built in" when changing this.
   - path: /usr/local/bin/bench-image-cache
     permissions: "0755"
     content: |
@@ -173,14 +112,13 @@ write_files:
       ctx="/home/ubuntu/bench/proxies/$name"
       [ -d "$ctx" ] || exit 1
 
-      # Every input to the build, plus the CPU this host actually is.
+      # every build input, plus this host's CPU model
       key=$( { find "$ctx" -type f -print0 | sort -z | xargs -0 cat;
                grep -m1 '^model name' /proc/cpuinfo; } \
              | sha256sum | cut -c1-16 )
       obj="cache/$name-$key.tar"
 
-      # `-shared`, NOT `get`/`put`: those are namespaced by BENCH_RUNID, and a
-      # cache written under this run's prefix is a cache no other run can read.
+      # -shared: RUNID-namespaced objects are invisible to other runs.
       case "$op" in
         restore)
           bench-os get-shared "$obj" /tmp/$name-cache.tar >/dev/null 2>&1 \
@@ -202,10 +140,8 @@ write_files:
         *) exit 2 ;;
       esac
 
-  # payload.tar is uploaded BEFORE apply, so it is already in the bucket when
-  # this runs. The retry loop is for this end, not that one: the default route
-  # through the NAT gateway and the instance's service-account binding both
-  # become usable a few seconds after the guest starts running commands.
+  # payload.tar is uploaded before apply; the retry covers the NAT route and
+  # SA binding becoming usable a few seconds after boot.
   - path: /usr/local/bin/bench-payload
     permissions: "0755"
     content: |
@@ -221,11 +157,8 @@ write_files:
       chown -R ubuntu:ubuntu /home/ubuntu/bench
 %{~ if role == "loadgen" }
 
-  # The per-run ssh identity. It exists in exactly two places — terraform's
-  # state in the CI workspace, and here — and both are gone when the job ends.
-  # deferred, because write_files normally runs before the users module and
-  # `owner: ubuntu` would not resolve yet; deferred writes still land before
-  # runcmd, which is all this needs.
+  # Per-run ssh identity; exists only here and in CI's terraform state.
+  # defer: `owner: ubuntu` needs the users module to have run.
   - path: ${ssh_key_path}
     owner: "ubuntu:ubuntu"
     permissions: "0600"
@@ -233,9 +166,7 @@ write_files:
     content: |
       ${indent(6, fleet_private_key)}
 
-  # In the default location on purpose: anything that shells out to ssh picks it
-  # up without being told, so peer verification does not depend on `bench`
-  # passing the right -o flags.
+  # Default location, so any ssh invocation verifies peers without flags.
   - path: /home/ubuntu/.ssh/known_hosts
     owner: "ubuntu:ubuntu"
     permissions: "0644"
@@ -243,9 +174,8 @@ write_files:
     content: |
       ${indent(6, known_hosts)}
 
-  # The run, end to end. Ordering here is the contract's: results.tar goes up
-  # before DONE, so the runner never polls into a marker that points at a
-  # half-uploaded object.
+  # The run end to end. results.tar goes up before DONE, so the runner never
+  # fetches a half-uploaded object.
   - path: /usr/local/bin/bench-drive
     permissions: "0755"
     content: |
@@ -254,14 +184,8 @@ write_files:
       set -a; . /etc/bench/env; set +a
 
       LOG=/home/ubuntu/bench.log
-      # A terminal marker was written by THIS script. bench-postmortem checks it
-      # so it only speaks when the script never got the chance to.
-      #
-      # Under $HOME, NOT /run: the unit runs as User=ubuntu and /run is
-      # root-owned, so `: > /run/bench-terminal` failed with "Permission denied"
-      # on every run. The sentinel was therefore never written, and the
-      # post-mortem spoke even when the suite had reported for itself — it would
-      # have appended FAILED after a perfectly good DONE.
+      # Written on every terminal path; bench-postmortem speaks only if absent.
+      # Under $HOME: /run is root-owned and the unit runs as ubuntu.
       TERMINAL=/home/ubuntu/.bench-terminal
       exec > >(tee -a "$LOG") 2>&1
 
@@ -273,12 +197,10 @@ write_files:
         exit 1
       }
 
-      # after fail() exists, so a payload that never landed is a FAILED marker
-      # rather than a suite that quietly runs in the wrong directory
+      # after fail(), so a missing payload reports FAILED
       cd /home/ubuntu/bench || fail "payload never unpacked into ~/bench"
 
-      # the same pinning bench's remote.Ssh uses: the host keys came from
-      # terraform, so there is no first use to trust
+      # same pinning as remote.Ssh: host keys come from terraform
       peer() {
         timeout 900 ssh -i "$SSH_KEY" \
           -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
@@ -286,10 +208,8 @@ write_files:
           "ubuntu@$1" "$2"
       }
 
-      # sshd answers minutes before docker and the payload are in place, so gate
-      # on the peer's own cloud-init and then on the two things actually needed.
-      # `cloud-init status --wait` exits 2 for recoverable warnings, which is not
-      # a reason to abandon a 40-minute run — hence the discarded status.
+      # sshd is up long before docker and the payload. `cloud-init status
+      # --wait` exits 2 on mere warnings, so its status is ignored.
       wait_peer() {
         for _ in $(seq 1 120); do
           if peer "$1" 'cloud-init status --wait >/dev/null 2>&1; test -d ~/bench && docker info >/dev/null 2>&1'; then
@@ -301,25 +221,16 @@ write_files:
       }
 
       wait_peer "$PROXY_IP" || fail "proxy never became ready"
-      # EVERY member of the pool. A run that starts while one backend is still
-      # booting does not fail — it produces numbers, and they look like a proxy
-      # regression, because the proxy round-robins a quarter of its requests
-      # into a refused connection. So this gate is all-or-nothing.
-      #
-      # `tr` rather than `IFS=,`: fail() exits, and an exit inside the `( ... )`
-      # a scoped IFS would need leaves only the subshell — the run would carry
-      # on with a backend it just declared dead. The index, not the address, is
-      # what goes in the message: this log is uploaded and streamed into a
-      # public CI log, and no benchmark output may contain an address
-      # (bench/CONTRACT.md, redact.assertNoIps).
+      # All-or-nothing: a booting backend doesn't fail the run, it fakes a proxy
+      # regression. `tr`, not a subshell IFS, so fail() exits the script. Log
+      # the index, never the address (bench/CONTRACT.md, redact.assertNoIps).
       i=0
       for ip in $(echo "$BACKEND_IPS" | tr ',' ' '); do
         wait_peer "$ip" || fail "backend #$i never became ready"
         i=$((i + 1))
       done
 
-      # the contract's `log`: re-uploaded every ~30s so the runner can stream a
-      # run it has no other way to watch.
+      # the contract's `log`, re-uploaded every ~30s for the runner to stream
       ( while sleep 30; do bench-os put log "$LOG" || true; done ) &
       tailer=$!
       trap 'kill $tailer 2>/dev/null || true' EXIT
@@ -328,18 +239,8 @@ write_files:
       IFS=, read -r -a profiles <<< "$BENCH_PROFILES"
       for p in "$${profiles[@]}"; do
         ./bench suite --profile "$p" --proxies "$BENCH_PROXIES" || rc=$?
-        # Ship what is finished after EVERY profile, not just at the end.
-        #
-        # results.tar used to be built once, after this loop, so a profile that
-        # hung took the completed ones down with it: a c10k deadlock discarded a
-        # c1k that had run clean for 51 minutes, and the run produced no
-        # artifacts at all. The tar is cumulative (it archives the whole run
-        # directory), so re-uploading it here just means the bucket always holds
-        # everything finished so far.
-        #
-        # Deliberately NOT guarded by rc: a profile that failed still leaves
-        # per-proxy records worth publishing, and `bench suite` already writes
-        # profile.json after each proxy for the same reason.
+        # Upload the cumulative results after EVERY profile, even a failed one,
+        # so a later hang cannot discard finished profiles.
         if [ -n "$(find results/"$BENCH_RUNID" -type f -print -quit 2>/dev/null)" ]; then
           tar -cf /tmp/results.tar -C results "$BENCH_RUNID" \
             && bench-os put results.tar /tmp/results.tar \
@@ -347,11 +248,8 @@ write_files:
         fi
       done
 
-      # An empty result is never useful, and `tar` succeeds on a directory tree
-      # that contains nothing — which is exactly what a suite that aborted early
-      # leaves behind. Without this check the runner sees DONE, fetches an empty
-      # archive, and the failure surfaces two steps later as a confusing
-      # FileNotFound from the report instead of as "the suite died".
+      # tar succeeds on an empty tree; fail here, not as a confusing
+      # FileNotFound in the report.
       if [ -z "$(find results/"$BENCH_RUNID" -type f -print -quit 2>/dev/null)" ]; then
         fail "suite produced no artifacts (rc=$rc)"
       fi
@@ -360,24 +258,9 @@ write_files:
       bench-os put results.tar /tmp/results.tar || fail "results.tar upload failed"
       kill $tailer 2>/dev/null || true
       bench-os put log "$LOG" || true
-      # rc 3 is `bench suite` reporting that it ran but some proxy failed — real
-      # data worth publishing, with the per-proxy status recorded in
-      # profile.json. rc 4 is the SAME situation reached a different way: the
-      # per-proxy watchdog (suite.zig's ProxyWatchdog) had to end the whole
-      # process because one proxy wedged somewhere no ordinary error path could
-      # catch — every OTHER proxy in that profile still ran to completion and
-      # flushed its own record before the wedge, exactly like an rc-3 run.
-      #
-      # Run 20260730-112927 is why this matters: envoy wedged mid-ramp in BOTH
-      # profiles, rc=4 both times, and this check (as `-eq 0 || -eq 3`) sent
-      # FAILED even though the render step immediately after logged "rendered
-      # 2 of 2 profile(s)" — direct/zoxy/haproxy/pingora's numbers were
-      # complete and correct in both. A red run with nothing wrong in it is
-      # worse than a quiet one: it trains whoever is watching Discord to
-      # expect noise on a genuine failure too.
-      #
-      # Anything else means the suite itself broke before producing anything
-      # worth trusting.
+      # rc 3: some proxy failed; rc 4: the watchdog (suite.zig ProxyWatchdog)
+      # ended a wedged run. Both still carry valid per-proxy records, so they
+      # report DONE (see run 20260730-112927). Anything else is FAILED.
       if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
         bench-os say DONE "rc=$rc"
         : > "$TERMINAL" || true
@@ -387,22 +270,9 @@ write_files:
       fi
       exit $rc
 
-  # A unit rather than a backgrounded runcmd, so the whole run lands in the
-  # journal and can be pulled off a host that never reached DONE.
-  # Speaks only when bench-drive did NOT — i.e. when it was killed rather than
-  # finishing. Every terminal path in that script writes $TERMINAL after saying
-  # DONE/FAILED, so an absent sentinel means it never reached its own reporting.
-  #
-  # This is the gap that hid the c10k memory leak for a whole day: the kernel
-  # OOM-killed `bench` mid-ramp, and a SIGKILLed process writes no marker, no
-  # watchdog line and no log. From the runner that is indistinguishable from a
-  # hang, so `bench wait` polled a corpse until the step timed out, five runs
-  # running. The evidence was on the serial console the entire time:
-  #
-  #     Out of memory: Killed process 5452 (bench) anon-rss:7664524kB
-  #
-  # Runs with `+`, i.e. as root regardless of User=ubuntu, because dmesg is
-  # restricted and the whole point is to capture why the kernel intervened.
+  # ExecStopPost: reports FAILED only if bench-drive died without writing
+  # $TERMINAL, e.g. when OOM-killed (otherwise `bench wait` polls until
+  # timeout). Needs root for dmesg.
   - path: /usr/local/bin/bench-postmortem
     permissions: "0755"
     content: |
@@ -434,15 +304,8 @@ write_files:
     content: |
       [Unit]
       Description=zoxy-benchmark self-driving suite
-      # Wants, NOT Requires. `Requires` propagates STOPS: restart docker and
-      # systemd stops this unit too, with a SIGTERM the suite cannot report.
-      # Run #15 died exactly that way 31 seconds in — SERVICE_RESULT=signal,
-      # EXIT_STATUS=TERM, 6.4 GB free and no OOM verdict — because
-      # `package_update: true` lets apt and needrestart bounce services
-      # underneath a run that has already started.
-      #
-      # `After` still orders it behind docker; only the stop-propagation goes.
-      # The churn itself is stopped at its source — see the needrestart drop-in.
+      # Wants, not Requires: Requires turns a docker restart into a SIGTERM
+      # the suite cannot report (run #15).
       Wants=docker.service network-online.target
       After=docker.service network-online.target
 
@@ -453,38 +316,17 @@ write_files:
       WorkingDirectory=/home/ubuntu/bench
       EnvironmentFile=/etc/bench/env
       ExecStart=/usr/local/bin/bench-drive
-      # `+` runs it as root despite User=ubuntu: dmesg is restricted, and a
-      # kernel OOM verdict is exactly what this needs to capture. Runs on EVERY
-      # exit, and is a no-op unless bench-drive died without reporting.
+      # `+` = root, for dmesg. No-op unless bench-drive died without reporting.
       ExecStopPost=+/usr/local/bin/bench-postmortem
-      # limits.d is pam_limits, which a unit never goes through: without these
-      # two lines the c10k profile hits systemd's 1024 default and the run looks
-      # like a proxy failure instead of a harness failure.
+      # A unit bypasses pam_limits; without these c10k hits the 1024 default.
       LimitNOFILE=1048576
       LimitMEMLOCK=infinity
       TimeoutStartSec=infinity
 %{~ endif }
 
-# Ubuntu's own background apt, silenced before it can start.
-#
-# `bootcmd`, not `runcmd`: these timers are `Persistent=true` and fire shortly
-# after boot, which on this fleet is under the run — and `runcmd` is minutes
-# too late, after `package_update` has already refreshed the lists they act on.
-#
-# The needrestart drop-in above stops needrestart BOUNCING a service whose
-# libraries moved; it does nothing about apt upgrading a package whose own
-# postinst restarts it. openssh-server is that package, and on 24.04 ssh is
-# socket-activated, so the restart is a window where port 22 answers
-# `Connection refused`. Run 32885230435 (2026-08-25 18:41) lost three proxies
-# to one such window: haproxy's identity check was refused, its teardown was
-# refused too, the container stayed up, and nginx and pingora both aborted on
-# `ForeignProxyRunning`. `remote.check` now retries a refused connect, and this
-# is the other half — the fleet is destroyed after ~45 minutes, so there is
-# nothing it can gain from a security update landing mid-ramp.
-#
-# `--now` as well as `mask`, because cloud-init is not always first: a timer
-# that already fired has to be stopped, not merely prevented from starting.
-# `|| true` because a mask that fails is not a reason to abandon a boot.
+# Mask background apt in bootcmd; runcmd is too late for its Persistent timers.
+# An openssh-server upgrade restarts ssh and refuses connections mid-run (run
+# 32885230435). `--now` also stops timers that already fired.
 bootcmd:
   - systemctl mask --now unattended-upgrades.service apt-daily.timer apt-daily.service apt-daily-upgrade.timer apt-daily-upgrade.service || true
 
@@ -498,15 +340,8 @@ package_update: true
 
 runcmd:
   - sysctl --system
-  # Pin docker-ce to the same major.minor everywhere (same compose CLI as
-  # local). The other three packages have their own, unrelated version
-  # numbering (docker-compose-plugin's version is nothing like docker-ce's),
-  # so they cannot share `$VERSION` — but leaving them unpinned meant only
-  # docker-ce/docker-ce-cli were actually reproducible night to night, and a
-  # `docker-compose-plugin` bump landing between two runs is exactly the kind
-  # of drift this whole pin exists to prevent. Pin each to whatever apt
-  # resolves as newest AT THIS BOOT, so it is at least fixed for the rest of
-  # this VM's life even though it can still differ from a previous night's.
+  # Pin docker-ce to var.docker_version; the other packages to whatever is
+  # newest at boot, so at least fixed for this VM's life.
   - >-
     VERSION=$(apt-cache madison docker-ce | awk '$3 ~ /${docker_version}/ {print $3; exit}');
     CONTAINERD_VERSION=$(apt-cache madison containerd.io | awk 'NR==1{print $3}');
@@ -518,19 +353,14 @@ runcmd:
   - apt-mark hold docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   - systemctl enable --now docker
   - /usr/local/bin/bench-payload
-  # One object per role (bench's ycs.Keys.bootOk, which exists so cloud-init and
-  # the runner cannot disagree about a key). A single shared `boot-ok` would be
-  # last-writer-wins and could not answer the only question it is ever asked:
-  # which host failed to get here.
+  # One boot-ok object per role (ycs.Keys.bootOk), so a missing one names the
+  # host that failed.
   - bench-os say boot-ok.${role} "${role} ready"
 %{~ if role == "loadgen" }
-  # a root-owned ~/.ssh is a failure that only shows up an hour later, as an
-  # unexplained ssh error in the middle of a ramp
+  # a root-owned ~/.ssh breaks ssh an hour later, mid-ramp
   - chown -R ubuntu:ubuntu /home/ubuntu/.ssh
   - chmod 700 /home/ubuntu/.ssh
-  # --no-block: the suite runs for the better part of an hour, and cloud-init
-  # has to be able to report "done" long before that — the peers' readiness gate
-  # is exactly that signal, and blocking here would deadlock the fleet.
+  # --no-block: the suite runs ~1h; cloud-init must report done long before.
   - systemctl daemon-reload
   - systemctl start --no-block bench-suite.service
 %{~ endif }

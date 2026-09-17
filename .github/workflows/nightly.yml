@@ -1,59 +1,24 @@
-# Nightly benchmark — an ephemeral, self-driving fleet.
+# Nightly benchmark on an ephemeral fleet: OIDC-minted token, payload in
+# Object Storage, six private VMs, watched via the bucket, destroyed after.
+# Measures only; rendering/deploy/Discord live in publish.yml.
 #
-# Build the harness, mint a short-lived cloud token from GitHub's OIDC
-# identity, drop the payload in Object Storage, create six VMs with no public
-# address, watch the run through the bucket, upload the raw data, and destroy the
-# fleet. Nothing long-lived is stored anywhere: no cloud key in the repo, no
-# remote terraform state, no VM that outlives the job.
+# Invariants:
+#  1. THE FLEET NEVER SURVIVES THE RUN. `tofu destroy` is `if: always()`,
+#     `bench sweep` is the backstop, and the ~1h IAM token is re-minted before
+#     each wait chunk, fetch and teardown.
+#  2. NO ADDRESS REACHES THE LOG (it is public). apply/destroy output is
+#     scrubbed; never `cat` the state or echo an output.
+#  3. NO SECRET REACHES THE LOG. Secrets go through `env:` only, never
+#     interpolated into a command line.
 #
-# This workflow MEASURES. Everything downstream of the numbers — rendering the
-# reports, building and deploying the Pages site, posting to Discord — lives in
-# publish.yml, which this calls with the artifact it just uploaded. That split
-# is what lets a past run be re-published with fixed rendering code, against the
-# same implementation the nightly uses rather than a second copy of it.
-#
-# Three invariants this file exists to hold:
-#
-#  1. THE FLEET NEVER SURVIVES THE RUN. `tofu destroy` is `if: always()`, so it
-#     runs on success, on failure and on cancellation; `bench sweep` is the
-#     backstop for when destroy itself cannot (state lost, apply died before it
-#     could write state, token expired). The IAM token is re-minted immediately
-#     before teardown, because a 150-minute job outlives a one-hour token and a
-#     teardown that 401s is exactly the failure this design cannot tolerate.
-#     The same reasoning applies to the whole rest of the job: `bench wait` runs
-#     as two ~55-minute chunks so it can pick up a fresh token between them
-#     instead of one open-ended call outliving its own, and the token is
-#     re-minted again before `fetch` — a 401 there would look like a fetch
-#     failure with a perfectly good run sitting in the bucket.
-#
-#  2. NO ADDRESS REACHES THE LOG. This log is public. `tofu output` is
-#     sensitive, and nothing here reads one — but `apply`/`destroy` print the
-#     resource diff, which carries `ip_address` and the subnet CIDR in clear, so
-#     both are piped through an address scrubber. Never `cat` the state, never
-#     echo an output.
-#
-#  3. NO SECRET REACHES THE LOG. The IAM token and the Discord webhook are only
-#     ever passed through `env:`, never interpolated into a command line.
-#
-# See bench/CONTRACT.md for the `bench` CLI and the Object Storage layout, and
-# docs/SETUP.md for the one-time cloud setup this assumes already exists.
+# See bench/CONTRACT.md and docs/SETUP.md.
 
 name: nightly
 
 on:
-  # Once a night, at 00:00 UTC. GitHub runs scheduled workflows on a
-  # best-effort basis and commonly fires them 5-30 minutes late, which is
-  # immaterial here. The `concurrency` group below serializes a firing that
-  # lands while a run (or its retry, nightly-retry.yml) is still going — see
-  # its comment — so a slow night pushes the next one back rather than
-  # overlapping it.
-  #
-  # What makes an unattended cron safe is that teardown does not depend on the
-  # run succeeding: `tofu destroy` is `if: always()` with a freshly re-minted IAM
-  # token, and `bench sweep` runs both as a backstop after a failed destroy and
-  # at the start of the next run — which is the only thing that covers the runner
-  # itself dying. A failed run therefore costs a red run and ~15 minutes of
-  # six VMs, not a stranded fleet.
+  # 00:00 UTC. `concurrency` serializes overlap with a slow run or its retry;
+  # teardown does not depend on success, and the next run's sweep covers a
+  # dead runner.
   schedule:
     - cron: '0 0 * * *'
 
@@ -70,20 +35,14 @@ on:
         type: string
         default: zoxy,haproxy,nginx,pingora,envoy
 
-# `id-token: write` is needed by the Yandex OIDC exchange in the bench job, and
-# again — along with `pages: write` — by the publish job it hands off to, whose
-# deploy-pages step authenticates with an OIDC token of its own. Job-level
-# `permissions:` REPLACES this block rather than merging with it, so every job
-# below restates exactly what it needs; for the job that CALLS a reusable
-# workflow, that restatement is also the ceiling on what the callee may ask for.
+# Job-level `permissions:` REPLACE this block, so each job restates its own;
+# for a job calling a reusable workflow, that is also the callee's ceiling.
 permissions:
   contents: read
   id-token: write
   pages: write
 
-# One nightly at a time, and never cancel one that is in flight: cancelling
-# between `apply` and `destroy` is precisely how a fleet is left running. A
-# queued run waits instead.
+# Never cancel in flight: cancelling between apply and destroy strands a fleet.
 concurrency:
   group: nightly-bench
   cancel-in-progress: false
@@ -92,59 +51,34 @@ jobs:
   bench:
     runs-on: ubuntu-24.04
 
-    # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
-    # pingora a cargo build), then 5 profiles (c1k, c1k-tls, c1k-64, c1k-10k,
-    # c1k-100k) x 5 proxies x ~350 s ~= 146 min, plus fetch/report/publish —
-    # ~175 min on a normal night. 270 leaves real headroom without letting a
-    # wedged run bill for hours, and stays well inside GitHub's 360-minute cap
-    # on a hosted job. `bench wait` runs as up to four ~55 minute chunked steps
-    # (each with its own, tighter step timeout — see "Wait chunk 1".."Wait
-    # chunk 4" below), each on a fresh IAM token, so that a loadgen which never
-    # writes DONE fails a STEP, leaving the teardown steps to run normally
-    # instead of being raced by a job-level cancellation.
+    # ~175 min on a normal night (5 profiles x 5 proxies x ~350 s + builds);
+    # under GitHub's 360-minute cap. Wait chunks have their own step timeouts
+    # so a hung loadgen fails a step, not the job, and teardown still runs.
     timeout-minutes: 270
 
-    # No `pages:` here — this job never touches Pages, it only uploads the raw
-    # artifact that the publish job renders and deploys.
+    # No `pages:`: this job only uploads the raw artifact.
     permissions:
       contents: read
       id-token: write
 
     env:
-      # Absolute, and NOT `./bench` — that path is the source directory.
+      # Absolute; `./bench` is the source directory.
       BENCH: ${{ github.workspace }}/bin/bench
 
-      # `inputs` is null on a scheduled run, so every consumer needs the same
-      # fallback the dispatch form defaults to.
-      #
-      # c1k-tls is c1k with the transport swapped and nothing else changed (see
-      # profile.zig), and it is on the schedule because the pair is only worth
-      # anything measured on the same night, on the same fleet: "TLS costs X" is
-      # the difference between two rows, and comparing tonight's TLS run against
-      # last week's plaintext one would fold every other night-to-night
-      # difference into that number.
-      #
-      # c1k-64, c1k-10k and c1k-100k are c1k with the response body swapped
-      # (profile.zig's `c1kBody`), on the schedule for the same reason: how a
-      # proxy scales with body size only means something on one fleet, one
-      # night. c1k-100k runs last because its ramp passes line rate earliest
-      # and is the likeliest to misbehave — and results.tar ships after every
-      # profile, so it cannot take the others down with it.
-      #
-      # c10k stays defined in profile.zig (its tuning history and the open
-      # start-failure investigation from run #25 are worth keeping) — it is
-      # just not in the default nightly set while that investigation is open.
-      # Add `c10k` to `profiles` on a manual dispatch to run it anyway.
+      # `inputs` is null on a scheduled run, hence the fallbacks.
+      # c1k-tls and the c1k body-size variants must run on the same night and
+      # fleet as c1k to be comparable; c1k-100k runs last (likeliest to
+      # misbehave). c10k is excluded while run #25's start failure is open;
+      # dispatch with it to run anyway.
       BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-64,c1k-10k,c1k-100k' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
       YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID }}
       YC_FOLDER_ID: ${{ vars.YC_FOLDER_ID }}
-      # The service account the CI job federates INTO (source of YC_TOKEN).
+      # Service account the CI job federates into (source of YC_TOKEN).
       YC_CI_SA_ID: ${{ vars.YC_CI_SA_ID }}
-      # The service account ATTACHED to the instances — bucket access only, so
-      # a saturated benchmark host holds nothing worth stealing.
+      # Service account attached to the VMs: bucket access only.
       YC_VM_SA_ID: ${{ vars.YC_VM_SA_ID }}
 
       # Read by `bench notify`. Never passed to a VM, never echoed.
@@ -152,17 +86,9 @@ jobs:
 
     outputs:
       runid: ${{ steps.meta.outputs.runid }}
-      # Whether the run produced RESULTS worth publishing.
-      #
-      # `fetch` is the step that pulls the run's output out of the bucket, so
-      # its success is the honest "there is something to render" signal. NOT the
-      # artifact upload, which is deliberately `if: always()` — it uploads the
-      # raw data on a failed or cancelled night too, precisely so that night is
-      # still diagnosable, which makes it useless as a gate.
-      #
-      # Deliberately not `needs.bench.result`: a teardown failure fails this job
-      # but must not cost a perfectly good report, which is what the old deploy
-      # gate got right and is worth keeping.
+      # Whether there are results to publish. `fetch`, not the artifact upload
+      # (always runs) nor the job result (a teardown failure must not block
+      # a good report).
       results: ${{ steps.fetch.outcome }}
 
     steps:
@@ -176,14 +102,9 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@v2
         with:
-          # Matches the devenv pin, which is what cloud/.terraform.lock.hcl was
-          # generated with. cloud/versions.tf only requires >= 1.6, but a
-          # floating version is one more thing that can plan differently between
-          # two runs of the same config.
+          # Matches the devenv pin (cloud/.terraform.lock.hcl).
           tofu_version: 1.12.3
-          # The wrapper copies every tofu invocation's stdout and stderr into
-          # step outputs. Those streams carry the resource diff, and therefore
-          # addresses. Off.
+          # The wrapper copies output (with addresses) into step outputs. Off.
           tofu_wrapper: false
 
       # ------------------------------------------------------------ identity --
@@ -193,9 +114,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fail here, before a single cloud call, rather than three steps later
-          # with a URL that has an empty bucket in it. All five are repo
-          # VARIABLES, not secrets — see docs/SETUP.md.
+          # Fail before any cloud call. These are repo variables (docs/SETUP.md).
           missing=()
           for v in BENCH_BUCKET YC_CLOUD_ID YC_FOLDER_ID YC_CI_SA_ID YC_VM_SA_ID; do
             [ -n "${!v:-}" ] || missing+=("$v")
@@ -205,17 +124,13 @@ jobs:
             exit 1
           fi
 
-          # UTC, sortable, and inside cloud/variables.tf's runid validation
-          # (^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$) — it is a label, an object
-          # prefix AND a resource-name suffix. Generated ONCE and threaded
-          # through terraform and every bench invocation.
+          # UTC, sortable, and must pass cloud/variables.tf's runid validation
+          # (label, object prefix and resource-name suffix).
           runid="$(date -u +%Y%m%d-%H%M%S)"
           echo "runid=$runid" >> "$GITHUB_OUTPUT"
           echo "run id: $runid"
 
-      # Exchanges the job's GitHub OIDC identity for a short-lived Yandex IAM
-      # token. There is NO static cloud key anywhere in this repo or in the
-      # repo's secrets — the trust is the federated credential bound to
+      # No static cloud key exists: trust is the federated credential bound to
       # `repo:zoxy-io/benchmark:ref:refs/heads/main` (docs/SETUP.md).
       - name: Exchange the GitHub OIDC token for a Yandex IAM token
         id: iam
@@ -228,8 +143,7 @@ jobs:
           TOKEN: ${{ steps.iam.outputs.token }}
         run: |
           set -euo pipefail
-          # The action masks its own output; do it again rather than depend on
-          # that. `::add-mask::` does not print the value it is given.
+          # Mask again rather than rely on the action.
           echo "::add-mask::$TOKEN"
           echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
@@ -237,10 +151,8 @@ jobs:
 
       - name: Build bench (static x86_64-linux-musl)
         working-directory: bench
-        # -Dcpu: `bench` embeds zrk, and a named target alone means a BASELINE
-        # cpu — the load generator was pure SSE2. Not `native`: this is built
-        # here and run on the loadgen VM, so the runner's features must not be
-        # baked in. See the Makefile for why v3 and not v4.
+        # -Dcpu: `bench` embeds zrk, and a named target alone is baseline.
+        # Not `native`: it runs on the loadgen VM. See the Makefile for v3.
         run: zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3 -Doptimize=ReleaseFast
 
       - name: Stage the binary
@@ -251,17 +163,14 @@ jobs:
 
       # ---------------------------------------------------------- pre-flight --
 
-      # Anything labelled bench=nightly is an orphan from a run that died
-      # between apply and destroy: per-run terraform state lives in the runner
-      # workspace and dies with it, so the label is the only recovery path.
+      # Terraform state dies with the runner, so the bench=nightly label is the
+      # only way to find orphaned fleets.
       - name: Sweep orphaned fleets from previous runs
         run: |
           set -euo pipefail
           "$BENCH" sweep
 
-      # payload.tar has to be in the bucket BEFORE apply: cloud-init's
-      # bench-payload pulls it on first boot and the loadgen unpacks it into
-      # ~/bench, which is the working directory the whole run executes from.
+      # Must be uploaded before apply: cloud-init pulls it on first boot.
       - name: Pack and upload payload.tar
         env:
           RUNID: ${{ steps.meta.outputs.runid }}
@@ -269,10 +178,7 @@ jobs:
           set -euo pipefail
           rm -rf payload && mkdir -p payload
 
-          # The layout cloud-init extracts into ~/bench: the harness at the
-          # root (bench-drive runs `./bench suite`), both compose files beside
-          # it (`docker compose -f compose.yaml -f compose.cloud.yaml`), and the
-          # build contexts and bind-mounted configs those reference.
+          # Layout extracted into ~/bench on the loadgen.
           install -m 0755 "$BENCH" payload/bench
           cp compose.yaml compose.cloud.yaml payload/
           cp -a proxies backend payload/
@@ -280,8 +186,7 @@ jobs:
           tar -cf payload.tar -C payload .
           echo "payload.tar: $(stat -c %s payload.tar) bytes"
 
-          # Yandex Object Storage accepts an IAM token directly — no SigV4, no
-          # static access key. Same call the VMs' bench-os makes.
+          # Object Storage accepts the IAM token directly.
           curl -fsS --retry 3 --retry-connrefused \
             -X PUT \
             -H "Authorization: Bearer $YC_TOKEN" \
@@ -294,20 +199,10 @@ jobs:
       - name: tofu init
         run: tofu -chdir=cloud init -input=false
 
-      # State is EPHEMERAL — it lives in this workspace and there is no remote
-      # backend on purpose (a nightly fleet has nothing to hand to the next run,
-      # and a shared backend is one more thing that can lock or leak).
-      #
-      # The diff prints `ip_address` and `v4_cidr_blocks` in clear, so the whole
-      # stream goes through a scrubber. `pipefail` keeps tofu's exit status;
-      # `sed -u` keeps it streaming so the console shows progress.
-      #
-      # The second expression is belt-and-braces. `metadata` should render as
-      # `(sensitive value)` — terraform propagates the tls provider's sensitive
-      # mark through templatefile(), and the rendered cloud-init carries the
-      # fleet's ssh host key (and, for the loadgen, its private identity). If
-      # that propagation ever stops holding, this catches it rather than
-      # publishing a private key to a public log.
+      # State is ephemeral (no remote backend). The diff prints addresses, so
+      # output is scrubbed; `sed -u` keeps it streaming. The private-key
+      # expression is a backstop in case `metadata` ever stops rendering as
+      # sensitive.
       - name: tofu apply
         id: apply
         env:
@@ -326,34 +221,12 @@ jobs:
               -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
               -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
 
-      # The VMs have no public address and nothing can dial in, so the bucket is
-      # the only window onto the run: `bench wait` polls for DONE/FAILED and
-      # streams the log object, which the loadgen re-uploads every ~30 s. The
-      # console therefore lags reality by about half a minute.
-      #
-      # "What if DONE is never written" is answered TWICE, and the inner answer
-      # is the one that should fire. `bench wait` carries its own deadlines
-      # (commands.WaitOptions: 15 min for the first boot marker) and exits
-      # cleanly with a diagnosis. `timeout-minutes` here is a few minutes wider
-      # than `--max-wait-s`, so it only fires if `wait` ITSELF wedges — and it
-      # bounds the STEP rather than the job, because a job-level timeout cancels
-      # the job and races the teardown, whereas a step timeout leaves the
-      # `if: always()` steps below to run normally.
-      #
-      # Split into up to four 55-minute CHUNKS, each on its own IAM token,
-      # rather than one open-ended call: the federated token this job started
-      # with is short-lived (~1h — see the top-of-file comment), and boot plus
-      # cold docker builds plus five profiles' ramps can genuinely run past that
-      # in the worst case. A single long call would start 401ing partway
-      # through and the run would look dead even though the fleet is healthy.
-      # `--max-wait-s` bounds ONE call; exit 5 means that chunk's deadline
-      # elapsed with no terminal marker yet (the fleet may be fine), distinct
-      # from exit 1 (`never_booted` — no amount of retrying helps). Only a 5
-      # earns the next chunk with a freshly-minted token. With five profiles
-      # a normal night needs three chunks; the fourth is headroom.
-      #
-      # Exit codes (bench/CONTRACT.md): 0 done, 3 the suite ran and reported
-      # failures, 1 it never booted, 5 this chunk's deadline elapsed.
+      # The bucket is the only window onto the run (private VMs): `bench wait`
+      # polls for DONE/FAILED and streams the log (~30 s lag).
+      # Up to four 55-min chunks, each on a fresh token. Step timeout is only a
+      # backstop for `wait` itself wedging; step, not job, so teardown runs.
+      # Exit codes (bench/CONTRACT.md): 0 done, 3 suite failures, 1 never
+      # booted, 5 chunk deadline elapsed (only 5 earns the next chunk).
       - name: Wait chunk 1
         id: wait
         continue-on-error: true
@@ -383,9 +256,8 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-      # Only runs if chunk 1's OWN deadline elapsed (code 5). If the re-mint
-      # above failed, this still tries with whatever token is current — the old
-      # one may still be good, same trade the teardown re-mint below makes.
+      # Runs only on chunk 1 code 5. Tries even if the re-mint failed; the old
+      # token may still be good.
       - name: Wait chunk 2 (only if chunk 1's deadline elapsed)
         id: wait2
         if: always() && steps.wait.outputs.code == '5'
@@ -462,11 +334,7 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
 
-      # A fresh token immediately before `fetch`, regardless of whether chunk 2
-      # ran: on the common fast path (chunk 1 alone finishes) the token in use
-      # is still the one this job started with, and by now it may be close to
-      # an hour old. Same proven pattern as the teardown re-mint — failure is
-      # tolerated, the old token may still be good.
+      # Fresh token before fetch even on the fast path; failure tolerated.
       - name: Re-mint the IAM token before fetch
         id: iam_fetch
         if: always()
@@ -496,15 +364,9 @@ jobs:
 
       # ------------------------------------------------------------ teardown --
 
-      # As early as it can possibly be: everything after this point is rendering
-      # and publishing, which needs no fleet. Placed BEFORE the report steps so a
-      # slow render is not billed as three guaranteed-vCPU VMs.
-
-      # A federated IAM token is short-lived and this job may have been running
-      # for well over an hour by now. Re-mint before teardown — a destroy that
-      # fails on an expired token leaves the fleet up, which is the one outcome
-      # that is not allowed. Failure here is tolerated: the old token may still
-      # be good, and destroy should get its chance either way.
+      # Before rendering, so no VM time is billed for it. Re-mint first: a
+      # destroy that fails on an expired token leaves the fleet up. Failure
+      # tolerated; destroy still gets its chance.
       - name: Re-mint the IAM token for teardown
         id: iam_teardown
         if: always()
@@ -522,9 +384,8 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-      # `if: always()` covers success, failure AND cancellation. Same scrubber as
-      # apply. `continue-on-error` so that a teardown failure still reaches the
-      # sweep backstop below instead of ending the job here.
+      # Same scrubber as apply. `continue-on-error` so a failure reaches the
+      # sweep backstop.
       - name: tofu destroy
         id: destroy
         if: always()
@@ -549,9 +410,8 @@ jobs:
               -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
               -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
 
-      # Last line of defence. Deletes by the bench=nightly label, which is what
-      # the label is for. NOTE: it deletes every fleet carrying that label, so a
-      # laptop-driven run in the same folder would go with it — see docs/SETUP.md.
+      # Deletes EVERY fleet labelled bench=nightly, including a laptop-driven
+      # run in the same folder (docs/SETUP.md).
       - name: Sweep the fleet (backstop for a failed destroy)
         if: always() && steps.destroy.outcome != 'success'
         run: |
@@ -561,15 +421,8 @@ jobs:
 
       # ------------------------------------------------------------- publish --
 
-      # results/ is gitignored, so THIS is the durable store for a night's raw
-      # data — 90 days of NDJSON, histograms and cAdvisor samples. Everything
-      # else (Pages, Discord) is a rendering of it, and every one of those
-      # renderings now happens in publish.yml, downstream of this artifact.
-      #
-      # That is the whole measure/publish split: this job produces numbers, and
-      # knows nothing about how they are presented. It is also what makes
-      # re-publishing possible — publish.yml can be pointed at any past run's
-      # artifact to re-render it with fixed code, without a fleet.
+      # The durable store of a night's raw data (results/ is gitignored);
+      # publish.yml renders from it and can re-render any past run.
       - name: Upload the run artifact
         id: artifact
         if: always()
@@ -581,19 +434,16 @@ jobs:
           if-no-files-found: warn
       # ---------------------------------------------------------- the verdict --
 
-      # Everything above is `continue-on-error` so that teardown and publishing
-      # always get their turn. The job's success or failure is decided here,
-      # once, from what actually happened.
+      # Steps above continue on error so teardown always runs; the job
+      # result is decided here.
       - name: Verdict
         if: always()
         run: |
           set -euo pipefail
           bad=0
 
-          # Fold the wait chunks into one outcome: the LAST chunk that ran
-          # decides it. An earlier chunk's own "failure" was just its deadline
-          # elapsing (code 5), which is what earned the next one — not a real
-          # problem. A chunk 4 that also ends on 5 stays a failure.
+          # The last wait chunk that ran decides; an earlier code 5 just
+          # earned the next chunk. A final 5 is a failure.
           wait_outcome="${{ steps.wait.outcome }}"
           if [ "${{ steps.wait.outputs.code }}" = "5" ]; then
             wait_outcome="${{ steps.wait2.outcome }}"
@@ -623,39 +473,19 @@ jobs:
             exit 1
           fi
 
-  # Everything downstream of the measurement lives in publish.yml, which this
-  # calls rather than re-implements — see that file's header. The same workflow
-  # is dispatchable on its own to re-render any past run, so a rendering fix
-  # reaches the site without spending a fleet run on new numbers.
-  #
-  # `source-run` is THIS run: the bench job's artifact is what gets published.
-  #
-  # NOTE a behaviour change. The old deploy job was `continue-on-error` so a
-  # Pages outage could not redden the night. A job that calls a reusable
-  # workflow cannot set that key, and it is no longer the right trade anyway:
-  # the bench job's own Verdict decides whether the MEASUREMENT succeeded, the
-  # raw data is safe in the artifact either way, and a publish failure now has
-  # a one-click fix (dispatch publish.yml) that it did not have before. Better
-  # seen than swallowed.
+  # Renders and deploys this run's artifact via publish.yml. Cannot be
+  # `continue-on-error` (reusable workflow); a failed publish is fixed by
+  # dispatching publish.yml.
   publish:
     needs: bench
-    # `!cancelled()`, NOT `always()`. `always()` runs the job even when the run
-    # was CANCELLED, and run #36 duly published a half-finished bench after
-    # someone stopped it — the numbers on the site then described a night that
-    # was deliberately abandoned. A cancelled run has nothing to say.
-    #
-    # Still not `success()`: a teardown failure fails the bench job, and that
-    # must not cost an otherwise good report. `needs.bench.outputs.results` is
-    # the gate that means there is something to render.
+    # `!cancelled()`, NOT `always()`: run #36 published a cancelled run.
+    # Not `success()`: a teardown failure must not block a good report.
     if: ${{ !cancelled() && needs.bench.outputs.results == 'success' }}
     uses: ./.github/workflows/publish.yml
     with:
       source-run: ${{ github.run_id }}
       notify: true
-    # Job-level permissions REPLACE the workflow block rather than merging, and
-    # for a called workflow they also CAP what it can ask for. Restated in full:
-    # `actions: read` to read the artifact, `id-token: write` twice over (the
-    # Yandex OIDC exchange and deploy-pages' own auth), `pages: write` to deploy.
+    # Replaces, and caps, the called workflow's permissions: restated in full.
     permissions:
       contents: read
       actions: read
@@ -663,22 +493,11 @@ jobs:
       pages: write
     secrets: inherit
 
-  # Tells the landing site to pull tonight's numbers in, now that they're
-  # actually live at the URL it fetches from — precise timing instead of a
-  # guessed cron over there, which would either race a slow run or sit idle
-  # after a fast one. Best-effort: a missed dispatch just leaves the site's
-  # numbers one night stale.
-  #
-  # Nightly-only, which is why it stayed here rather than moving into
-  # publish.yml: a re-publish emits the same numbers the site already has, so
-  # there is nothing for it to refresh.
+  # Tells the landing site to refresh tonight's numbers. Best-effort.
+  # Nightly-only: a re-publish has nothing new for the site.
   dispatch:
     needs: publish
-    # `!cancelled()` for the same reason as the publish job above. A skipped
-    # publish already fails the result check, so this only closes the narrow
-    # window where the run is cancelled after publish succeeded — and the cost
-    # of skipping then is the site's numbers being one night stale, which this
-    # step is explicitly best-effort about anyway.
+    # `!cancelled()` as for publish; a miss only leaves the site a night stale.
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
@@ -687,10 +506,8 @@ jobs:
       contents: read
 
     steps:
-      # ZOXY_IO_DISPATCH_TOKEN is a fine-grained PAT scoped to Contents: read
-      # and write on zoxy-io/site ONLY — nothing on this repo, nothing broader.
-      # Same secret-handling rule as DISCORD_WEBHOOK: only ever through `env:`,
-      # never interpolated into a command line.
+      # ZOXY_IO_DISPATCH_TOKEN: fine-grained PAT, Contents read/write on
+      # zoxy-io/site only. Only ever through `env:`.
       - name: Notify zoxy-io to refresh benchmark numbers
         env:
           TOKEN: ${{ secrets.ZOXY_IO_DISPATCH_TOKEN }}

@@ -1,15 +1,8 @@
-//! Renders a run directory into report.json (and, later, report.html).
+//! Renders a run directory into report.json and report.html.
 //!
-//! report.json is the canonical MEASURED-data artifact: the exact numbers the
-//! HTML draws, so downstream consumers never parse HTML. It is also the Phase 0
-//! gate for this rewrite — `bench report` must reproduce
-//! `python3 report/report.py`'s output field-for-field on an existing run
-//! directory, which is the only honest proof that analysis.zig's port of the
-//! measurement math is correct.
-//!
-//! That gate is why this file cares about things that would otherwise be
-//! irrelevant: key emission order, Python's round-half-to-even, and how
-//! json.dumps prints a float.
+//! report.json is the canonical measured-data artifact. Gate: `bench report`
+//! must reproduce report/report.py's output field-for-field, hence the care
+//! over key order, round-half-to-even and float printing.
 
 const std = @import("std");
 const zrk = @import("zrk");
@@ -23,15 +16,11 @@ const Allocator = std.mem.Allocator;
 const Histogram = zrk.hdr.Histogram;
 const Point = analysis.Point;
 
-/// Display order for the summary table and every series list. Proxies present in
-/// the run but not named here follow, in the order the run recorded them.
+/// Display order for the summary table and series lists; unlisted proxies
+/// follow in run order.
 ///
-/// `direct` is still listed, and deliberately, even though it is no longer part
-/// of the comparison and no run produces it any more: `bench index` walks THIS
-/// list to build the trend chart out of history.ndjson, and every night before
-/// the removal has direct rows in there. Dropping it here would erase that line
-/// from the chart retroactively rather than letting it end where it stopped.
-/// Nothing else reaches it — a name only matters here if the data contains it.
+/// Keep `direct`: `bench index` walks this list for the trend chart, and
+/// history.ndjson still has direct rows.
 pub const proxy_order = [_][]const u8{
     "zoxy", "haproxy", "nginx", "pingora", "envoy", "direct",
 };
@@ -41,8 +30,7 @@ pub const proxy_order = [_][]const u8{
 pub const palette = [_]struct { name: []const u8, hex: []const u8 }{
     .{ .name = "zoxy", .hex = "#fb9e0e" },
     .{ .name = "haproxy", .hex = "#38bdf8" },
-    // Matches --c-nginx in report.css, which kept its entry through the
-    // removal; the swatch and line rules there are already keyed on s-nginx.
+    // Matches --c-nginx in report.css.
     .{ .name = "nginx", .hex = "#34d399" },
     .{ .name = "pingora", .hex = "#f472b6" },
     .{ .name = "envoy", .hex = "#a78bfa" },
@@ -56,24 +44,19 @@ pub fn colorOf(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Everything measured for one proxy, computed once so the HTML and the JSON
-/// render from the SAME numbers.
+/// Everything measured for one proxy, so HTML and JSON share the same numbers.
 pub const ProxyData = struct {
     name: []const u8,
     rows: []analysis.Window,
     sustained: f64,
-    /// Reference-band histogram (fixed rate, warmup excluded): the summary
-    /// table's p50/p99 columns read from this, so every proxy is compared at
-    /// the same fair, sub-knee load — see profile.zig's `ref_rate` docs.
+    /// Reference-band histogram (fixed rate, warmup excluded) for the summary
+    /// table's p50/p99; see profile.zig's `ref_rate`.
     hist: ?Histogram,
-    /// The WHOLE run's histogram (every window, warmup included): the
-    /// distribution chart plots this, and it matches what `hgrm_file` holds
-    /// on disk. Deliberately a separate field from `hist` — conflating the
-    /// two would either wrongly filter the chart or wrongly widen the table.
+    /// Whole-run histogram for the distribution chart; matches `hgrm_file`.
+    /// Kept separate from `hist` on purpose.
     dist_hist: ?Histogram,
     hgrm_file: []const u8,
-    /// Peak container working-set bytes; null for any run whose cAdvisor
-    /// samples are absent.
+    /// Peak container working-set bytes; null without cAdvisor samples.
     mem: ?f64,
     /// Container cores vs offered; empty when no cAdvisor samples exist.
     cpu: []Point,
@@ -95,10 +78,8 @@ pub const Gathered = struct {
     p99: []Series,
     shed: []Series,
 
-    /// Frees the reference histograms. Everything else lives in the caller's
-    /// arena, but a Histogram owns a counts array from the general-purpose
-    /// allocator (zrk allocates it in `Histogram.init`), so it needs releasing
-    /// explicitly.
+    /// Frees the histograms, whose counts live in the general-purpose
+    /// allocator rather than the arena.
     pub fn deinit(self: *Gathered) void {
         for (self.present) |*p| {
             if (p.hist) |*h| h.deinit();
@@ -115,11 +96,8 @@ pub const Ramp = struct {
     ramp_seconds: ?i64 = null,
 };
 
-/// Compute every curve and summary for a run directory.
-///
-/// `ref_rate`/`ref_band` come from the profile rather than being module
-/// constants, because the offered level at which a single latency number is
-/// fair moves with the connection count — see profile.zig's `ref_rate` docs.
+/// Compute every curve and summary for a run directory. `ref_rate`/`ref_band`
+/// come from the profile; see profile.zig's `ref_rate`.
 pub fn gather(
     gpa: Allocator,
     arena: Allocator,
@@ -132,8 +110,7 @@ pub fn gather(
     var out: std.ArrayList(ProxyData) = .empty;
 
     for (proxies) |in| {
-        // Merge the per-loadgen series, dropping zrk's end-of-run partial flush
-        // from each before they are aligned by interval index.
+        // Drop each loadgen's end-of-run partial flush before merging.
         const per_tag = try arena.alloc([]analysis.TsRow, in.tags.len);
         for (in.tags, 0..) |tag, i| {
             const path = try artifactPath(arena, dir, in.name, tag, "ndjson");
@@ -144,9 +121,8 @@ pub fn gather(
 
         const rows = try analysis.merge(arena, per_tag_const);
 
-        // The reference histogram and the p99 curve both read the first tag's
-        // raw rows (report.py does the same — a second loadgen contributes to
-        // throughput, but merging two machines' tails would misstate both).
+        // Reference histogram and p99 curve read only the first tag's rows
+        // (as report.py): merging two machines' tails would misstate both.
         const first = if (per_tag.len > 0) per_tag[0] else &.{};
 
         var raw_shed: std.ArrayList(Point) = .empty;
@@ -191,19 +167,9 @@ pub fn gather(
         try rps.append(arena, .{ .name = "offered", .pts = diag, .ref = true });
     }
 
-    // --- cpu: median over 7 points, to damp genuine second-to-second jitter
-    // (scheduling, the periodic healthcheck exec, cAdvisor housekeeping stalls
-    // that widen a real interval).
-    //
-    // This median used to be load-bearing for a DIFFERENT reason, and that
-    // reason was a bug: the rate was computed against the poll clock, so a poll
-    // that re-read an unchanged counter charted 0 cores and the next one
-    // charted ~2x. The median duly erased the zeros — and kept the inflated
-    // peaks, turning a symmetric sampling artifact into a systematic ~1.44x
-    // overstatement that put a 1-CPU-capped container at ~1.5 cores. The rate
-    // is measured on cAdvisor's own clock now (see cadvisor.Sample.cadvisor_ms),
-    // so what reaches this median is already honest, and the median is back to
-    // being cosmetic. Do not widen it to fix a number that looks wrong.
+    // --- cpu: 7-point median, cosmetic jitter damping only. The rate is on
+    // cAdvisor's clock (cadvisor.Sample.cadvisor_ms); do not widen the median
+    // to fix a number that looks wrong.
     var cpu: std.ArrayList(Series) = .empty;
     for (present) |*p| {
         if (p.cpu.len == 0) continue;
@@ -220,22 +186,12 @@ pub fn gather(
         try p99.append(arena, .{ .name = p.name, .pts = p.p99 });
     }
 
-    // --- shed: every window shown, no offered floor. Raw shed is signed (see
+    // --- shed: every window, no offered floor. Raw shed is signed (see
     // analysis.merge), median-smoothed, then clamped at 0.
     //
-    // It used to have the `direct` baseline's smoothed shortfall subtracted at
-    // the same offered level first. That mattered: the loadgen itself falls a
-    // few % short of the schedule in the first ~15s (connect overhead, TCP
-    // slow-start), `direct` measured exactly that with no proxy on the path,
-    // and subtracting it made every curve sit at zero from the left edge until
-    // the proxy's real knee.
-    //
-    // Removing `direct` removed the only measurement of that shortfall, so the
-    // subtraction is gone and the generator's own ramp-up is now INSIDE these
-    // curves. A few % at the extreme left is the loadgen, not the proxy — the
-    // chart caption says so, because nothing in the data distinguishes them any
-    // more. Curves are still comparable to each other (every proxy carries the
-    // same generator overhead); they are not comparable to a pre-removal run's.
+    // No baseline subtraction since `direct` was removed: the loadgen's own
+    // few-% ramp-up shortfall is inside these curves (the caption says so).
+    // Not comparable with pre-removal runs.
     var shed: std.ArrayList(Series) = .empty;
     for (present) |*p| {
         if (p.shed_raw.len == 0) continue;
@@ -255,14 +211,9 @@ pub fn gather(
     };
 }
 
-/// Load a proxy's cAdvisor samples into the shape `gather` wants: container
-/// cores against OFFERED load, plus peak working-set bytes.
-///
-/// This is the half of the Prometheus replacement that lives in the report. The
-/// poller records raw counters on the ramp's own clock, so mapping a sample onto
-/// the offered axis is analytic — `offered(t)` straight from the ramp — with no
-/// wall-clock-to-elapsed remap and no clock skew between two machines, which is
-/// what the Prometheus path needed.
+/// Load a proxy's cAdvisor samples: container cores against OFFERED load, plus
+/// peak working-set bytes. Samples are on the ramp's clock, so offered(t) is
+/// analytic with no clock skew.
 pub fn loadCadvisor(
     arena: Allocator,
     io: std.Io,
@@ -291,14 +242,9 @@ pub fn loadCadvisor(
     var peak: u64 = 0;
     for (rows.items) |r| peak = @max(peak, r.mem_ws);
 
-    // A counter needs two points to become a rate, so the first sample only
-    // establishes a baseline.
-    //
-    // The rate's denominator is cAdvisor's own clock, NOT the poll clock — see
-    // cadvisor.Sample.cadvisor_ms for why dividing by the poll interval put
-    // points above the 1-CPU cap on a container that cannot exceed it. The
-    // x position still comes from `r.t`, the ramp's own clock, which is what
-    // makes offered(t) analytic.
+    // The first sample is only a baseline. Rate denominator is cAdvisor's
+    // clock, not the poll clock (see cadvisor.Sample.cadvisor_ms); x comes from
+    // the ramp clock `r.t`.
     var cpu: std.ArrayList(Point) = .empty;
     if (rows.items.len >= 2) {
         const start: f64 = @floatFromInt(ramp.start_rate orelse 0);
@@ -321,11 +267,7 @@ pub fn loadCadvisor(
 }
 
 /// `<dir>/<proxy>.<tag>.<ext>`, or `<dir>/<proxy>.<ext>` when the tag is empty.
-///
-/// `bench suite` writes untagged names; the loadgen tag only ever existed to
-/// disambiguate multiple generators, and there has only ever been one. Archived
-/// run dirs from the bash harness carry the `lg1` tag, so both spellings have to
-/// resolve.
+/// `bench suite` writes untagged names; archived bash-harness runs use `lg1`.
 fn artifactPath(
     arena: Allocator,
     dir: []const u8,
@@ -367,8 +309,7 @@ fn hgrmFilename(
     return "";
 }
 
-/// Order proxies for display: `proxy_order` first, then anything else in the
-/// order the run recorded it.
+/// Order proxies: `proxy_order` first, then the rest in run order.
 pub fn orderPresent(arena: Allocator, names: []const []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (proxy_order) |want| {
@@ -386,13 +327,8 @@ pub fn orderPresent(arena: Allocator, names: []const []const u8) ![]const []cons
     return out.toOwnedSlice(arena);
 }
 
-/// The build a row's numbers came from, looked up by proxy name.
-///
-/// profile.json has carried this since the version probe landed, but that file
-/// is this harness's own run record. report.json is the contract other things
-/// read, and a consumer wanting to label a number with the build behind it had
-/// to parse a second artifact or hand-type the version and hope — zoxy.io was
-/// doing the latter, which is the kind of claim that goes stale unnoticed.
+/// The build a row's numbers came from, so report.json consumers need not
+/// parse profile.json.
 fn versionOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const u8 {
     for (statuses) |s| {
         if (std.mem.eql(u8, s.name, name)) return s.version;
@@ -400,21 +336,9 @@ fn versionOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const 
     return null;
 }
 
-/// The suite's own verdict on this proxy's turn — `ok`, `degraded`, `failed`,
-/// `skipped` — or null when the record is missing entirely.
-///
-/// report.json publishes `sustained` as a NUMBER for every proxy it lists, and
-/// a turn that died at `start` lands there as a plain `0`. Every other surface
-/// distinguishes the two: the HTML table renders an em-dash, history.ndjson
-/// carries `status` (which is what keeps a failure out of the trend and out of
-/// the vs-last-night delta), and the Discord table refuses to print a zero for
-/// a failed proxy at all. This is the one machine-readable artifact where a
-/// crash and a genuine zero read the same, and "absent, not zero" is a
-/// distinction this harness makes everywhere else.
-///
-/// Found the night zoxy v0.6.0's TLS listener segfaulted at boot
-/// (zoxy-io/zoxy#283): report.json said `"sustained":0`, which reads as a
-/// proxy that is catastrophically slow rather than one that never started.
+/// The suite's verdict (`ok`, `degraded`, `failed`, `skipped`), or null when
+/// missing. Without it a crash at `start` reads as `"sustained":0`
+/// (zoxy-io/zoxy#283).
 fn statusOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const u8 {
     for (statuses) |s| {
         if (std.mem.eql(u8, s.name, name)) return @tagName(s.status);
@@ -422,8 +346,8 @@ fn statusOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?[]const u
     return null;
 }
 
-/// Write report.json. Key order and number formatting are chosen to match
-/// report.py's `json.dumps(..., separators=(",", ":"))` exactly — see jsonw.zig.
+/// Write report.json, matching report.py's `json.dumps(...,
+/// separators=(",", ":"))` exactly; see jsonw.zig.
 pub fn writeJson(
     arena: Allocator,
     w: *std.Io.Writer,
@@ -433,9 +357,8 @@ pub fn writeJson(
     ramp: Ramp,
     ref_rate: f64,
     ref_band: f64,
-    /// Per-proxy records out of profile.json, for the version each row ran.
-    /// Empty for a legacy run dir that has no profile.json — that reports null
-    /// versions rather than failing, the same way its missing statuses do.
+    /// Per-proxy records from profile.json; empty for legacy run dirs, which
+    /// report null versions.
     statuses: []const artifact.ProxyRecord,
 ) !void {
     var j = jsonw.Writer{ .w = w };
@@ -503,8 +426,8 @@ pub fn writeJson(
     }
     try j.endObject();
 
-    // Ordered by max sustained throughput, same as the HTML summary table.
-    // Stable: ties keep `present` order, matching Python's sorted(reverse=True).
+    // By max sustained descending, like the HTML table. Stable, matching
+    // Python's sorted(reverse=True).
     const ranked = try arena.dupe(*ProxyData, blk: {
         const ptrs = try arena.alloc(*ProxyData, g.present.len);
         for (g.present, 0..) |*p, i| ptrs[i] = p;
@@ -525,16 +448,12 @@ pub fn writeJson(
         try j.key("self");
         try j.boolean(std.mem.eql(u8, p.name, "zoxy"));
 
-        // Verbatim, as the container answered — the same string profile.json
-        // and the HTML table carry. Shortening it to a marketing-sized label
-        // is a presentation choice, and this file is the record, not the
-        // presentation; a consumer that wants "3.0" can take it from "HAProxy
-        // version 3.0.7-...", but nothing can recover the rest once dropped.
+        // Verbatim, as the container answered: this file is the record, not
+        // the presentation.
         try j.key("version");
         if (versionOf(statuses, p.name)) |v| try j.string(v) else try j.nullValue();
 
-        // Before `sustained`, deliberately: a reader scanning this object hits
-        // the verdict before the number it qualifies.
+        // Before `sustained`, so the verdict precedes the number.
         try j.key("status");
         if (statusOf(statuses, p.name)) |s| try j.string(s) else try j.nullValue();
 
@@ -543,9 +462,7 @@ pub fn writeJson(
         try j.key("mem");
         if (p.mem) |m| try j.float(m, 6) else try j.nullValue();
 
-        // p50/p99 at the reference load, read from the merged reference-rate
-        // histogram. p99, not raw max: HdrHistogram's max is a single worst
-        // sample, so one scheduling blip ruins it even in a healthy window.
+        // p50/p99 at the reference load. p99, not max: max is a single sample.
         try j.key("latency_ms");
         try j.beginObject();
         const lat: ?struct { p50: f64, p99: f64 } = if (p.hist) |*h| (if (h.count() > 0) .{
@@ -681,14 +598,9 @@ test "the charted cpu curve never exceeds a capped container's cap" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The rate math and the 7-point median TOGETHER are what charted a 1-CPU
-    // container at ~1.5 cores: the poll-clock rate alternated 0 / ~2x, and the
-    // median then dropped the zeros and kept the peaks. Testing the two in
-    // isolation misses that interaction, so this exercises the same pair the
-    // report runs — smoothMedian over the rates rateSpanSeconds produces.
-    //
-    // Load: a container pegged at exactly 1.0 core, sampled the way the fleet
-    // samples it — see cadvisor.peggedSamples.
+    // Rate math and 7-point median together once charted a 1-CPU container at
+    // ~1.5 cores, so test the pair: smoothMedian over rateSpanSeconds output
+    // for a container pegged at 1.0 core (cadvisor.peggedSamples).
     const samples = try cadvisor.peggedSamples(arena, 1.0, 300);
     var pts: std.ArrayList(analysis.Point) = .empty;
     for (samples[1..], 0..) |s, i| {

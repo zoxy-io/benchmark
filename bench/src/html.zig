@@ -1,18 +1,11 @@
 //! Assembles report.html from the same numbers report.json carries.
 //!
-//! Ported from report/report.py's `build`, with one substantive addition: a
-//! proxy's STATUS is rendered. The Python derived the proxy list from
-//! `meta["runs"]` membership, so a proxy that failed produced a row of zeros
-//! indistinguishable from one that genuinely served nothing. Here a `failed` or
-//! `skipped` proxy contributes no line to any chart and gets an explicit badge
-//! naming the stage it died at; a `degraded` one renders its numbers with a
+//! A `failed`/`skipped` proxy draws no chart line and gets a badge naming the
+//! stage it died at, so it never reads as zeros; `degraded` renders with a
 //! warning.
 //!
-//! Both style and behaviour are `@embedFile`d, so the page is self-contained —
-//! it has to be, since it is posted to Discord as an attachment. The two font
-//! `@import`s the Python's CSS carried were dropped when the assets were
-//! extracted: on a public Pages site they send every viewer's address to
-//! Fontshare and Google, and the CSS already declares full fallback stacks.
+//! Assets are `@embedFile`d so the page is self-contained (it is a Discord
+//! attachment). No font `@import`s: they would leak viewers' addresses.
 
 const std = @import("std");
 
@@ -31,16 +24,14 @@ const js = @embedFile("assets/report.js");
 pub const Options = struct {
     runid: []const u8,
     profile_name: []const u8,
-    /// A local run is banner-marked; see the note at the banner itself.
+    /// A local run is banner-marked.
     origin: artifact.Origin = .cloud,
     ref_rate: f64,
     connections: u32,
     deadline_ms: u64,
-    /// The load was offered over TLS, terminated by each proxy. Changes what
-    /// every number on the page is a measurement OF, so the page says so.
+    /// Load offered over TLS, terminated by each proxy; the page says so.
     tls: bool = false,
-    /// Absolute prefix for `.hgrm` download links, so the same file works both
-    /// as a Discord attachment (where a relative link 404s) and on Pages.
+    /// Absolute prefix for `.hgrm` links: relative links 404 in Discord.
     base_url: []const u8 = "",
 };
 
@@ -51,13 +42,8 @@ pub fn render(
     statuses: []const artifact.ProxyRecord,
     opts: Options,
 ) !void {
-    // Crop every chart's offered axis to where the LAST proxy stops keeping up.
-    // The p99 curves are keep-up-filtered, so their rightmost offered IS that
-    // knee, and the full ramp would waste half the chart width on empty space.
-    //
-    // This used to skip `direct`, which kept up far past every proxy and so
-    // would have set the crop to the whole ramp on its own. With it gone there
-    // is nothing to exclude.
+    // Crop every chart's offered axis to where the LAST proxy stops keeping up
+    // (the rightmost keep-up-filtered p99 point).
     var crop: ?f64 = null;
     for (g.p99) |s| {
         for (s.pts) |p| crop = @max(crop orelse 0, p.x);
@@ -79,8 +65,7 @@ pub fn render(
     );
     try out.print("<h1>request throughput <span class=\"rid\">{s}</span></h1>", .{opts.runid});
     if (opts.origin == .local) {
-        // Someone will eventually screenshot one of these. The page has to say
-        // what it is without being read carefully.
+        // Pages get screenshotted; this must be unmissable.
         try out.writeAll(
             "<p class=\"meta\"><b class=\"warn\">Local run — not a benchmark result.</b> " ++
                 "The load generator shared CPU, cache and memory bandwidth with the proxy it was " ++
@@ -98,7 +83,7 @@ pub fn render(
         \\shared, light, sub-knee rate where the number reflects per-request <em>cost</em> rather than queueing.
     , .{ opts.connections, svg.fmtSi(&buf, opts.ref_rate) });
     if (opts.deadline_ms > 0) {
-        // Say so explicitly: it changes what p99 MEANS on this page.
+        // Said explicitly: it changes what p99 means on this page.
         try out.print(
             \\ This profile applies a <b>{d}ms client-side deadline</b>, identical for every proxy: a request that
             \\would miss it is shed before being sent and never recorded, so p99 is the distribution of requests
@@ -106,10 +91,8 @@ pub fn render(
         , .{opts.deadline_ms});
     }
     if (opts.tls) {
-        // Everything a reader needs to know before comparing this page's
-        // numbers to a plaintext profile's, in the place they will actually
-        // read it. The resumption line is the one that matters most: zoxy 0.2.0
-        // ships session tickets, and nothing here exercises them.
+        // What a reader must know before comparing with a plaintext profile.
+        // Resumption matters most: zoxy ships session tickets, unexercised here.
         try out.writeAll(
             \\ <b>The load is offered over TLS 1.3</b>, terminated by the proxy; every proxy's
             \\upstream leg stays plaintext, as zoxy terminates inbound only. All five load the same
@@ -151,7 +134,7 @@ pub fn render(
         try out.writeAll("</td>");
 
         if (!usable) {
-            // No numbers at all — a failed proxy must never render as zeros.
+            // A failed proxy must never render as zeros.
             try out.writeAll("<td>—</td><td>—</td><td>—</td><td>—</td>");
         } else {
             try out.print("<td>{s}</td>", .{svg.fmtSi(&buf, p.sustained)});
@@ -202,12 +185,8 @@ pub fn render(
 
     // --- per-proxy latency distributions
     //
-    // Plots `dist_hist` (every window merged, warmup included) rather than
-    // `hist` (the summary table's reference-band histogram) — a reader
-    // hovering this chart should see what the whole run actually did, not a
-    // fairness-filtered slice of it. The downloadable `.hgrm` file is the
-    // SAME data (see analysis.wholeRunHist's doc comment), so the two no
-    // longer describe different things under one heading.
+    // Plots `dist_hist` (whole run, warmup included), the same data as the
+    // downloadable `.hgrm`, not the summary table's reference-band `hist`.
     var any_hist = false;
     for (g.present) |*p| {
         if (p.dist_hist) |*hh| {
@@ -222,9 +201,7 @@ pub fn render(
 
             try out.print("<section class=\"card\" id=\"hist-{s}\"><h2>{s}</h2><p class=\"sub\">latency by percentile", .{ p.name, p.name });
             if (analysis.isSaturated(hh)) {
-                // zrk's histogram clamps at 60s, so every tail percentile here
-                // is the clamp value. Printing it as a measurement would be a
-                // fabrication.
+                // zrk clamps at 60s: the tail percentiles are not measurements.
                 try out.writeAll(" · <b class=\"warn\">saturated at 60s — tail percentiles are a floor, not a value</b>");
             }
             if (p.hgrm_file.len > 0) {
@@ -277,13 +254,8 @@ fn writeLatencyCellP99(out: *Writer, p: *const report.ProxyData, st: ?artifact.P
     try out.print("<td>{d:.2}ms</td>", .{v});
 }
 
-/// The version that actually answered, under the proxy's name.
-///
-/// A benchmark number means nothing without the build it came from, and until
-/// now the page named neither — a reader had to take "haproxy" on faith and go
-/// read compose.yaml to find out which haproxy. zoxy additionally gets its
-/// commit, short-form, since its version alone (`zoxy 0.0.5`) does not identify
-/// a nightly build of a moving `main`.
+/// The version that answered, under the proxy's name. zoxy also gets its short
+/// commit, since its version alone does not identify a nightly build.
 fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
     var vbuf: [128]u8 = undefined;
     var ebuf: [512]u8 = undefined;
@@ -291,18 +263,14 @@ fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
     const version: ?[]const u8 = if (st) |r| r.version else null;
     const commit: ?[]const u8 = if (st) |r| r.zoxy_commit else null;
 
-    // ALWAYS one line, on every row: a row that is two lines tall beside rows
-    // that are one looks broken.
-    //
-    // The full string as recorded goes in `title`, so shortening costs a reader
-    // nothing: it is a hover away here and verbatim in profile.json.
+    // Always one line on every row, or the table looks broken. The full string
+    // goes in `title`.
     try out.writeAll("<span class=\"prov\"");
     if (version) |v| try out.print(" title=\"{s}\"", .{escapeHtml(&ebuf, v)});
     try out.writeAll(">");
 
     if (version == null and commit == null) {
-        // Said, not left blank: it means the probe could not read a version,
-        // which is worth seeing rather than hiding behind an empty cell.
+        // A dash, not blank: the probe could not read a version.
         try out.writeAll("—");
         try out.writeAll("</span>");
         return;
@@ -314,8 +282,7 @@ fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
         wrote = true;
     }
     if (commit) |c| {
-        // Short sha: the full 40 is in profile.json for anyone bisecting, and
-        // the table has to stay readable.
+        // Short sha; the full one is in profile.json.
         const short = if (c.len > 9) c[0..9] else c;
         if (wrote) try out.writeAll(" ");
         try out.print("@{s}", .{escapeHtml(&ebuf, short)});
@@ -323,26 +290,17 @@ fn writeVersion(out: *Writer, st: ?artifact.ProxyRecord) !void {
     try out.writeAll("</span>");
 }
 
-/// The version number out of whatever the proxy printed.
+/// The version number out of a proxy's banner text, which verbatim can run to
+/// 88 characters and break the table layout.
 ///
-/// What these report is banner text, not a version — haproxy adds a build sha,
-/// a date and a URL; envoy a commit, a build type and its TLS backend; the
-/// image-reference fallback carries a whole repository path. Rendered verbatim
-/// they run to 67 and 88 characters and stretch the summary table's first
-/// column until the numbers beside it stop lining up.
-///
-/// The rule: split on the separators these formats use, and take the first
-/// token that is a dotted version number. That is enough for every shape the
-/// harness actually sees, and each one is pinned by a test:
+/// Takes the first dotted-version token (each shape pinned by a test):
 ///
 ///   HAProxy version 3.0.25-eb573a937 2026/07/03 - ...  -> 3.0.25
 ///   envoy  version: 14197ab.../1.33.14/Clean/RELEASE/.. -> 1.33.14
 ///   zoxy 0.0.5                                          -> 0.0.5
 ///   zoxy-bench/pingora-http:0.8                         -> 0.8
 ///
-/// A string with no such token (an unrecognised format, or a proxy added later
-/// that prints something else) falls back to the raw text, truncated. Losing
-/// the shortening is a cosmetic problem; dropping the version is not.
+/// With no such token, falls back to the raw text, truncated.
 fn shortVersion(buf: []u8, raw: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, raw, " \t/:");
     while (it.next()) |tok| {
@@ -354,13 +312,8 @@ fn shortVersion(buf: []u8, raw: []const u8) []const u8 {
 
 /// `tok` as a dotted version number, or null.
 ///
-/// Requires a leading digit and at least one dot, which is what separates a
-/// version from the other digit-bearing tokens in these banners — envoy's
-/// 40-character commit sha (no dots) and haproxy's `2026/07/03` date, split
-/// into `2026`, `07`, `03` by the same separators.
-///
-/// A `-suffix` is a build tag (haproxy's `3.0.25-eb573a937`) and is dropped:
-/// the release is the part a reader compares.
+/// Needs a leading digit and a dot, which rejects envoy's sha and haproxy's
+/// split date. A `-suffix` build tag is dropped.
 fn versionToken(tok: []const u8) ?[]const u8 {
     if (tok.len == 0 or !std.ascii.isDigit(tok[0])) return null;
     var dots: usize = 0;
@@ -393,17 +346,9 @@ fn writeStatusBadge(out: *Writer, st: ?artifact.ProxyRecord) !void {
     }
 }
 
-/// Every recorded caveat, as a list UNDER the table.
-///
-/// Not in the status cell, which is where these first landed: a note is a
-/// sentence, and one row carrying five lines of it beside rows carrying a
-/// one-line badge tears the table's row heights apart. A cell is for a value.
-///
-/// Every note on every status, though — not just the first, and not only when
-/// degraded. Both of those limits used to hide things recorded precisely
-/// because a reader needs them: an `ok` zoxy's build-parity note (SIMD against
-/// haproxy's generic x86-64 image) reached no reader at all, and a degraded
-/// proxy showed one note while silently dropping the rest.
+/// Every note on every status, as a list under the table (not in the status
+/// cell, where multi-line notes break row heights). Includes notes on `ok`
+/// proxies, e.g. zoxy's build-parity note.
 fn writeNotes(out: *Writer, ranked: []const *report.ProxyData, statuses: []const artifact.ProxyRecord) !void {
     var any = false;
     for (ranked) |p| {
@@ -426,14 +371,8 @@ fn writeNotes(out: *Writer, ranked: []const *report.ProxyData, statuses: []const
     try out.writeAll("</ul>");
 }
 
-/// Escape `text` for HTML text content.
-///
-/// This page has no other genuinely free-text sink: everything else `{s}`
-/// interpolates is a name this harness generates itself (a proxy name from
-/// `commands.parseProxies`'s allowlist, a `Stage`'s own `.str()`, a filename
-/// it wrote) — but `notes` carries text built in `suite.zig` from a docker
-/// image's `/etc/<proxy>/build-info` file, which is not proxy-name-shaped and
-/// has no allowlist behind it.
+/// Escape `text` for HTML text and attribute values. Required for `notes` and
+/// versions, which come from docker image files with no allowlist.
 fn escapeHtml(buf: []u8, text: []const u8) []const u8 {
     var len: usize = 0;
     for (text) |c| {
@@ -441,10 +380,7 @@ fn escapeHtml(buf: []u8, text: []const u8) []const u8 {
             '&' => "&amp;",
             '<' => "&lt;",
             '>' => "&gt;",
-            // Also escaped because this now feeds an ATTRIBUTE value (the
-            // version `title=`), where a bare quote ends the attribute and
-            // everything after it becomes markup. Harmless in text content,
-            // which is the only place it went before.
+            // Needed for attribute values (the version `title=`).
             '"' => "&quot;",
             else => {
                 if (len == buf.len) break;
@@ -460,8 +396,7 @@ fn escapeHtml(buf: []u8, text: []const u8) []const u8 {
     return buf[0..len];
 }
 
-/// analysis and svg each own their own Point type deliberately: one is a
-/// measurement, the other a screen coordinate source. Convert at the boundary.
+/// analysis and svg each own a Point type; convert at the boundary.
 fn toSvgPoints(arena: Allocator, pts: []const analysis.Point) ![]svg.Point {
     const out = try arena.alloc(svg.Point, pts.len);
     for (pts, 0..) |p, i| out[i] = .{ .x = p.x, .y = p.y };
@@ -476,7 +411,6 @@ fn statusOf(statuses: []const artifact.ProxyRecord, name: []const u8) ?artifact.
 }
 
 /// Usable proxies by sustained throughput descending, then failed, then skipped.
-/// A failure never outranks a real result just because it has no number.
 fn rank(
     arena: Allocator,
     present: []report.ProxyData,
@@ -525,9 +459,7 @@ fn card(
     _ = try svg.chart(out, opts, conv);
     try out.print("<div class=\"tooltip\" id=\"tip-{s}\" hidden></div></div>", .{opts.id});
 
-    // The synthetic y=x diagonal is excluded from the hover data: its value at
-    // any x is just x, already shown in the header. `conv` above still carries
-    // it (drawn as the dashed reference line), so filter separately here.
+    // The synthetic y=x diagonal is drawn but excluded from hover data.
     var hover_n: usize = 0;
     for (series) |s| {
         if (!s.ref) hover_n += 1;
@@ -543,11 +475,8 @@ fn card(
     try out.writeAll("</section>");
 }
 
-/// The distribution chart: `svg.histChart` plus the same hover-tooltip
-/// wiring `card` gives the line charts, adapted for a LOG x-axis (percentile,
-/// as n = 1/(1-p)) and a single series instead of several named ones —
-/// `report.js` has its own small handler for this shape, distinguished by the
-/// `data-hist` attribute on the hover-capture rect rather than `data-chart`.
+/// The distribution chart: `svg.histChart` plus hover wiring for its log x-axis
+/// (handled by `report.js` via `data-hist`).
 fn histCard(arena: Allocator, out: *Writer, name: []const u8, pts: []const analysis.Point) !void {
     const conv = try toSvgPoints(arena, pts);
 
@@ -555,11 +484,8 @@ fn histCard(arena: Allocator, out: *Writer, name: []const u8, pts: []const analy
     _ = try svg.histChart(out, name, conv);
     try out.print("<div class=\"tooltip\" id=\"tip-hist-{s}\" hidden></div></div>", .{name});
 
-    // `decades` here must match svg.histChart's OWN internal computation
-    // exactly — it defines the log-x scale report.js needs to invert to find
-    // the nearest point under the cursor. Duplicated rather than threaded
-    // back out of histChart, matching how `card` above already recomputes
-    // `xmax`/ticks itself instead of getting them back from `svg.chart`.
+    // `decades` must match svg.histChart's own computation exactly, or
+    // report.js inverts the log-x scale wrongly.
     var max_n: f64 = 1;
     for (conv) |p| max_n = @max(max_n, p.x);
     const decades = @max(1.0, @ceil(std.math.log10(max_n)));
@@ -594,8 +520,7 @@ test "a failed proxy renders no numbers and names its stage" {
     var present = [_]report.ProxyData{.{
         .name = "haproxy",
         .rows = &.{},
-        // Even with a nonzero sustained recorded, a failed proxy must not
-        // publish it — that is precisely the zeros-look-like-data failure.
+        // A failed proxy must not publish a recorded sustained value.
         .sustained = 12345,
         .hist = null,
         .dist_hist = null,
@@ -759,8 +684,7 @@ test "the chart data blob is well-formed JSON built through jsonw, not string co
 }
 
 test "the page carries no external font imports" {
-    // On a public Pages site an @import would send every viewer's address to a
-    // third party, and a Discord attachment must render offline.
+    // No @import: it would leak viewer addresses and break offline rendering.
     try std.testing.expect(std.mem.indexOf(u8, css, "@import") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, "fonts.googleapis.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, "fontshare.com") == null);
@@ -811,15 +735,13 @@ test "the report names the build each number came from" {
     });
     const s = out.buffered();
 
-    // The version that answered, and the commit that produced it — a number
-    // without its build is not reproducible.
+    // The version that answered, and its commit.
     try std.testing.expect(std.mem.indexOf(u8, s, "zoxy 0.0.5") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "@03308bfe3") != null);
     // Short sha in the table; the full one stays in profile.json.
     try std.testing.expect(std.mem.indexOf(u8, s, "03308bfe33d2a0239cf2e40fe28e6a78686bb634") == null);
 
-    // EVERY note reaches the page. Both of these used to be dropped: notes
-    // rendered only on `degraded` and only the first one.
+    // EVERY note reaches the page, not just the first or only on `degraded`.
     try std.testing.expect(std.mem.indexOf(u8, s, "STALE BUILD") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "compiled for this host's CPU with SIMD") != null);
 }
@@ -841,8 +763,7 @@ test "an ok proxy's notes are rendered too, not only a degraded one's" {
         .p99 = &.{},
         .shed_raw = &.{},
     }};
-    // The exact case that was invisible: suite.zig records the SIMD-parity note
-    // because it "must travel WITH the numbers", and the proxy is perfectly ok.
+    // An ok proxy's note must still render.
     const statuses = [_]artifact.ProxyRecord{.{
         .name = "zoxy",
         .status = .ok,
@@ -869,8 +790,7 @@ test "an ok proxy's notes are rendered too, not only a degraded one's" {
 
 test "a version banner is shortened to the version" {
     var buf: [128]u8 = undefined;
-    // Every one of these is real output, captured from the images compose.yaml
-    // pins. Rendered verbatim they are 67 and 88 characters wide.
+    // Real output from the images compose.yaml pins.
     try std.testing.expectEqualStrings(
         "3.0.25",
         shortVersion(&buf, "HAProxy version 3.0.25-eb573a937 2026/07/03 - https://haproxy.org/"),
@@ -886,9 +806,7 @@ test "a version banner is shortened to the version" {
 }
 
 test "version shortening does not mistake a sha or a date for a version" {
-    // The two digit-bearing decoys that sit next to the real version in these
-    // banners. envoy's leading sha has no dots; haproxy's date is split into
-    // 2026 / 07 / 03 by the same separators and none of those has dots either.
+    // Decoys: envoy's sha and haproxy's split date have no dots.
     try std.testing.expect(versionToken("14197ab296e1a276facff37b918d62794f0cf48c") == null);
     try std.testing.expect(versionToken("2026") == null);
     try std.testing.expect(versionToken("07") == null);
@@ -896,14 +814,12 @@ test "version shortening does not mistake a sha or a date for a version" {
     try std.testing.expect(versionToken("") == null);
 
     try std.testing.expectEqualStrings("1.33.14", versionToken("1.33.14").?);
-    // A build tag is dropped — the release is what a reader compares.
     try std.testing.expectEqualStrings("3.0.25", versionToken("3.0.25-eb573a937").?);
 }
 
 test "an unrecognised version format is truncated, never dropped" {
     var buf: [128]u8 = undefined;
-    // A proxy added later that prints something with no dotted version in it.
-    // Losing the shortening is cosmetic; losing the version is not.
+    // No dotted version: fall back to the raw text.
     const raw = "some-proxy built from an unusual banner with no version number";
     const got = shortVersion(&buf, raw);
     try std.testing.expect(got.len > 0);
@@ -951,7 +867,7 @@ test "the full version survives as a hover title, and cannot break out of it" {
     });
     const s = out.buffered();
 
-    // Short in the cell, full in the title — nothing is lost to the shortening.
+    // Short in the cell, full in the title.
     try std.testing.expect(std.mem.indexOf(u8, s, ">3.0.25<") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "title=\"HAProxy version") != null);
     // The quote inside the version must not be able to close the attribute.
@@ -964,10 +880,8 @@ test "every row carries a provenance line, so none is shorter than its neighbour
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The mix that makes the table uneven: one proxy's version probe came back
-    // and the other's did not. Without a line on both, one row is a line
-    // shorter than the other. (`direct` used to be the guaranteed no-version
-    // row; a failed probe is the case that remains.)
+    // One proxy's version probe succeeded, the other's did not; both rows
+    // must still be one line.
     var present = [_]report.ProxyData{
         .{
             .name = "haproxy",
@@ -1016,9 +930,9 @@ test "every row carries a provenance line, so none is shorter than its neighbour
     });
     const s = out.buffered();
 
-    // One `.prov` per data row — two rows, two lines.
+    // One `.prov` per data row.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "class=\"prov\""));
-    // The unprobed one says so with a dash rather than sitting blank.
+    // The unprobed one shows a dash.
     try std.testing.expect(std.mem.indexOf(u8, s, "—</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, ">3.0.25<") != null);
 }

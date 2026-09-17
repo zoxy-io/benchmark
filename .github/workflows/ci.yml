@@ -1,26 +1,9 @@
-# CI — the gate the nightly is not.
-#
-# Until this existed, the ONLY thing that ever compiled `bench` was
-# nightly.yml: a 150-minute job that provisions six VMs before it finds out
-# whether the harness builds. A broken push therefore cost a night, and the
-# repo's history is full of the class of bug that costs one — a segfault that
-# reproduces only in the ReleaseFast static-musl binary CI actually ships
-# (d4ad5fa), an unbounded connect that hung whole runs (845a2e3), a TLS write
-# that never reached the wire (db77dd7).
-#
-# So the ordering principle here is: run the SAME commands the nightly runs, as
-# early as they can be run, on the cheapest thing that can run them.
-#
-#   check  — fmt, unit tests, and the nightly's exact cross-compile. ~2 min.
-#   config — compose/terraform/workflow syntax, which a Zig build cannot see.
-#   smoke  — the whole suite end-to-end against this runner's own docker.
-#
-# `smoke` is the one that catches what unit tests structurally cannot: 2 527
-# lines of suite.zig are compose bring-up, warm probes, container inspection and
-# teardown, and none of that has a unit test because none of it is a pure
-# function. It runs the `smoke` profile (bench/src/profile.zig) — a real ramp
-# sized for a shared runner — against nginx and haproxy, the two proxies whose
-# images are stock and need no `docker build`.
+# CI: run the nightly's own commands early and cheaply, so a broken push does
+# not cost a night.
+#   check  — fmt, unit tests, and the nightly's exact cross-compile.
+#   config — compose/terraform/workflow syntax.
+#   smoke  — the suite end-to-end (profile.zig `smoke`) on local docker,
+#            against the stock nginx and haproxy images.
 
 name: ci
 
@@ -33,9 +16,7 @@ on:
 permissions:
   contents: read
 
-# A second push to the same branch makes the first one's answer irrelevant.
-# main is exempt: every commit there is a candidate for the next nightly, so
-# each one gets its own verdict.
+# Cancel superseded runs, except on main: every main commit gets a verdict.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -48,40 +29,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pinned to the same version nightly.yml and publish.yml install. Three
-      # copies of this string is two too many, but a composite action would be
-      # a fourth file to keep in sync — the tests below are what actually
-      # notice a drift, because 0.16 is a hard `minimum_zig_version` in
-      # build.zig.zon.
+      # Same Zig version as nightly.yml and publish.yml (hard minimum in
+      # build.zig.zon).
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      # Cheapest check first, and the only one that was failing when this file
-      # was written (5 files, a 205-line diff).
       - name: zig fmt
         working-directory: bench
         run: zig fmt --check build.zig src
 
-      # Debug build, host target. Two tests in remote.zig call
-      # `std.os.linux.kill` directly and die with SIGSYS anywhere but Linux —
-      # which is why the whole suite has to run HERE and not only on a
-      # contributor's machine.
+      # Must run on Linux: remote.zig tests call `std.os.linux.kill`.
       - name: zig build test
         working-directory: bench
         run: zig build test --summary all
 
-      # Byte-for-byte the command in nightly.yml's "Build bench" step. Not an
-      # approximation of it: -Dcpu is load-bearing (a named target alone means a
-      # BASELINE cpu, and `bench` embeds the load generator), and ReleaseFast is
-      # the mode whose miscompiles do not reproduce in Debug.
+      # Must match nightly.yml's "Build bench" exactly: -Dcpu matters (a named
+      # target alone is baseline), and ReleaseFast miscompiles don't show in
+      # Debug.
       - name: Build bench (static x86_64-linux-musl, as the nightly does)
         working-directory: bench
         run: zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3 -Doptimize=ReleaseFast
 
-      # A static binary that turns out to be dynamically linked would fail on
-      # the loadgen VM, hours later, with no toolchain there to diagnose it.
+      # A dynamic binary would only fail later, on the loadgen VM.
       - name: Assert the artifact is a static ELF
         run: |
           set -euo pipefail
@@ -92,11 +63,8 @@ jobs:
             *) echo "::error::bench is not a static x86_64 ELF: $out"; exit 1 ;;
           esac
 
-      # The runner is x86_64 Linux, so the cross-compiled artifact runs here
-      # directly. `bench` with no arguments must print usage and exit 2, per
-      # CONTRACT.md's exit-code table — which also proves the ReleaseFast musl
-      # binary reaches `main` at all. The segfault in d4ad5fa did not, and
-      # reproduced in NO other build mode.
+      # No args must exit 2 (CONTRACT.md); also proves the ReleaseFast musl
+      # binary reaches `main` (d4ad5fa did not).
       - name: Exit codes match CONTRACT.md
         run: |
           set -euo pipefail
@@ -117,14 +85,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Every profile, and the cloud overlay on top. A typo in a service the
-      # nightly runs but `make local` does not is otherwise found at 03:00 by a
-      # fleet that has already been paid for.
-      #
-      # The variables below are the ones envPrefix() supplies at run time
-      # (suite.zig). Their values are irrelevant to `config`; their PRESENCE is
-      # what stops compose interpolating them to empty and validating a file
-      # nobody runs.
+      # Every profile plus the cloud overlay. The env vars mirror envPrefix()
+      # (suite.zig) so compose does not interpolate them to empty.
       - name: docker compose config
         env:
           PROXY_PORT: "18080"
@@ -152,10 +114,7 @@ jobs:
           tofu_version: 1.12.3
           tofu_wrapper: false
 
-      # `-backend=false` because there is no remote state to reach and no
-      # credential here to reach it with — the nightly's state is per-run and
-      # lives in the runner workspace. `validate` still needs the providers,
-      # which is what init installs.
+      # No remote state or credential here; init still installs providers.
       - name: tofu fmt + validate
         working-directory: cloud
         run: |
@@ -164,8 +123,6 @@ jobs:
           tofu init -backend=false -input=false
           tofu validate
 
-      # The workflows are the least-tested code in the repo: nightly.yml is 631
-      # lines that run once a night and cannot be run any other way.
       - name: actionlint
         uses: raven-actions/actionlint@v2
         with:
@@ -174,8 +131,7 @@ jobs:
   smoke:
     name: local suite end-to-end
     runs-on: ubuntu-24.04
-    # The suite bounds itself (deadline.turn, the ProxyWatchdog), so this is a
-    # backstop for the runner wedging, not the primary bound.
+    # Backstop only; the suite bounds itself.
     timeout-minutes: 25
     needs: check
     steps:
@@ -188,22 +144,13 @@ jobs:
 
       - run: chmod +x bin/bench
 
-      # zrk opens one socket per connection and the suite asserts the fd limit
-      # before ramping (ramp.assertFdLimit). 50 connections is far inside the
-      # default, but the origin pool plus compose plus cAdvisor share this
-      # process table.
+      # The suite asserts the fd limit before ramping (ramp.assertFdLimit).
       - name: Raise the fd limit
         run: ulimit -n 65536 && ulimit -n
 
-      # nginx and haproxy ONLY, deliberately:
-      #   - both are stock upstream images, so nothing is compiled here (zoxy
-      #     ~179s, pingora ~469s — they belong to the nightly, which has a
-      #     shared image cache; a PR gate does not);
-      #   - zoxy additionally needs io_uring through a custom seccomp profile,
-      #     which is exactly the kind of runner-environment dependency that
-      #     turns a gate into a flake.
-      # What this covers is the harness, not the proxies: bring-up, the warm
-      # probe, the ramp, cAdvisor identity, teardown, artifact writing.
+      # nginx and haproxy only: stock images (no compile), and zoxy's io_uring
+      # seccomp profile would make the gate flaky. Covers the harness, not the
+      # proxies.
       - name: bench suite --local --profile smoke
         run: |
           set -euo pipefail
@@ -213,26 +160,15 @@ jobs:
       - name: bench report
         run: ./bin/bench report "results/ci-${{ github.run_id }}/smoke" --profile smoke
 
-      # `index` and `notify --dry-run` are the two rendering paths the nightly
-      # runs that `report` does not, and neither needs a credential. --dry-run
-      # prints the payload instead of posting, so no webhook is involved.
+      # The nightly's other rendering paths; --dry-run posts nothing.
       - name: bench index + notify --dry-run
         run: |
           set -euo pipefail
           ./bin/bench index "results/ci-${{ github.run_id }}" --out _site
           ./bin/bench notify "results/ci-${{ github.run_id }}" --dry-run
 
-      # A report that renders is not the same as a report with numbers in it. A
-      # proxy that never served a request still produces a file — and a turn
-      # that served every request but lost its CPU/memory still produces a
-      # report with a dash in the memory column.
-      #
-      # Both are checked, and both are fatal. `status: degraded` is the
-      # suite's own verdict on a turn whose record is incomplete; letting it
-      # pass here would mean this job's comment claims to cover "cAdvisor
-      # identity" while a run with zero cAdvisor samples goes green. That is
-      # precisely how the chunked-body bug survived: recorded honestly every
-      # time, and never once failing anything.
+      # A rendered report can still be empty. Both missing proxies and
+      # `status: degraded` turns are fatal, so missing cAdvisor data fails CI.
       - name: The run actually measured something
         run: |
           set -euo pipefail
@@ -248,8 +184,7 @@ jobs:
 
           bad = []
 
-          # report.json lists only proxies that produced artifacts, so a missing
-          # name here means that proxy's turn never got as far as a ramp.
+          # A proxy missing from report.json never reached a ramp.
           proxies = report.get("proxies") or []
           names = sorted(p.get("name") for p in proxies)
           print("proxies in report:", names)
@@ -262,7 +197,7 @@ jobs:
               if not p.get("sustained"):
                   bad.append(f"{p['name']} sustained no load — the ramp did not run")
 
-          # The suite's own per-turn verdict. `notes` says what it objected to.
+          # The suite's own per-turn verdict; `notes` says why.
           for name, t in sorted((profile.get("proxies") or {}).items()):
               print(f"  {name}: status={t.get('status')} "
                     f"cadvisor_samples={t.get('cadvisor_samples')} notes={t.get('notes')}")
@@ -276,9 +211,7 @@ jobs:
           print("all turns ok")
           PY
 
-      # The artifacts are the whole point of a failure here: profile.json says
-      # which stage each proxy died in, and the ndjson says whether the ramp
-      # ever produced a window.
+      # profile.json shows which stage each proxy died in.
       - uses: actions/upload-artifact@v4
         if: always()
         with:

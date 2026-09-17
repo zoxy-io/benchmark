@@ -1,11 +1,6 @@
-# Pingora is a framework, not a ready-made proxy — we build a tiny L7 (HTTP/1.1
-# reverse-proxy) binary on it (src/main.rs). Pinned Rust for reproducibility;
-# the Pingora version lives in Cargo.toml. Build deps cover both TLS backends
-# pingora may pull (openssl via libssl-dev/pkg-config, boringssl via
-# cmake/clang) so the crate resolves regardless of the default feature. That
-# backend is load-bearing now rather than incidental: main.rs binds a TLS
-# listener with `add_tls`, so a build that resolved to no TLS backend fails
-# here — at build time, on every run — instead of at the first TLS ramp.
+# Minimal HTTP/1.1 reverse proxy built on Pingora (src/main.rs).
+# Build deps cover both TLS backends; main.rs uses `add_tls`, so a missing
+# backend fails here at build time rather than at the first TLS ramp.
 FROM rust:1.85-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -14,23 +9,11 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
-# NATIVE by default from compose, which passes PINGORA_TARGET_CPU=native — zoxy
-# and pingora are both built for the host CPU because that is how they ship, and
-# measuring a baseline build would measure something no user runs. The ARG
-# default below is only what a bare `docker build` with no compose gets.
-#
-# haproxy is the stock upstream image and stays a generic x86-64 build, so this
-# comparison is NOT CPU-matched. That asymmetry is deliberate and recorded: the
-# effective model goes into /etc/pingora/build-info, `bench suite` reads it into
-# profile.json, and each SIMD-built proxy gets a note saying the stock images it
-# is compared against are generic builds.
-#
-# It is also part of the image cache key (bench-image-cache), because a `native`
-# build is only valid on the model that produced it.
+# compose passes PINGORA_TARGET_CPU=native (how it ships); this default is for
+# bare `docker build`. Not CPU-matched with stock haproxy: recorded in
+# build-info -> profile.json. Part of the bench-image-cache key.
 ARG PINGORA_TARGET_CPU=x86-64
-# Recorded for the same reason zoxy records its target: the comparison is only
-# fair if both were built for the same CPU, and that has to be checkable from the
-# run's artifacts rather than inferred from a Dockerfile.
+# Recorded so the build target is checkable from run artifacts.
 RUN RUSTFLAGS="-C target-cpu=${PINGORA_TARGET_CPU}" cargo build --release \
     && strip target/release/pingora-http \
     && echo "release target-cpu=${PINGORA_TARGET_CPU}" > /pingora-build

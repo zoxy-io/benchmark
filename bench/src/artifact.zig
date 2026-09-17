@@ -1,20 +1,8 @@
-//! `profile.json` — one profile's record of what actually happened.
+//! `profile.json`: one profile's record of what actually happened.
 //!
-//! Replaces the old `meta.json`, and fixes two defects in it.
-//!
-//! **Presence stopped meaning success.** report.py derived the proxy list purely
-//! from `meta["runs"]` membership, and zrk-bench.sh added an entry
-//! unconditionally — even when the ramp exited non-zero and even when every
-//! result file failed to copy back. A proxy that never produced a byte of data
-//! therefore rendered as a plausible row of zeros, indistinguishable from one
-//! that genuinely served nothing. Status here is explicit and four-valued.
-//!
-//! **Writes stopped being destructive.** zrk-bench.sh truncated meta.json at the
-//! start of every invocation, so re-running a subset of proxies into an existing
-//! run id erased the others' entries; their data files survived on disk but
-//! became invisible to the report. `upsert` merges into whatever is already
-//! there, and writes via a temp file plus rename, so a suite that dies midway
-//! leaves every completed proxy intact.
+//! Status is explicit, so a proxy that produced no data never renders as
+//! zeros. `upsert` merges and writes via temp file plus rename, so re-runs and
+//! mid-suite deaths never erase other proxies' entries.
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,30 +16,25 @@ const Allocator = std.mem.Allocator;
 pub const Status = enum {
     /// Ran to completion and the numbers are usable.
     ok,
-    /// Produced usable but incomplete data — a truncated ramp that still covered
-    /// enough of the offered range, or a run whose cAdvisor samples are missing.
-    /// Rendered with a warning rather than silently.
+    /// Usable but incomplete (truncated ramp, missing cAdvisor samples);
+    /// rendered with a warning.
     degraded,
     /// Attempted and did not produce usable data.
     failed,
-    /// Never attempted, because something earlier made the attempt meaningless
-    /// (a failed build, or a proxy host left in an unknown state).
+    /// Never attempted (e.g. a failed build or a host in an unknown state).
     skipped,
 
     pub fn str(self: Status) []const u8 {
         return @tagName(self);
     }
 
-    /// Whether this proxy's numbers may be drawn on a chart or ranked in the
-    /// summary table.
+    /// Whether the numbers may be charted or ranked.
     pub fn usable(self: Status) bool {
         return self == .ok or self == .degraded;
     }
 };
 
-/// Which step a proxy was on when it failed. Named in the report and the Discord
-/// post, because "haproxy failed" is far less actionable than "haproxy never
-/// answered its warm probe".
+/// Which step a proxy was on when it failed, named in the report and Discord.
 pub const Stage = enum {
     build,
     start,
@@ -80,81 +63,40 @@ pub const ProxyRecord = struct {
     deadline_errors: u64 = 0,
     status_errors: u64 = 0,
     socket_errors: u64 = 0,
-    /// Latency pegged at zrk's histogram ceiling: every tail percentile is the
-    /// clamp value, so the report must say "saturated" rather than print one.
+    /// Latency pegged at zrk's histogram ceiling; report "saturated", not a
+    /// value.
     saturated: bool = false,
     cadvisor_samples: usize = 0,
-    /// What the running proxy says it is — `haproxy -v`, `envoy --version`,
-    /// `zoxy --version`, or the image reference for one with no version CLI.
-    ///
-    /// Every number this harness publishes is a claim about a specific build of
-    /// a specific proxy, and the version was the one part of that claim nothing
-    /// recorded. An image tag in compose.yaml is what was ASKED for; this is
-    /// what answered, read out of the container that actually served the ramp.
+    /// What the running proxy says it is (`haproxy -v`, `envoy --version`,
+    /// `zoxy --version`, or the image reference). Read from the container that
+    /// served the ramp, not the tag compose.yaml asked for.
     version: ?[]const u8 = null,
-    /// Resolved commit of the running zoxy image, for zoxy only. Recorded
-    /// because the Dockerfile caches its git clone, so a floating ref can
-    /// silently be an older commit than requested.
+    /// Resolved commit of the running zoxy image (zoxy only). The Dockerfile
+    /// caches its clone, so a floating ref can be stale.
     zoxy_commit: ?[]const u8 = null,
-    /// The ref the build resolved to — a release tag (`v0.0.9`) by default, a
-    /// branch or sha on the source path — and what that ref pointed at when the
-    /// build ran, resolved independently from GitHub rather than from the
-    /// image. Never the literal `release`: that is a request, and the report
-    /// has to name the thing measured.
-    ///
-    /// Together with `zoxy_commit` these make the freshness of the nightly
-    /// CHECKABLE instead of merely intended. On the source path the trend
-    /// chart's premise is that each night measures whatever main is that night,
-    /// and a build that silently reused a cached clone would keep reporting a
-    /// frozen commit as "main" — the chart reading as stability rather than as
-    /// a stuck build. `zoxy_commit != zoxy_ref_sha` is exactly that failure,
-    /// and it degrades the record rather than passing quietly.
+    /// The ref the build resolved to (never the literal `release`) and its sha
+    /// resolved from GitHub. `zoxy_commit != zoxy_ref_sha` means a stale cached
+    /// build and degrades the record.
     zoxy_ref: ?[]const u8 = null,
     zoxy_ref_sha: ?[]const u8 = null,
-    /// How the image was compiled — optimisation mode and target CPU, read from
-    /// the image's own /etc/<proxy>/build-info.
-    ///
-    /// The comparison is only fair if every proxy was built for the same CPU.
-    /// zoxy falls back to a BASELINE target when the build and target
-    /// architectures differ, while pingora always builds `target-cpu=native`;
-    /// that mismatch would handicap zoxy by a wide margin and leave no trace
-    /// anywhere, since the run completes and the report renders normally.
+    /// Optimisation mode and target CPU, from /etc/<proxy>/build-info. Fairness
+    /// needs the same CPU target: zoxy can fall back to a baseline target while
+    /// pingora builds `target-cpu=native`.
     build_info: ?[]const u8 = null,
-    /// Access-log lines zoxy DROPPED during the ramp, for zoxy only. `null`
-    /// everywhere else, and on zoxy when the counter could not be read.
-    ///
-    /// Every proxy here access-logs every request, and they disagree about what
-    /// to do when the sink cannot keep up: nginx, haproxy and pingora write once
-    /// per request and wear the cost, envoy buffers and flushes on a timer, and
-    /// zoxy drops the line rather than stall its event loop. Dropping is
-    /// CHEAPER than writing, so a zoxy that quietly discarded a tenth of its log
-    /// lines would post a throughput number the others were not allowed to
-    /// earn. This is the count that makes that visible; zero means the
-    /// comparison is clean.
+    /// Access-log lines zoxy dropped during the ramp (zoxy only; null if
+    /// unreadable). Dropping is cheaper than writing, so nonzero means an
+    /// unfair advantage; zero means the comparison is clean.
     access_log_dropped: ?u64 = null,
-    /// Connections zoxy REFUSED for want of a TLS session slot, on a TLS
-    /// profile. `null` for every other proxy, on every plaintext profile (zoxy
-    /// has no TLS listener then, so the metric is absent rather than zero), and
-    /// when the counter could not be read.
-    ///
-    /// zoxy preallocates one TLS engine per admitted connection and sheds past
-    /// the pool; the other four allocate per connection and have no such
-    /// ceiling. The TLS profiles size the pool to `conn_slots` so this stays
-    /// zero — a nonzero value means the ramp measured that cap rather than
-    /// zoxy's TLS, the same way `zoxy_shed_upstream_slots` would mean it
-    /// measured the upstream pool.
+    /// Connections zoxy refused for want of a TLS session slot. Null for other
+    /// proxies, plaintext profiles, or an unreadable counter. Nonzero means the
+    /// ramp measured the pool cap (`conn_slots`) rather than zoxy's TLS.
     shed_tls_engines: ?u64 = null,
     notes: []const []const u8 = &.{},
 };
 
-/// Which fleet produced a profile's numbers.
-///
-/// Recorded rather than inferred, because a `local` run is not comparable to a
-/// `cloud` one and the difference is invisible in the numbers themselves: the
-/// generator shares CPU and memory bandwidth with the proxy, and loopback
-/// removes a network ceiling the cloud baseline sits near. Everything
-/// downstream keys off this — the report banners it, and the trend chart
-/// refuses to plot it.
+/// Which fleet produced a profile's numbers. A `local` run is not comparable
+/// to `cloud` (shared CPU, no network ceiling); the report banners it and the
+/// trend refuses to plot it.
 pub const Origin = enum {
     cloud,
     local,
@@ -173,10 +115,8 @@ pub const Profile = struct {
     proxies: []const ProxyRecord = &.{},
 };
 
-/// Serialize to `<dir>/profile.json`, atomically.
-///
-/// The IP check is not belt-and-braces: this file is published, and the record
-/// it replaces carried the loadgen's public address in every run.
+/// Serialize to `<dir>/profile.json`, atomically. This file is published, so
+/// it must pass the IP check.
 pub fn write(gpa: Allocator, io: Io, dir: []const u8, p: Profile) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -221,9 +161,7 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.key("finished");
     try j.string(p.finished);
 
-    // The full ramp configuration, recorded rather than assumed. Comparing runs
-    // with different ramp parameters is meaningless, so a report must be able to
-    // prove which ones produced it.
+    // Full ramp configuration: runs with different ramps are not comparable.
     try j.key("ramp");
     try j.beginObject();
     try j.key("start_rate");
@@ -242,10 +180,7 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.int(@intCast(p.prof.deadline_ms));
     try j.key("req_path");
     try j.string(p.prof.req_path);
-    // The transport the load was offered over. Additive, and recorded for the
-    // same reason every other ramp parameter is: two runs whose numbers differ
-    // by a factor should not require reading the profile's NAME to find out
-    // that one of them terminated TLS.
+    // Transport, recorded like every other ramp parameter.
     try j.key("tls");
     try j.boolean(p.prof.tls);
     try j.key("ref_rate");
@@ -254,8 +189,7 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.float(p.prof.ref_band, 4);
     try j.endObject();
 
-    // Per-profile proxy tuning, so a reader can tell a measurement of zoxy from
-    // a measurement of zoxy's admission cap.
+    // Per-profile proxy tuning, e.g. to tell zoxy from its admission cap.
     try j.key("proxy_config");
     try j.beginObject();
     for (p.prof.proxy_env) |kv| {
@@ -390,8 +324,6 @@ test "render distinguishes a failed proxy from one that served nothing" {
     });
 
     const s = w.buffered();
-    // The old meta.json could not express any of this — the proxy simply
-    // appeared, with zeros.
     try std.testing.expect(std.mem.indexOf(u8, s, "\"status\":\"failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"stage\":\"warm\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"error\":\"no 200 after 30 attempts\"") != null);
@@ -402,9 +334,8 @@ test "render records c10k's ramp settings so a reader can tell the profiles apar
     var w: std.Io.Writer = .fixed(&buf);
     try render(&w, .{ .runid = "r", .prof = profile.c10k, .started = "t" });
     const s = w.buffered();
-    // Both guards are off at c10k (see profile.zig). Recording the zeroes is the
-    // point: a reader comparing two runs has to be able to see that this one had
-    // no deadline, because that decides whether the tail is a value or a floor.
+    // Both guards are off at c10k (see profile.zig); the zeroes must be
+    // recorded, since they decide whether the tail is a value or a floor.
     try std.testing.expect(std.mem.indexOf(u8, s, "\"deadline_ms\":1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"timeout_s\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"connections\":10000") != null);

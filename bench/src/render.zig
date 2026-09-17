@@ -1,8 +1,5 @@
-//! CLI plumbing plus the `report`/`index`/`notify` commands — the subset that
-//! `bench-publish` builds standalone, without the fleet orchestration path
-//! (`suite`/`remote`/`ramp`/`ycs`) or the `zio` dependency those pull in.
-//! `main.zig` wires these into the full `bench` CLI alongside `suite`/`wait`/
-//! `fetch`/`ramp`; `publish_main.zig` wires only these three.
+//! CLI plumbing plus the `report`/`index`/`notify` commands: the subset
+//! `bench-publish` builds standalone, without the fleet path or `zio`.
 
 const std = @import("std");
 
@@ -22,11 +19,9 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-/// Every flag in this CLI that is checked with `hasFlag` rather than read with
-/// `flagValue` — i.e. every flag `positional` must NOT treat as consuming the
-/// argument after it. A flag added to a `hasFlag` call site anywhere but not to
-/// this list is silently misparsed: `positional` would treat whatever follows
-/// it as ITS value and skip past a real positional argument.
+/// Every flag checked with `hasFlag` rather than `flagValue`. A `hasFlag` flag
+/// missing here is misparsed: `positional` would treat the next arg as its
+/// value.
 const valueless_flags = [_][]const u8{ "--dry-run", "--local" };
 
 fn isValueless(name: []const u8) bool {
@@ -115,20 +110,16 @@ pub fn cmdIndex(init: std.process.Init, args: []const [:0]const u8) !void {
         runid,
         try flagValue(args, "--out") orelse "_site",
         try flagValue(args, "--history") orelse "",
-        // A full URL rather than a bucket name: it keeps `bench` ignorant of
-        // the storage endpoint, which nothing else in this binary knows either
-        // (`bench-publish` does not link ycs.zig), and lets a fork host the
-        // archive wherever it likes.
+        // A full URL, not a bucket name: `bench` stays ignorant of the storage
+        // endpoint and forks can host the archive anywhere.
         try flagValue(args, "--results-url") orelse "",
     ));
 }
 
 /// `bench report <rundir> [--profile <name>] [--generated <iso>]`
 ///
-/// Reads the run's own artifacts and writes report.json beside them. During the
-/// migration this also accepts the legacy meta.json written by
-/// scripts/zrk-bench.sh, so the port can be diffed against report/report.py on
-/// runs that already exist — the Phase 0 gate.
+/// Writes report.json beside the run's artifacts. Also accepts legacy
+/// meta.json from scripts/zrk-bench.sh, for diffing against report/report.py.
 pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -167,14 +158,9 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
 
     try prof.validate();
 
-    // profile.json is what `bench suite` writes; meta.json is the bash
-    // harness's, kept working so archived run dirs still render.
-    //
-    // Neither present is the ordinary shape of a truncated run — the profile
-    // never got far enough to write one — so say that, with the path. A bare
-    // `error: FileNotFound` sent me looking for a corrupt artifact when the
-    // directory simply was not there, and it names neither the file nor the
-    // fact that `<dir>` must be the PROFILE directory, not the run directory.
+    // profile.json from `bench suite`, or legacy meta.json. Neither usually
+    // means a truncated run, or `<dir>` is not the PROFILE directory: say so,
+    // with the path.
     const meta = readProfileMeta(arena, io, run_dir) catch
         readMeta(arena, io, run_dir) catch {
         std.debug.print(
@@ -190,9 +176,8 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     const inputs = try arena.alloc(report.ProxyInput, ordered.len);
     for (ordered, 0..) |name, k| {
         const tags = meta.tagsFor(name);
-        // cAdvisor samples replace the Prometheus CPU/memory queries. An
-        // archived run predates the poller and comes back empty, which the
-        // report renders as absent rather than as zero.
+        // An archived run predating the cAdvisor poller comes back empty,
+        // rendered as absent rather than zero.
         const cad = try report.loadCadvisor(
             arena,
             io,
@@ -207,17 +192,12 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     var g = try report.gather(gpa, arena, io, run_dir, inputs, prof.ref_rate, prof.ref_band);
     defer g.deinit();
 
-    // profile.json carries per-proxy status and which fleet produced the run; a
-    // legacy meta.json run dir has neither, in which case every present proxy is
-    // treated as ok and the run as a cloud one.
+    // A legacy meta.json run dir has no statuses or origin: every proxy is
+    // treated as ok and the run as cloud.
     const statuses = readStatuses(arena, io, run_dir) catch &.{};
     const origin = readOrigin(arena, io, run_dir);
 
-    // Built into memory first, like report.html below, so `assertNoIps` runs
-    // BEFORE anything reaches disk. This used to stream straight to the file —
-    // the only artifact in the whole harness that skipped the check at its own
-    // point of creation; the gap was closed only incidentally, whenever
-    // `copyFile` re-checked it during a Pages publish.
+    // Built in memory so `assertNoIps` runs before anything reaches disk.
     var jbuf: std.ArrayList(u8) = .empty;
     defer jbuf.deinit(gpa);
     var jw: std.Io.Writer.Allocating = .fromArrayList(gpa, &jbuf);
@@ -244,8 +224,7 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
     try fw.interface.writeAll(jw.written());
     try fw.interface.flush();
 
-    // The HTML draws from the SAME Gathered value the JSON was written from, so
-    // the two can never disagree about a number.
+    // HTML draws from the same Gathered value as the JSON.
     const html_path = try std.fmt.allocPrint(arena, "{s}/report.html", .{run_dir});
     const hfile = try std.Io.Dir.cwd().createFile(io, html_path, .{});
     defer hfile.close(io);
@@ -268,8 +247,7 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         .origin = origin,
     });
 
-    // This file is attached to a public Discord channel and served from a public
-    // Pages site. Refuse to write it rather than publish an address.
+    // Published on Discord and Pages: refuse to write an address.
     try redact.assertNoIps("report.html", pw.written());
 
     try hfw.interface.writeAll(pw.written());
@@ -292,9 +270,8 @@ const Meta = struct {
     }
 };
 
-/// Parse scripts/zrk-bench.sh's meta.json. Retained for the migration only;
-/// `bench suite` writes profile.json, which carries an explicit per-proxy status
-/// instead of making presence in a map mean "this proxy produced valid data".
+/// Parse scripts/zrk-bench.sh's meta.json. Migration only; presence in its map
+/// does not mean the proxy produced valid data.
 fn readMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
     const path = try std.fmt.allocPrint(arena, "{s}/meta.json", .{run_dir});
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(8 * 1024 * 1024));
@@ -321,8 +298,7 @@ fn readMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
         if (lg.items.len == 0) try lg.append(arena, "lg1");
         try tags.append(arena, try lg.toOwnedSlice(arena));
 
-        // The ramp is identical across proxies by construction — read it off
-        // whichever run we see first.
+        // The ramp is identical across proxies; read it from the first run.
         if (ramp_meta.start_rate == null) {
             if (run.get("start_rate")) |v| ramp_meta.start_rate = v.integer;
             if (run.get("max_rate")) |v| ramp_meta.max_rate = v.integer;
@@ -338,10 +314,8 @@ fn readMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
     };
 }
 
-/// Read a run dir written by `bench suite`. Its files are untagged
-/// (`<proxy>.ndjson`), and the proxy list is the profile.json `proxies` map —
-/// which, unlike the bash harness's meta.json, distinguishes a proxy that failed
-/// from one that served nothing.
+/// Read a run dir written by `bench suite`: untagged files, proxy list from
+/// profile.json's `proxies` map.
 fn readProfileMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !Meta {
     const path = try std.fmt.allocPrint(arena, "{s}/profile.json", .{run_dir});
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(8 * 1024 * 1024));
@@ -376,8 +350,7 @@ fn readProfileMeta(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) !M
     };
 }
 
-/// Which fleet produced this run. A legacy run dir predates the field, and
-/// every one of those came off the real fleet.
+/// Which fleet produced this run. Legacy run dirs all came off the real fleet.
 fn readOrigin(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) artifact.Origin {
     const path = std.fmt.allocPrint(arena, "{s}/profile.json", .{run_dir}) catch return .cloud;
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch
@@ -403,11 +376,8 @@ fn readStatuses(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) ![]ar
         const o = e.value_ptr.*.object;
         const status_str = if (o.get("status")) |v| v.string else "ok";
 
-        // Provenance — the version that answered, how it was built, and (for
-        // zoxy) which commit. All of this was already being RECORDED in
-        // profile.json and then dropped right here, so the report never saw
-        // it: the build-parity note that suite.zig writes because it "must
-        // travel WITH the numbers" reached no reader at all.
+        // Provenance: version, build info and (zoxy) commit, so the report
+        // shows what profile.json recorded.
         var notes: std.ArrayList([]const u8) = .empty;
         if (o.get("notes")) |v| {
             if (v == .array) {
@@ -436,9 +406,8 @@ fn readStatuses(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) ![]ar
     return out.toOwnedSlice(arena);
 }
 
-/// A string field of a profile.json proxy record, or null when it is absent or
-/// JSON `null` (every one of these is nullable by design — a stock image has no
-/// build descriptor, only zoxy has a commit).
+/// A string field of a profile.json proxy record, or null when absent or JSON
+/// `null`.
 fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = o.get(key) orelse return null;
     return if (v == .string) v.string else null;

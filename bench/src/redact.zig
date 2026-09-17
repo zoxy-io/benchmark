@@ -1,40 +1,24 @@
-//! The single choke point for keeping addresses out of anything that leaves the
-//! fleet.
-//!
-//! Every artifact this harness produces is published: report.html is attached to
-//! a public Discord channel and served from a public GitHub Pages site, and the
-//! raw run data goes up alongside it. The old harness leaked in several places
-//! at once — meta.json recorded the loadgen's public IP in its `prom` key,
-//! zrk's per-run summary embedded the proxy's private address in a `target.url`,
-//! and the driver printed both to stdout where they landed in any pasted
-//! terminal log.
-//!
-//! Rather than rely on remembering to strip addresses at each site, `assertNoIps`
-//! is called on every artifact before it is written and on the Discord body
-//! before it is posted. That turns "we were careful" into a checkable invariant
-//! with a test, and it fails the run rather than publishing.
+//! Keeps addresses out of published artifacts and logs. `assertNoIps` runs on
+//! every artifact before write and on the Discord body before post, failing
+//! the run rather than publishing a leak.
 
 const std = @import("std");
 
-/// Addresses registered for scrubbing from log output. Small and fixed: the
-/// three fleet members plus whatever an operator adds.
+/// Addresses registered for scrubbing from log output.
 var table: [16][]const u8 = undefined;
 var table_len: usize = 0;
 var table_buf: [16][64]u8 = undefined;
 
-/// Whether to emit GitHub Actions `::add-mask::` directives on `register`.
-/// Set once at startup from the environment rather than read here, so this
-/// module has no hidden dependency on process state.
+/// Whether `register` emits GitHub Actions `::add-mask::`. Set from main, not
+/// read from the environment here.
 var ci_masking = false;
 
 pub fn setCiMasking(on: bool) void {
     ci_masking = on;
 }
 
-/// Register an address so `log` scrubs it. Under CI this also emits GitHub
-/// Actions' `::add-mask::`, which makes the runner redact the value from every
-/// subsequent log line — including ones this module never sees, such as a child
-/// process's stderr.
+/// Register an address so `log` scrubs it. Under CI also emits `::add-mask::`,
+/// which covers output this module never sees (e.g. child stderr).
 pub fn register(addr: []const u8) void {
     if (addr.len == 0 or addr.len > 63) return;
     for (table[0..table_len]) |existing| {
@@ -47,8 +31,7 @@ pub fn register(addr: []const u8) void {
     table_len += 1;
 
     if (ci_masking) {
-        // GitHub masks the value in the add-mask line itself, so emitting it
-        // here does not leak it.
+        // GitHub masks the add-mask line itself, so this does not leak.
         std.debug.print("::add-mask::{s}\n", .{addr});
     }
 }
@@ -69,8 +52,8 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("{s}\n", .{scrub(&scrubbed, line)});
 }
 
-/// Replace each registered address with "<addr>". Returns a slice of `out`, or
-/// the input unchanged when nothing matched and no copy was needed.
+/// Replace each registered address with "<addr>". Returns `text` unchanged when
+/// nothing is registered.
 pub fn scrub(out: []u8, text: []const u8) []const u8 {
     if (table_len == 0) return text;
 
@@ -102,27 +85,20 @@ pub const IpLeak = struct {
 
 var last_leak: ?IpLeak = null;
 
-/// The offending match from the most recent `assertNoIps` failure, for building
-/// an error message. Only valid immediately after the error.
+/// The match from the last `assertNoIps` failure. Valid only right after it.
 pub fn lastLeak() ?IpLeak {
     return last_leak;
 }
 
 /// Fail if `text` contains anything shaped like an IPv4 address.
-///
-/// Deliberately blunt: it does not try to distinguish a private address from a
-/// public one, or an address from a version string, because the cost of a false
-/// positive (a developer adjusts one string) is far below the cost of a false
-/// negative (a published report carries a host address forever). Callers that
-/// legitimately contain dotted quads — there are none among the artifacts today
-/// — would need an explicit exemption rather than a looser check.
+/// Blunt on purpose (no private/public or version-string distinction): a false
+/// positive costs one string edit, a false negative a published address.
 pub fn assertNoIps(what: []const u8, text: []const u8) !void {
     last_leak = null;
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         if (!std.ascii.isDigit(text[i])) continue;
-        // Only consider a match at a token boundary, so the "1.2.3.4" inside
-        // "v1.2.3.4" is still caught but "10" in "x10" does not start a scan.
+        // Match only at a token boundary: "v1.2.3.4" is caught, "x10" isn't a start.
         if (i > 0 and (std.ascii.isDigit(text[i - 1]) or text[i - 1] == '.')) continue;
         if (matchDottedQuad(text[i..])) |len| {
             last_leak = .{ .offset = i, .text = text[i .. i + len] };
@@ -135,18 +111,9 @@ pub fn assertNoIps(what: []const u8, text: []const u8) !void {
     }
 }
 
-/// Replace every IPv4-shaped substring in `text` with a placeholder, without
-/// needing anything registered in advance.
-///
-/// `scrub` above only redacts addresses THIS process was told about via
-/// `register` — which works for `remote.zig`, which dials the fleet itself,
-/// but not for `bench wait`: it runs on the CI runner, relaying a log object
-/// the LOADGEN wrote on a different machine entirely, and the runner never
-/// learns the fleet's private addresses (PROXY_IP/BACKEND_IPS are documented as
-/// VM-side only in CONTRACT.md). This finds anything IP-shaped instead — the
-/// same blunt pattern `assertNoIps` already applies to artifacts, and that
-/// nightly.yml's own `sed` applies to `tofu`'s resource diff. Private or
-/// public, none of it belongs in a log a public Actions run relays.
+/// Replace every IPv4-shaped substring with "<addr>", with nothing registered.
+/// For `bench wait`, which relays loadgen logs on the runner and never learns
+/// the fleet's private addresses (see CONTRACT.md).
 pub fn scrubAnyIp(out: []u8, text: []const u8) []const u8 {
     var len: usize = 0;
     var i: usize = 0;
@@ -170,18 +137,9 @@ pub fn scrubAnyIp(out: []u8, text: []const u8) []const u8 {
     return out[0..len];
 }
 
-/// `scrubAnyIp` over a whole document, into `arena`.
-///
-/// The buffer-based form above stops at the end of its output buffer, so it can
-/// only be handed a bounded slice — which is right for a log LINE and wrong for
-/// a captured file, where the silent truncation would land mid-run with nothing
-/// saying so. This one grows instead, and works a line at a time for the same
-/// reason `logAnyIp` does.
-///
-/// The per-line scratch is the line's own length plus slack: a replacement can
-/// never be longer than what it replaces ("<addr>" is 6 bytes, the shortest
-/// dotted quad is 7), so the input length is already an upper bound and the
-/// slack is only there so that relation never has to be re-derived by a reader.
+/// `scrubAnyIp` over a whole document, into `arena`. Grows instead of silently
+/// truncating at a fixed buffer. "<addr>" (6) is never longer than a dotted
+/// quad (7+), so `line.len` bounds each line; the +8 is slack.
 pub fn scrubAnyIpAlloc(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -195,13 +153,9 @@ pub fn scrubAnyIpAlloc(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Print `text` a line at a time, each line scrubbed by `scrubAnyIp`.
-///
-/// Line-at-a-time, not the whole blob at once, for the same reason
-/// `remote.zig`'s `printScrubbed` is: `scrubAnyIp` stops at the end of its
-/// output buffer, so handing it an unbounded blob would silently drop
-/// everything past the first ~4KB. Reconstructs `text` exactly, including
-/// whether it ends with a trailing newline.
+/// Print `text` a line at a time, each scrubbed by `scrubAnyIp`. Per line
+/// because `scrubAnyIp` truncates at its buffer end. Preserves a trailing
+/// newline.
 pub fn logAnyIp(text: []const u8) void {
     var scrubbed: [4096]u8 = undefined;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -209,16 +163,14 @@ pub fn logAnyIp(text: []const u8) void {
     while (lines.next()) |line| {
         if (!first) std.debug.print("\n", .{});
         first = false;
-        // `scrub` can only grow a line (each address becomes a longer
-        // placeholder), so an over-long one is truncated rather than risked.
+        // Cap at half the buffer so the scrubbed line always fits.
         const safe = line[0..@min(line.len, scrubbed.len / 2)];
         std.debug.print("{s}", .{scrubAnyIp(&scrubbed, safe)});
     }
 }
 
-/// Length of a dotted quad at the start of `s`, or null. Each octet is 1-3
-/// digits with a value <= 255, and the match must not be followed by a digit or
-/// a dot (so a five-group version string is not mistaken for an address).
+/// Length of a dotted quad (octets 1-3 digits, <= 255) at the start of `s`, or
+/// null. A following digit or dot rejects the match (version strings).
 fn matchDottedQuad(s: []const u8) ?usize {
     var i: usize = 0;
     var octet: usize = 0;
@@ -262,10 +214,7 @@ test "scrubAnyIpAlloc removes every address and keeps the shape" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Copied verbatim from a captured nginx /tmp/error.log: three addresses on
-    // one line, in three different syntactic positions. A proxy's error log is
-    // the densest source of addresses this harness touches, which is why the
-    // capture is scrubbed rather than trusted.
+    // Verbatim nginx error.log line: three addresses in three positions.
     const captured =
         "2026/09/01 17:37:59 [error] 29#29: *19 connect() failed (113: Host is unreachable) " ++
         "while connecting to upstream, client: 192.168.97.1, server: , " ++
@@ -287,8 +236,7 @@ test "scrubAnyIpAlloc does not truncate a document past one line buffer" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Longer than `logAnyIp`'s 4 KiB scratch, which is the truncation this
-    // function exists to avoid.
+    // Longer than `logAnyIp`'s 4 KiB scratch.
     var long: std.ArrayList(u8) = .empty;
     for (0..400) |i| try long.print(arena, "line {d} from 10.0.0.13\n", .{i});
     const clean = try scrubAnyIpAlloc(arena, long.items);
@@ -331,9 +279,7 @@ test "scrub is a no-op when nothing is registered" {
 }
 
 test "scrubAnyIp catches an address with nothing registered" {
-    // The whole point: unlike `scrub`, this needs no prior `register` call —
-    // it is what `bench wait` uses on the runner, which never learns the
-    // fleet's addresses the way `remote.zig` (dialing them itself) does.
+    // Unlike `scrub`, needs no prior `register` (what `bench wait` relies on).
     reset();
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(

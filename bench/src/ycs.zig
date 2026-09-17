@@ -1,20 +1,9 @@
 //! Yandex Cloud access: Object Storage for artifacts, Compute for the orphan
 //! sweep. Everything authenticates with `Authorization: Bearer <IAM token>`.
 //!
-//! That header is the reason this design has no long-lived secret. Yandex Object
-//! Storage accepts IAM tokens directly — "if authenticating with the API via an
-//! IAM token, you do not have to additionally sign HTTP requests" — so there is
-//! no AWS SigV4 to implement and no static access key to store. On the CI runner
-//! the token comes from GitHub OIDC federated to a service account; on a VM it
-//! comes from the metadata service, so the VM holds no credential at all.
-//!
-//! Object Storage is the only way results leave the fleet, because the VMs have
-//! no public address and nothing can reach in. GitHub was considered and
-//! rejected: it has no write-only drop-box credential — Actions artifacts can
-//! only be uploaded from inside a runner, and releases and branch pushes both
-//! sit under the `contents` permission — so any GitHub upload path would mean
-//! handing repo write access to a machine being deliberately saturated with
-//! load.
+//! IAM tokens need no SigV4 and no stored key: CI gets one via GitHub OIDC,
+//! VMs from the metadata service. Object Storage is the only way results leave
+//! the fleet; never give the load-saturated VMs GitHub write access instead.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,10 +24,7 @@ pub const Client = struct {
         return .{ .gpa = gpa, .io = io, .token = token };
     }
 
-    /// No-op: every request now builds and tears down its own throwaway
-    /// client (see `http.fetch`), so there is no longer any persistent
-    /// connection state for `Client` itself to hold. Kept so call sites that
-    /// pair `init`/`defer deinit()` need no change.
+    /// No-op, kept so `init`/`defer deinit()` call sites stay unchanged.
     pub fn deinit(self: *Client) void {
         _ = self;
     }
@@ -51,9 +37,8 @@ pub const Client = struct {
         content_type: ?[]const u8 = null,
     };
 
-    /// PUT an object. Every object this bucket holds is private run data; there
-    /// is deliberately no public-read path (the Discord post links the GitHub
-    /// Pages copy of the report instead of a world-readable object here).
+    /// PUT an object. Everything here is private run data; there is no
+    /// public-read path (Discord links the Pages copy instead).
     pub fn putObject(
         self: *Client,
         bucket: []const u8,
@@ -98,10 +83,6 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // A plain local. This used to be arena-ALLOCATED because `http.fetch`
-        // handed the pointer to a thread it might abandon, which would have
-        // left that thread writing into this dead frame. `fetch` cancels and
-        // joins now, so nothing outlives the call.
         var body: std.Io.Writer.Allocating = .init(arena);
         const res = try http.fetch(self.gpa, self.io, .{
             .url = url,
@@ -128,9 +109,8 @@ pub const Client = struct {
         var auth_buf: [4096]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
 
-        // A timeout here is not fatal: `wait`'s loop treats a failed `exists`
-        // as `false` and polls again next tick, which is exactly right for one
-        // stalled HEAD in a 110-minute loop — see `wait`'s own catch sites.
+        // A timeout is not fatal: `wait` treats a failed `exists` as false and
+        // polls again.
         const res = try http.fetch(self.gpa, self.io, .{
             .url = url,
             .method = .HEAD,
