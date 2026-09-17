@@ -13,7 +13,7 @@
 #>  make up / down   local: start/stop the backend origin pool (all four)
 #
 # Ramp parameters are NOT knobs any more — they are compiled into
-# bench/src/profile.zig as the c100, c1k, c1k-tls, c10k and smoke profiles,
+# bench/src/profile.zig as the c100, c1k, c1k-tls, c1k-64, c1k-10k, c1k-100k, c10k and smoke profiles,
 # because eleven env vars with silent fallbacks is how a real run ended up with
 # TIMEOUT_S=0 against a documented 1 and nothing noticed.
 #

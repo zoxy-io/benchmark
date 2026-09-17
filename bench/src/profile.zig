@@ -290,6 +290,31 @@ pub const c1k_tls: Profile = blk: {
     break :blk p;
 };
 
+/// c1k with a different canned response body, and NOTHING else changed.
+///
+/// Same derivation argument as `c1k_tls`: same ramp, connections, reference
+/// rate and zoxy slot tuning, so the family isolates how each proxy scales with
+/// the size of what it relays. The bodies are the ones backend/10-gen-bodies.sh
+/// already generates; `c1k` itself is the 1 KiB point of the series.
+///
+/// Read the large bodies against the rig's own ceiling (see the ramp-shape note
+/// above `zoxy_ref`): 100k req/s of 1 KiB is already ~820 Mbps. At 10 KiB the
+/// wire saturates near ~10k req/s, and at 100 KiB near ~1k req/s — BELOW the
+/// 2000 rps `ref_rate`. `c1k-100k` therefore mostly measures the network, and
+/// its summary latency is read past line rate. It is kept at c1k's `ref_rate`
+/// anyway so the family stays a set of one-variable changes; a proxy that
+/// diverges from the others there is still a finding.
+fn c1kBody(comptime name: []const u8, comptime path: []const u8) Profile {
+    var p = c1k;
+    p.name = name;
+    p.req_path = path;
+    return p;
+}
+
+pub const c1k_64 = c1kBody("c1k-64", "/64");
+pub const c1k_10k = c1kBody("c1k-10k", "/10k");
+pub const c1k_100k = c1kBody("c1k-100k", "/100k");
+
 pub const c100: Profile = .{
     .name = "c100",
     .connections = 100,
@@ -444,7 +469,7 @@ pub const smoke: Profile = .{
 /// (profile, proxy) turn precisely so no turn ever rebinds a port a previous
 /// turn used (runs #25/#26), and a renumbering would hand tonight's turns ports
 /// that an earlier turn in the same dispatch had already served load on.
-pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke };
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_64, c1k_10k, c1k_100k };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -462,6 +487,9 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c1k") != null);
     try std.testing.expect(byName("c10k") != null);
     try std.testing.expect(byName("c1k-tls") != null);
+    try std.testing.expect(byName("c1k-64") != null);
+    try std.testing.expect(byName("c1k-10k") != null);
+    try std.testing.expect(byName("c1k-100k") != null);
     try std.testing.expect(byName("") == null);
     try std.testing.expect(byName("c100k") == null);
 }
@@ -546,6 +574,29 @@ test "profile.all is append-only, because proxyPort keys off its index" {
     try std.testing.expectEqualStrings("c10k", all[2].name);
     try std.testing.expectEqualStrings("c1k-tls", all[3].name);
     try std.testing.expectEqualStrings("smoke", all[4].name);
+    try std.testing.expectEqualStrings("c1k-64", all[5].name);
+    try std.testing.expectEqualStrings("c1k-10k", all[6].name);
+    try std.testing.expectEqualStrings("c1k-100k", all[7].name);
+}
+
+test "the body-size profiles are c1k with the body swapped, and nothing else" {
+    // Same subtraction argument as c1k-tls: anything beyond the name and the
+    // body makes "a bigger body costs X" a comparison of two experiments.
+    for ([_]Profile{ c1k_64, c1k_10k, c1k_100k }) |p| {
+        try std.testing.expect(!std.mem.eql(u8, c1k.req_path, p.req_path));
+        try std.testing.expectEqual(c1k.tls, p.tls);
+        try std.testing.expectEqual(c1k.connections, p.connections);
+        try std.testing.expectEqual(c1k.threads, p.threads);
+        try std.testing.expectEqual(c1k.start_rate, p.start_rate);
+        try std.testing.expectEqual(c1k.max_rate, p.max_rate);
+        try std.testing.expectEqual(c1k.ramp_seconds, p.ramp_seconds);
+        try std.testing.expectEqual(c1k.timeout_s, p.timeout_s);
+        try std.testing.expectEqual(c1k.deadline_ms, p.deadline_ms);
+        try std.testing.expectEqual(c1k.ref_rate, p.ref_rate);
+        try std.testing.expectEqual(c1k.ref_band, p.ref_band);
+        try std.testing.expectEqual(c1k.cooldown_s, p.cooldown_s);
+        try std.testing.expectEqual(c1k.proxy_env.ptr, p.proxy_env.ptr);
+    }
 }
 
 test "smoke shares no ramp shape with a published profile" {

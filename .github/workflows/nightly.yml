@@ -41,11 +41,12 @@
 name: nightly
 
 on:
-  # Every 6 hours (00:00/06:00/12:00/18:00 UTC). GitHub runs scheduled
-  # workflows on a best-effort basis and commonly fires them 5-30 minutes
-  # late, which is immaterial here. The `concurrency` group below serializes
-  # firings that land while a run is still going — see its comment — so a
-  # slow run just pushes the next one back rather than overlapping it.
+  # Once a night, at 00:00 UTC. GitHub runs scheduled workflows on a
+  # best-effort basis and commonly fires them 5-30 minutes late, which is
+  # immaterial here. The `concurrency` group below serializes a firing that
+  # lands while a run (or its retry, nightly-retry.yml) is still going — see
+  # its comment — so a slow night pushes the next one back rather than
+  # overlapping it.
   #
   # What makes an unattended cron safe is that teardown does not depend on the
   # run succeeding: `tofu destroy` is `if: always()` with a freshly re-minted IAM
@@ -54,7 +55,7 @@ on:
   # itself dying. A failed run therefore costs a red run and ~15 minutes of
   # six VMs, not a stranded fleet.
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0 * * *'
 
   workflow_dispatch:
     inputs:
@@ -62,7 +63,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k,c1k-tls
+        default: c1k,c1k-tls,c1k-64,c1k-10k,c1k-100k
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -92,17 +93,16 @@ jobs:
     runs-on: ubuntu-24.04
 
     # Budget: boot ~4 min, cold docker builds 5-20 min (zoxy is a source build,
-    # pingora a cargo build), then 2 profiles (c1k, c1k-tls) x 5 proxies x
-    # ~350 s ~= 58 min, plus fetch/report/publish. 150 still leaves real
-    # headroom without letting a wedged run bill for hours — and the two ~55
-    # minute `wait` chunks below are what a run that legitimately outlives one
-    # IAM token lands in, which two profiles now makes the normal case rather
-    # than the worst one. `bench wait` runs as two chunked steps (each
-    # with its own, tighter step timeout — see "Wait chunk 1"/"Wait chunk 2"
-    # below) so that a loadgen which never writes DONE fails a STEP, leaving
-    # the teardown steps to run normally instead of being raced by a job-level
-    # cancellation.
-    timeout-minutes: 150
+    # pingora a cargo build), then 5 profiles (c1k, c1k-tls, c1k-64, c1k-10k,
+    # c1k-100k) x 5 proxies x ~350 s ~= 146 min, plus fetch/report/publish —
+    # ~175 min on a normal night. 270 leaves real headroom without letting a
+    # wedged run bill for hours, and stays well inside GitHub's 360-minute cap
+    # on a hosted job. `bench wait` runs as up to four ~55 minute chunked steps
+    # (each with its own, tighter step timeout — see "Wait chunk 1".."Wait
+    # chunk 4" below), each on a fresh IAM token, so that a loadgen which never
+    # writes DONE fails a STEP, leaving the teardown steps to run normally
+    # instead of being raced by a job-level cancellation.
+    timeout-minutes: 270
 
     # No `pages:` here — this job never touches Pages, it only uploads the raw
     # artifact that the publish job renders and deploys.
@@ -124,11 +124,18 @@ jobs:
       # last week's plaintext one would fold every other night-to-night
       # difference into that number.
       #
+      # c1k-64, c1k-10k and c1k-100k are c1k with the response body swapped
+      # (profile.zig's `c1kBody`), on the schedule for the same reason: how a
+      # proxy scales with body size only means something on one fleet, one
+      # night. c1k-100k runs last because its ramp passes line rate earliest
+      # and is the likeliest to misbehave — and results.tar ships after every
+      # profile, so it cannot take the others down with it.
+      #
       # c10k stays defined in profile.zig (its tuning history and the open
       # start-failure investigation from run #25 are worth keeping) — it is
       # just not in the default nightly set while that investigation is open.
-      # Pass `profiles: c1k,c1k-tls,c10k` on a manual dispatch to run it anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls' }}
+      # Add `c10k` to `profiles` on a manual dispatch to run it anyway.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-64,c1k-10k,c1k-100k' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
@@ -333,16 +340,17 @@ jobs:
       # the job and races the teardown, whereas a step timeout leaves the
       # `if: always()` steps below to run normally.
       #
-      # Split into two 55-minute CHUNKS, each on its own IAM token, rather than
-      # one open-ended 110-minute call: the federated token this job started
+      # Split into up to four 55-minute CHUNKS, each on its own IAM token,
+      # rather than one open-ended call: the federated token this job started
       # with is short-lived (~1h — see the top-of-file comment), and boot plus
-      # cold docker builds plus two profiles' ramps can genuinely run past that
+      # cold docker builds plus five profiles' ramps can genuinely run past that
       # in the worst case. A single long call would start 401ing partway
       # through and the run would look dead even though the fleet is healthy.
       # `--max-wait-s` bounds ONE call; exit 5 means that chunk's deadline
       # elapsed with no terminal marker yet (the fleet may be fine), distinct
       # from exit 1 (`never_booted` — no amount of retrying helps). Only a 5
-      # earns a second chunk with a freshly-minted token.
+      # earns the next chunk with a freshly-minted token. With five profiles
+      # a normal night needs three chunks; the fourth is headroom.
       #
       # Exit codes (bench/CONTRACT.md): 0 done, 3 the suite ran and reported
       # failures, 1 it never booted, 5 this chunk's deadline elapsed.
@@ -381,6 +389,68 @@ jobs:
       - name: Wait chunk 2 (only if chunk 1's deadline elapsed)
         id: wait2
         if: always() && steps.wait.outputs.code == '5'
+        continue-on-error: true
+        timeout-minutes: 58
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -uo pipefail
+          code=0
+          "$BENCH" wait --runid "$RUNID" --max-wait-s 3300 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Re-mint the IAM token (wait chunk 3)
+        id: iam_wait3
+        if: always() && steps.wait2.outputs.code == '5'
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the refreshed token (wait chunk 3)
+        if: always() && steps.wait2.outputs.code == '5' && steps.iam_wait3.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.iam_wait3.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # Same as chunk 2, one chunk further on.
+      - name: Wait chunk 3 (only if chunk 2's deadline elapsed)
+        id: wait3
+        if: always() && steps.wait2.outputs.code == '5'
+        continue-on-error: true
+        timeout-minutes: 58
+        env:
+          RUNID: ${{ steps.meta.outputs.runid }}
+        run: |
+          set -uo pipefail
+          code=0
+          "$BENCH" wait --runid "$RUNID" --max-wait-s 3300 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Re-mint the IAM token (wait chunk 4)
+        id: iam_wait4
+        if: always() && steps.wait3.outputs.code == '5'
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Export the refreshed token (wait chunk 4)
+        if: always() && steps.wait3.outputs.code == '5' && steps.iam_wait4.outcome == 'success'
+        env:
+          TOKEN: ${{ steps.iam_wait4.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          echo "YC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # Same as chunk 2, one chunk further on.
+      - name: Wait chunk 4 (only if chunk 3's deadline elapsed)
+        id: wait4
+        if: always() && steps.wait3.outputs.code == '5'
         continue-on-error: true
         timeout-minutes: 58
         env:
@@ -520,13 +590,19 @@ jobs:
           set -euo pipefail
           bad=0
 
-          # Fold the two wait chunks into one outcome: chunk 1 alone if it
-          # never needed a second (its own deadline never elapsed), otherwise
-          # whatever chunk 2 concluded with — chunk 1's own "failure" in that
-          # case was just its deadline elapsing (code 5), not a real problem.
+          # Fold the wait chunks into one outcome: the LAST chunk that ran
+          # decides it. An earlier chunk's own "failure" was just its deadline
+          # elapsing (code 5), which is what earned the next one — not a real
+          # problem. A chunk 4 that also ends on 5 stays a failure.
           wait_outcome="${{ steps.wait.outcome }}"
           if [ "${{ steps.wait.outputs.code }}" = "5" ]; then
             wait_outcome="${{ steps.wait2.outcome }}"
+          fi
+          if [ "${{ steps.wait2.outputs.code }}" = "5" ]; then
+            wait_outcome="${{ steps.wait3.outcome }}"
+          fi
+          if [ "${{ steps.wait3.outputs.code }}" = "5" ]; then
+            wait_outcome="${{ steps.wait4.outcome }}"
           fi
 
           for pair in \

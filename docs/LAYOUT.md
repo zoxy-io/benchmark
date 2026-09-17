@@ -2,7 +2,7 @@
 
 ```
 bench/CONTRACT.md         the interfaces terraform, cloud-init and CI code against
-bench/src/profile.zig     c100, c1k, c10k — the ramp parameters, compiled in
+bench/src/profile.zig     c100, c1k(-tls/-64/-10k/-100k), c10k — ramps, compiled in
 bench/src/suite.zig       the per-proxy loop; the only place an error is caught
 bench/src/ramp.zig        one ramp, embedding zrk's runner.run in-process
 bench/src/cadvisor.zig    1Hz container sampling + the identity witness

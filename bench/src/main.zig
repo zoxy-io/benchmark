@@ -42,7 +42,7 @@ pub const render = @import("render.zig");
 const usage =
     \\usage: bench <command> [options]
     \\
-    \\  suite   --profile <c100|c1k|c1k-tls|c10k|smoke> [--proxies a,b,c] [--local]
+    \\  suite   --profile <c100|c1k|c1k-tls|c1k-64|c1k-10k|c1k-100k|c10k|smoke> [--proxies a,b,c] [--local]
     \\                                                   run the suite
     \\  report  <rundir>                                 render report.json + report.html
     \\  index   <rundir>                                 build the Pages site

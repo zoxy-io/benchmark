@@ -18,15 +18,18 @@ coming out, both through Object Storage.
 ## Profiles
 
 Ramp profiles are compiled into [`bench/src/profile.zig`](../bench/src/profile.zig)
-and run across `zoxy, haproxy, nginx, pingora, envoy`. `c1k` and `c1k-tls` run
-on the schedule; pass `profiles: c1k,c1k-tls,c10k` on a manual dispatch to run
-`c10k` too:
+and run across `zoxy, haproxy, nginx, pingora, envoy`. `c1k`, `c1k-tls`,
+`c1k-64`, `c1k-10k` and `c1k-100k` run on the schedule, once a night at 00:00
+UTC; add `c10k` to `profiles` on a manual dispatch to run it too:
 
 | profile | connections | transport | deadline | runs nightly? | what it answers |
 |---|---|---|---|---|---|
 | `c100` | 100 | plaintext | — | manual only | cheap smoke profile, zoxy's shipped defaults |
 | `c1k` | 1 000 | plaintext | — | yes (default) | how fast is each proxy at a healthy concurrency |
 | `c1k-tls` | 1 000 | TLS 1.3 | — | yes (default) | what terminating TLS costs each proxy — `c1k` with TLS on and nothing else changed |
+| `c1k-64` | 1 000 | plaintext | — | yes (default) | per-request overhead — `c1k` with a 64 B response body and nothing else changed |
+| `c1k-10k` | 1 000 | plaintext | — | yes (default) | how each proxy relays a 10 KiB body — `c1k` with only the body changed; the wire saturates near ~10k req/s |
+| `c1k-100k` | 1 000 | plaintext | — | yes (default) | how each proxy relays a 100 KiB body — the ramp passes line rate near ~1k req/s, so this mostly measures the network; read proxies against each other only |
 | `c10k` | 10 000 | plaintext | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
 | `smoke` | 50 | plaintext | — | never | **not a measurement** — the CI gate. A 30 s, 200→5 000 req/s ramp that exists so a push can prove the harness still runs end-to-end without paying for a fleet. Its ramp shape deliberately matches no other profile, so its numbers cannot be plotted against a real one; `profile.zig` has a test asserting that stays true. |
 
