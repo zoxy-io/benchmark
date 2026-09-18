@@ -39,7 +39,9 @@ x-proxy-common: &proxy-common
 
 # PROXY_PORT: `bench` gives each (profile, proxy) turn its own host port
 # (suite.zig proxyPort); rebinding a fixed :8080 after a loaded turn failed with
-# EADDRINUSE in cloud (runs #25/#26, root cause open). Unset locally. Resolved
+# EADDRINUSE in cloud (runs #25/#26). The cause was the listener port sitting
+# inside ip_local_port_range, so an upstream connection could hold it as a
+# source port; cloud-init reserves the pool now. Unset locally. Resolved
 # at compose parse time for pingora/envoy, natively by haproxy, and by zoxy's
 # entrypoint.
 #

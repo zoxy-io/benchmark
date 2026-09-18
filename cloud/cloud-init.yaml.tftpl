@@ -34,6 +34,18 @@ write_files:
       net.core.netdev_max_backlog = 65536
       net.ipv4.tcp_max_syn_backlog = 65536
       net.ipv4.ip_local_port_range = 1024 65535
+      # Every port a listener binds must be excluded from that range, or the
+      # kernel hands it to an upstream connection as a source port and the next
+      # turn's bind fails with EADDRINUSE (run #40: zoxy on 18104/18128, envoy
+      # on 18140). SO_REUSEADDR/SO_REUSEPORT do not help: the squatter is an
+      # ordinary outbound socket that set neither. Reservation only removes
+      # them from *automatic* allocation; an explicit bind still works.
+      #   8080-8081  local proxy port, cAdvisor
+      #   9000       backend
+      #   9101,9902  zoxy and envoy admin
+      #   18080-19199 suite.zig's per-turn plaintext and TLS pools, with room
+      #               for the profiles proxyPort has yet to number
+      net.ipv4.ip_local_reserved_ports = 8080-8081,8443,9000,9101,9902,18080-19199
       net.ipv4.tcp_tw_reuse = 1
       fs.file-max = 2097152
       fs.nr_open = 2097152

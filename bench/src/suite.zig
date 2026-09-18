@@ -1662,6 +1662,10 @@ fn portsFor(p: profile.Profile, fleet: Fleet, proxy_idx: usize) Ports {
 /// A host port unique to this (profile, proxy) turn within one dispatch:
 /// rebinding a port that just served load hit EADDRINUSE (runs #25, #26).
 /// Keyed on `profile.all`'s compiled order, not the night's selection.
+///
+/// Every port this yields must appear in `ip_local_reserved_ports`
+/// (cloud/cloud-init.yaml.tftpl), else the kernel can hand it to an upstream
+/// connection as a source port and the bind fails anyway (run #40).
 fn proxyPort(p: profile.Profile, proxy_idx: usize) u16 {
     return proxy_port_base + slot(p, proxy_idx);
 }
@@ -1940,6 +1944,19 @@ test "proxyPort never repeats within one suite dispatch, including a proxy's own
             for ([_]u16{ proxyPort(p, proxy_idx), proxyTlsPort(p, proxy_idx) }) |port| {
                 try std.testing.expect(!seen.contains(port));
                 try seen.put(port, {});
+            }
+        }
+    }
+}
+
+test "the per-turn pool stays inside the ports cloud-init reserves" {
+    // ip_local_reserved_ports = ...,18080-19199. A port outside it can be
+    // taken as an upstream connection's source port before the bind (run #40),
+    // so appending profiles past this window needs the sysctl widened too.
+    for (profile.all) |p| {
+        for (0..proxy_port_slots) |proxy_idx| {
+            for ([_]u16{ proxyPort(p, proxy_idx), proxyTlsPort(p, proxy_idx) }) |port| {
+                try std.testing.expect(port >= 18080 and port <= 19199);
             }
         }
     }
