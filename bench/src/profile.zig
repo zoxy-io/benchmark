@@ -144,9 +144,7 @@ pub const c1k_tls: Profile = blk: {
 };
 
 /// c1k with a different response body and nothing else changed (bodies from
-/// backend/10-gen-bodies.sh). Large bodies hit the rig's line rate (see the
-/// ramp-shape note above `start_rate`): c1k-100k saturates near ~1k rps, below
-/// `ref_rate`, so it mostly measures the network.
+/// backend/10-gen-bodies.sh).
 fn c1kBody(comptime name: []const u8, comptime path: []const u8) Profile {
     var p = c1k;
     p.name = name;
@@ -156,7 +154,33 @@ fn c1kBody(comptime name: []const u8, comptime path: []const u8) Profile {
 
 pub const c1k_64 = c1kBody("c1k-64", "/64");
 pub const c1k_10k = c1kBody("c1k-10k", "/10k");
-pub const c1k_100k = c1kBody("c1k-100k", "/100k");
+
+/// The large-body band, and the only profile that sets zoxy's relay buffer.
+///
+/// A 100k body is the first that does not fit one buffer: at zoxy's 16 KiB
+/// default it is 7 strict recv->send->recv round trips (zoxy DESIGN.md §6),
+/// 4 at 32 KiB. Run 20260918-014014 is what puts the knob here — zoxy
+/// placed last (4228/s against nginx 5838) while holding 0.47 of its one
+/// core, where nginx/pingora/haproxy all reached 0.94-1.0, and its 5586
+/// errors were every one a timeout rather than a refusal. A throughput
+/// ceiling with half the core idle is the shape a per-body round-trip bound
+/// makes, and this is the cheapest test of it: zoxy leads the same ramp by
+/// 2.3x at 64B and 1k, where a body is one chunk.
+///
+/// The knob doubles zoxy's relay pool (`relay_buffers` x 2 x this, so
+/// 1386 pairs cost ~87 MiB against ~43), which is why it stays on this
+/// profile alone — and why the memory column here is expected to move.
+/// Needs a zoxy whose `relay_buffer_bytes_max` is 32 KiB; releases through
+/// 0.8.2 cap it at 16 and would refuse to start
+/// (`LimitRelayBufferBytesOutOfRange`), so `zoxy_ref` must name a build
+/// that has it.
+pub const c1k_100k = blk: {
+    var p = c1kBody("c1k-100k", "/100k");
+    p.proxy_env = c1k.proxy_env ++ [_]Pair{
+        .{ .key = "ZOXY_RELAY_BUFFER_BYTES", .value = "32768" },
+    };
+    break :blk p;
+};
 
 pub const c100: Profile = .{
     .name = "c100",
@@ -328,6 +352,8 @@ test "profile.all is append-only, because proxyPort keys off its index" {
 }
 
 test "the body-size profiles are c1k with the body swapped, and nothing else" {
+    // The ramp shape is what makes the four bands comparable, so every
+    // field that shapes the offered axis must still match c1k exactly.
     for ([_]Profile{ c1k_64, c1k_10k, c1k_100k }) |p| {
         try std.testing.expect(!std.mem.eql(u8, c1k.req_path, p.req_path));
         try std.testing.expectEqual(c1k.tls, p.tls);
@@ -341,8 +367,22 @@ test "the body-size profiles are c1k with the body swapped, and nothing else" {
         try std.testing.expectEqual(c1k.ref_rate, p.ref_rate);
         try std.testing.expectEqual(c1k.ref_band, p.ref_band);
         try std.testing.expectEqual(c1k.cooldown_s, p.cooldown_s);
-        try std.testing.expectEqual(c1k.proxy_env.ptr, p.proxy_env.ptr);
     }
+    // Two of the three are pure body swaps, sharing c1k's env slice.
+    try std.testing.expectEqual(c1k.proxy_env.ptr, c1k_64.proxy_env.ptr);
+    try std.testing.expectEqual(c1k.proxy_env.ptr, c1k_10k.proxy_env.ptr);
+    // c1k-100k is the documented exception: c1k's env plus the relay
+    // buffer, and nothing more. Pinned so a second knob cannot join it
+    // without saying so here — the band only stays a body swap if the
+    // proxy config is otherwise identical.
+    try std.testing.expectEqual(c1k.proxy_env.len + 1, c1k_100k.proxy_env.len);
+    for (c1k.proxy_env, c1k_100k.proxy_env[0..c1k.proxy_env.len]) |want, got| {
+        try std.testing.expectEqualStrings(want.key, got.key);
+        try std.testing.expectEqualStrings(want.value, got.value);
+    }
+    const extra = c1k_100k.proxy_env[c1k.proxy_env.len];
+    try std.testing.expectEqualStrings("ZOXY_RELAY_BUFFER_BYTES", extra.key);
+    try std.testing.expectEqualStrings("32768", extra.value);
 }
 
 test "smoke shares no ramp shape with a published profile" {

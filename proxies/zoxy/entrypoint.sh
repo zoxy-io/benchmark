@@ -21,6 +21,15 @@ fi
 if [ -n "${ZOXY_TLS_ENGINES:-}" ]; then
     fields="${fields}, \"tls_engines\": ${ZOXY_TLS_ENGINES}"
 fi
+# Bytes per relay direction: how many recv->send round trips one body costs.
+# Only the large-body profile sets it — a 100k body is 7 chunks at zoxy's
+# 16 KiB default and 4 at 32 KiB. The pool term is relay_buffers x 2 x this,
+# so this doubles zoxy's relay memory; leave it unset everywhere else. zoxy
+# refuses above 16 KiB when a listener terminates TLS, so never set it on a
+# TLS turn (LimitRelayBufferOverTlsRecord).
+if [ -n "${ZOXY_RELAY_BUFFER_BYTES:-}" ]; then
+    fields="${fields}, \"relay_buffer_bytes\": ${ZOXY_RELAY_BUFFER_BYTES}"
+fi
 LIMITS="{${fields}}"
 
 # All-or-nothing: a dropped member would round-robin over three backends.

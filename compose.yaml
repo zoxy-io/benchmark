@@ -175,6 +175,11 @@ services:
       # TLS session pool, set by TLS profiles only. One engine per admitted
       # connection, so anything under conn_slots sheds.
       ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
+      # Bytes per relay direction, set by the large-body profile only: it
+      # sets how many recv->send round trips one body costs, and doubles
+      # zoxy's relay pool when raised. Unset elsewhere keeps zoxy's 16 KiB
+      # default; zoxy refuses above that on a TLS turn.
+      ZOXY_RELAY_BUFFER_BYTES: ${ZOXY_RELAY_BUFFER_BYTES:-}
       # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS.
       PROXY_PORT: ${PROXY_PORT:-8080}
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
