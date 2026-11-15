@@ -31,6 +31,8 @@ pub const Options = struct {
     deadline_ms: u64,
     /// Load offered over TLS, terminated by each proxy; the page says so.
     tls: bool = false,
+    /// HTTP/2 over that TLS; the page says so.
+    h2: bool = false,
     /// Absolute prefix for `.hgrm` links: relative links 404 in Discord.
     base_url: []const u8 = "",
 };
@@ -97,13 +99,25 @@ pub fn render(
             \\ <b>The load is offered over TLS 1.3</b>, terminated by the proxy; every proxy's
             \\upstream leg stays plaintext, as zoxy terminates inbound only. All five load the same
             \\self-signed <b>ECDSA P-256</b> certificate — the key type is part of the measurement, since
-            \\the signature is per handshake. The generator offers <b>no ALPN</b> (so this is HTTP/1.1,
-            \\like every other profile) and <b>never resumes a session</b>, so each connection pays a full
+            \\the signature is per handshake. The generator offers <b>only <code>http/1.1</code> in ALPN</b>
+            \\unless this profile is HTTP/2 (below), and <b>never resumes a session</b>, so each connection pays a full
             \\handshake at connect time and the steady state read below is record-layer crypto on
             \\kept-alive connections, not handshake throughput. The <b>cipher suite is each proxy's own
             \\choice</b> from what the generator offers — AES-GCM and ChaCha20-Poly1305 do not cost the
             \\same per byte, and only some of these proxies expose a knob for it, so it is recorded as
             \\part of "the proxy as it ships" rather than pinned.
+        );
+    }
+    if (opts.h2) {
+        // What separates this page from the TLS one: the protocol, and only it.
+        try out.writeAll(
+            \\ <b>The clients speak HTTP/2</b>, negotiated by ALPN (the generator offers
+            \\<code>h2, http/1.1</code>, every proxy advertises the same, and a connection that lands
+            \\on HTTP/1.1 is counted as an error rather than measured). Each connection carries
+            \\<b>one stream at a time</b>, so requests in flight still equal connections: this measures
+            \\HTTP/2 framing, HPACK and stream bookkeeping against the TLS profile's HTTP/1.1, not
+            \\multiplexing. Every proxy's upstream leg stays HTTP/1.1, and each one's HTTP/2
+            \\settings (windows, concurrent-stream limits) are its own defaults.
         );
     }
     try out.writeAll("</p>");

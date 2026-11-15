@@ -603,6 +603,7 @@ pub fn buildIndex(
             .connections = p.connections,
             .deadline_ms = p.deadline_ms,
             .tls = p.tls,
+            .h2 = p.h2,
         });
 
         // A local run never enters history: incomparable points would read as a

@@ -91,6 +91,11 @@ pub const ProxyRecord = struct {
     /// proxies, plaintext profiles, or an unreadable counter. Nonzero means the
     /// ramp measured the pool cap (`conn_slots`) rather than zoxy's TLS.
     shed_tls_engines: ?u64 = null,
+    /// HTTP/2 connections and streams zoxy turned away for want of a pool
+    /// slot (zoxy on h2 profiles only, else null). Nonzero means the ramp
+    /// measured `h2_connections` / `stream_slots` rather than zoxy's HTTP/2.
+    shed_h2_sessions: ?u64 = null,
+    shed_h2_streams: ?u64 = null,
     notes: []const []const u8 = &.{},
 };
 
@@ -183,6 +188,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     // Transport, recorded like every other ramp parameter.
     try j.key("tls");
     try j.boolean(p.prof.tls);
+    try j.key("h2");
+    try j.boolean(p.prof.h2);
     try j.key("ref_rate");
     try j.float(p.prof.ref_rate, 1);
     try j.key("ref_band");
@@ -250,6 +257,10 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
         if (r.access_log_dropped) |d| try j.int(@intCast(d)) else try j.nullValue();
         try j.key("shed_tls_engines");
         if (r.shed_tls_engines) |d| try j.int(@intCast(d)) else try j.nullValue();
+        try j.key("shed_h2_sessions");
+        if (r.shed_h2_sessions) |d| try j.int(@intCast(d)) else try j.nullValue();
+        try j.key("shed_h2_streams");
+        if (r.shed_h2_streams) |d| try j.int(@intCast(d)) else try j.nullValue();
 
         try j.key("notes");
         try j.beginArray();

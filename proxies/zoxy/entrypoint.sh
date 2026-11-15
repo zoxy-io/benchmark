@@ -21,6 +21,15 @@ fi
 if [ -n "${ZOXY_TLS_ENGINES:-}" ]; then
     fields="${fields}, \"tls_engines\": ${ZOXY_TLS_ENGINES}"
 fi
+# HTTP/2 pools, only on h2 turns: zoxy refuses both unless a listener speaks
+# h2. h2_connections short of the offered connections answers the rest with
+# HTTP/1.1; stream_slots short refuses streams (zoxy_h2_shed_*).
+if [ -n "${ZOXY_H2_CONNECTIONS:-}" ]; then
+    fields="${fields}, \"h2_connections\": ${ZOXY_H2_CONNECTIONS}"
+fi
+if [ -n "${ZOXY_STREAM_SLOTS:-}" ]; then
+    fields="${fields}, \"stream_slots\": ${ZOXY_STREAM_SLOTS}"
+fi
 LIMITS="{${fields}}"
 
 # All-or-nothing: a dropped member would round-robin over three backends.
@@ -49,8 +58,11 @@ done
 # plaintext configs are unchanged (the preallocated engine pool would add
 # ~250 MiB). `tls` sits beside the `http` body (0.8.0 config).
 # One line: it becomes a sed replacement, which rejects raw newlines.
+# PROXY_H2 adds `alpn`; absent, zoxy (0.10.0+) offers `http/1.1` alone.
 if [ -n "${PROXY_TLS_PORT:-}" ]; then
-    TLS_LISTENER=", { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"tls\": { \"cert\": \"/etc/bench/tls/bench.crt\", \"key\": \"/etc/bench/tls/bench.key\" }, \"http\": { \"cluster\": \"origin\" } }"
+    ALPN=""
+    [ -n "${PROXY_H2:-}" ] && ALPN=", \"alpn\": [\"h2\", \"http/1.1\"]"
+    TLS_LISTENER=", { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"tls\": { \"cert\": \"/etc/bench/tls/bench.crt\", \"key\": \"/etc/bench/tls/bench.key\"${ALPN} }, \"http\": { \"cluster\": \"origin\" } }"
 else
     TLS_LISTENER=""
 fi

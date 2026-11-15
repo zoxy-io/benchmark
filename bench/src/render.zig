@@ -243,6 +243,7 @@ pub fn cmdReport(init: std.process.Init, args: []const [:0]const u8) !void {
         .connections = prof.connections,
         .deadline_ms = prof.deadline_ms,
         .tls = prof.tls,
+        .h2 = prof.h2,
         .base_url = base_url,
         .origin = origin,
     });

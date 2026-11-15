@@ -57,9 +57,10 @@ Every proxy is an **HTTP/1.1 reverse proxy** doing the same job — HAProxy
 ~90-line Rust binary on Cloudflare's framework, zoxy's phase-1 `http`
 listener: parse each request,
 **pick an origin from a four-node pool**, forward it over a pooled keep-alive
-upstream, stream the response back. The generator speaks HTTP/1.1 end-to-end —
-over TLS to the proxy on the `c1k-tls` profile, plaintext onward to the origins
-in every profile — and the origins are nginx.
+upstream, stream the response back. The generator speaks HTTP/1.1 to the proxy
+— over TLS on `c1k-tls` — except on `c1k-h2`, where it speaks HTTP/2 over the
+same TLS; every proxy speaks plaintext HTTP/1.1 onward to the origins in every
+profile, and the origins are nginx.
 
 The pool is what makes the job the one a production proxy actually does: a
 single origin measures forwarding, and forwarding alone. Balancing across a set
@@ -120,14 +121,13 @@ is the other half, and it is the half where proxies differ.
     that P-256 does not. It is also the only choice available: zoxy accepts
     ECDSA P-256/P-384 and rejects RSA outright, because an RSA signature would
     stall its single event loop.
-  - **TLS 1.3, and HTTP/1.1 underneath it.** Every listener is pinned to 1.3,
-    and the generator offers **only `http/1.1` in ALPN**, so nothing here is
-    HTTP/2 and the protocol being proxied is the same one every other profile
-    measures. The
-    ALPN list is pinned to `http/1.1` where it can be (haproxy, envoy) rather
-    than left at each proxy's default: haproxy's TLS bind advertises `h2` by
-    default and was measured negotiating HTTP/2 against an ALPN-offering client
-    while the others stayed on HTTP/1.1.
+  - **TLS 1.3, and HTTP/1.1 underneath it** (on `c1k-tls`). Every listener is
+    pinned to 1.3, and the generator offers **only `http/1.1` in ALPN**, so
+    the protocol being proxied is the same one the plaintext profiles measure.
+    The ALPN list is pinned to `http/1.1` where it can be (haproxy, envoy, and
+    zoxy by omission) rather than left at each proxy's default: haproxy's TLS
+    bind advertises `h2` by default and was measured negotiating HTTP/2
+    against an ALPN-offering client while the others stayed on HTTP/1.1.
   - **The cipher suite is not pinned**, because it cannot be for all five —
     zoxy exposes no knob for it. Each proxy picks from what the generator
     offers, AES-GCM and ChaCha20-Poly1305 do not cost the same per byte, and
@@ -157,6 +157,37 @@ is the other half, and it is the half where proxies differ.
     always-bound listener would have added ~166 MiB (68 MiB → 234 MiB, as
     `zoxy --check` prices 0.8.0) to a published memory number for a socket that
     never sees a handshake.
+- **HTTP/2 is a profile too, and only to the client.** `c1k-h2` is `c1k-tls`
+  with ALPN `h2` and nothing else changed, so `c1k-tls` → `c1k-h2` is a
+  subtraction the way `c1k` → `c1k-tls` is. What travels with those numbers:
+  - **One stream per connection.** Requests in flight still equal the 1 000
+    connections, as on every other `c1k` profile. This prices HTTP/2's
+    framing, HPACK and stream bookkeeping against HTTP/1.1 on the same TLS;
+    it does **not** measure multiplexing, which would change the concurrency
+    and with it every other number on the page.
+  - **Every proxy advertises `h2, http/1.1`**, the way production listeners
+    do: haproxy `alpn h2,http/1.1`, envoy's `alpn_protocols`, nginx
+    `http2 on`, pingora `enable_h2()`, zoxy `tls.alpn`. The switch is one
+    variable, `PROXY_H2`, and with it unset each proxy renders exactly its
+    `c1k-tls` configuration. The generator offers the same two and **counts a
+    connection that lands on HTTP/1.1 as a connect error** rather than
+    measuring it, and `bench`'s warm probe fails the turn before the ramp if
+    a listener picks anything but `h2`, so a proxy cannot quietly publish
+    HTTP/1.1 numbers under this profile.
+  - **Each proxy's HTTP/2 settings are its own defaults** (window sizes,
+    concurrent-stream limits, header table). A 10 KiB response fits the
+    protocol's default 65 535-byte window and one 16 KiB DATA frame, so
+    neither flow control nor frame size decides the result here.
+  - **Upstream stays HTTP/1.1** on every proxy: the same pooled keep-alive
+    job as every other profile, now translating between the two protocols.
+  - **zoxy's HTTP/2 pools are hard ceilings the others do not have**, like
+    its TLS engines. `h2_connections` (pinned at its 1024 default) bounds the
+    connections speaking HTTP/2, and with none free zoxy answers an `h2`
+    offer with HTTP/1.1; `stream_slots` (1386, required whenever a listener
+    speaks h2) bounds the streams. `bench` reads `zoxy_h2_shed_sessions` and
+    `zoxy_h2_shed_streams` after every h2 ramp and notes the row if either is
+    nonzero. The sessions are preallocated at boot (~94 KB each), so zoxy's
+    memory on `c1k-h2` sits roughly 100 MiB above `c1k-tls` by construction.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).

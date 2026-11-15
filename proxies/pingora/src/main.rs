@@ -1,4 +1,5 @@
-//! Minimal HTTP/1.1 reverse proxy on Pingora for the proxy benchmark.
+//! Minimal reverse proxy on Pingora for the proxy benchmark: HTTP/1.1, or
+//! HTTP/2 to clients on the TLS endpoint when PROXY_H2 is set.
 //!
 //! Strict round-robin over a fixed pool (an atomic counter, not
 //! pingora-load-balancing, to avoid health-check machinery no other proxy
@@ -8,6 +9,8 @@
 //!   LISTEN      downstream bind (default 0.0.0.0:8080)
 //!   TLS_LISTEN  TLS bind; unset or empty = no TLS listener
 //!   TLS_CERT / TLS_KEY  PEM paths (default /etc/bench/tls/bench.{crt,key})
+//!   PROXY_H2    non-empty = the TLS endpoint offers `h2, http/1.1` (else
+//!               `http/1.1` alone); upstream stays HTTP/1.1 either way
 //!   UPSTREAMS   comma-separated host:port pool (default backend0..3:9000),
 //!               resolved once at startup
 //!   ACCESS_LOG  access log file (default /tmp/access.log)
@@ -22,6 +25,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -169,6 +173,8 @@ fn main() {
         .unwrap_or_else(|_| "backend0:9000,backend1:9000,backend2:9000,backend3:9000".to_string());
     let access_log_path =
         std::env::var("ACCESS_LOG").unwrap_or_else(|_| "/tmp/access.log".to_string());
+    // Empty means off: compose renders an empty string on HTTP/1.1 turns.
+    let h2 = std::env::var("PROXY_H2").map_or(false, |v| !v.trim().is_empty());
 
     // All-or-nothing: a dropped member would round-robin over three backends.
     let addrs: Vec<SocketAddr> = upstreams
@@ -187,7 +193,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("pingora-http: cannot open {access_log_path}: {e}"));
 
     eprintln!(
-        "pingora-http: listen={listen} tls_listen={} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1, access_log={access_log_path}",
+        "pingora-http: listen={listen} tls_listen={} h2={h2} upstreams={upstreams} -> {} peers, pick=roundrobin, threads=1, access_log={access_log_path}",
         tls_listen.as_deref().unwrap_or("none"),
         addrs.len()
     );
@@ -216,12 +222,17 @@ fn main() {
     );
     svc.add_tcp(&listen);
     // TLS on the same service: one ProxyHttp, upstream pool and access log.
-    // Panic on failure so it is a start failure, not a silent zero-throughput
-    // listener.
+    // The settings `add_tls` builds itself, so HTTP/1.1 turns are unchanged;
+    // `enable_h2` prefers h2 and still allows http/1.1. Panic on failure so it
+    // is a start failure, not a silent zero-throughput listener.
     if let Some(addr) = &tls_listen {
-        svc.add_tls(addr, &tls_cert, &tls_key).unwrap_or_else(|e| {
+        let mut tls = TlsSettings::intermediate(&tls_cert, &tls_key).unwrap_or_else(|e| {
             panic!("pingora-http: cannot serve TLS on {addr} with {tls_cert}/{tls_key}: {e}")
         });
+        if h2 {
+            tls.enable_h2();
+        }
+        svc.add_tls_with_settings(addr, None, tls);
     }
     server.add_service(svc);
 

@@ -164,6 +164,11 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         // self-signed cert inside the VPC. Tied to the profile so a plaintext
         // profile never quietly runs an unverified https target.
         .insecure = p.tls,
+        // ALPN `h2, http/1.1`; zrk counts a connection that lands on HTTP/1.1
+        // as a connect error rather than measuring it. One stream per
+        // connection, so in-flight requests still equal `connections`.
+        .http2 = p.h2,
+        .streams = 1,
         // No zrk whole-run JSON: it embeds the target URL (a private address)
         // in a published file (zrk/src/report.zig writeUrl).
         .format = .json,

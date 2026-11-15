@@ -34,7 +34,8 @@ handling; at 100 KiB every proxy converged on the network path. The 64 B to
 100 KiB nights this was decided from are in the published history
 (2026-09-18 to 2026-10-07).
 
-Every proxy is an **HTTP/1.1 reverse proxy** doing the same job: parse each
+Every proxy is a **reverse proxy speaking HTTP/1.1 to the origins** (and
+HTTP/1.1, or HTTP/2 on `c1k-h2`, to the clients) doing the same job: parse each
 request, **pick an origin from a four-node pool**, forward it over a pooled
 keep-alive upstream, stream the response back. The pool is what makes the job
 the one a production proxy actually does — a single origin measures forwarding,

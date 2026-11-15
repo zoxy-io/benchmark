@@ -159,6 +159,8 @@ pub const ProfileSummary = struct {
     deadline_ms: u64,
     /// Load offered over TLS, terminated by the proxy; shown as its own column.
     tls: bool = false,
+    /// HTTP/2 over that TLS, rather than HTTP/1.1.
+    h2: bool = false,
 };
 
 /// The landing page: what ran, how it went, and the trend. `results_url` is
@@ -204,7 +206,7 @@ pub fn renderIndex(
         "<th>transport</th><th>deadline</th><th>result</th><th></th></tr>");
     for (profiles) |p| {
         try out.print("<tr><td>{s}</td><td>{d}</td>", .{ p.name, p.connections });
-        try out.writeAll(if (p.tls) "<td>TLS 1.3</td>" else "<td>plaintext</td>");
+        try out.writeAll(if (p.h2) "<td>HTTP/2, TLS 1.3</td>" else if (p.tls) "<td>TLS 1.3</td>" else "<td>plaintext</td>");
         if (p.deadline_ms > 0) {
             try out.print("<td>{d}ms</td>", .{p.deadline_ms});
         } else {

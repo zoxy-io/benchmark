@@ -274,6 +274,13 @@ const ZoxyCounters = struct {
     /// hit zoxy's admission cap (`ZOXY_TLS_ENGINES`, profile.zig), not its TLS.
     /// Always null on plaintext profiles: the metric is absent there.
     shed_tls_engines: ?u64 = null,
+
+    /// HTTP/2 connections answered with HTTP/1.1 (or shed) for want of a
+    /// session, and streams refused for want of a slot. Nonzero means the
+    /// ramp hit `ZOXY_H2_CONNECTIONS` / `ZOXY_STREAM_SLOTS`, not zoxy's h2.
+    /// Null on profiles without an h2 listener: the metrics are absent.
+    shed_h2_sessions: ?u64 = null,
+    shed_h2_streams: ?u64 = null,
 };
 
 /// Scrape zoxy's admin endpoint from inside the container via bash's /dev/tcp:
@@ -290,13 +297,15 @@ fn zoxyCounters(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) ZoxyCoun
         // question answered ("no such metric"), not a transport failure.
         "docker exec zoxy bash -c 'exec 3<>/dev/tcp/127.0.0.1/9101 && " ++
             "printf \"GET /metrics HTTP/1.1\\r\\nHost: admin\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && " ++
-            "cat <&3' 2>/dev/null | grep -E 'access_log_dropped|shed_tls_engines' || true",
+            "cat <&3' 2>/dev/null | grep -E 'access_log_dropped|shed_tls_engines|h2_shed_' || true",
         deadline.inspect,
     ) catch return .{};
 
     return .{
         .access_log_dropped = counterNamed(res.stdout, "access_log_dropped"),
         .shed_tls_engines = counterNamed(res.stdout, "shed_tls_engines"),
+        .shed_h2_sessions = counterNamed(res.stdout, "h2_shed_sessions"),
+        .shed_h2_streams = counterNamed(res.stdout, "h2_shed_streams"),
     };
 }
 
@@ -1090,6 +1099,7 @@ fn runOne(
         const probe_io = probe_rt.io();
 
         try warmProbe(gpa, probe_io, target, name);
+        if (p.h2) try assertH2(gpa, probe_io, target, name);
 
         // Best-effort cAdvisor head start before the ramp's sampling window.
         if (cadvisor_addr) |addr| {
@@ -1242,6 +1252,43 @@ fn runOne(
                 );
             }
         }
+
+        // HTTP/2 pools, as for TLS engines: nonzero means the ramp measured
+        // `h2_connections` / `stream_slots` (profile.zig), not zoxy's HTTP/2.
+        if (p.h2) {
+            if (counters.shed_h2_sessions) |shed| {
+                if (shed > 0) {
+                    try notes.insert(arena, 0, try std.fmt.allocPrint(
+                        arena,
+                        "turned away {d} HTTP/2 connection(s) for want of a session: this profile's " ++
+                            "h2_connections pool was too small for {d} offered connections, so part of " ++
+                            "this number is zoxy's admission cap rather than its HTTP/2",
+                        .{ shed, p.connections },
+                    ));
+                }
+            } else {
+                try notes.append(
+                    arena,
+                    "could not read zoxy's HTTP/2 session shed counter; whether connections fell back for want of a session is unknown, not zero",
+                );
+            }
+            if (counters.shed_h2_streams) |shed| {
+                if (shed > 0) {
+                    try notes.insert(arena, 0, try std.fmt.allocPrint(
+                        arena,
+                        "refused {d} HTTP/2 stream(s) for want of a stream slot: this profile's " ++
+                            "stream_slots pool was too small, so part of this number is zoxy's cap " ++
+                            "rather than its HTTP/2",
+                        .{shed},
+                    ));
+                }
+            } else {
+                try notes.append(
+                    arena,
+                    "could not read zoxy's HTTP/2 stream shed counter; whether streams were refused is unknown, not zero",
+                );
+            }
+        }
     }
     if (stale_build) {
         // Not `failed` (some zoxy was measured), but never a plain `ok`: it is
@@ -1275,6 +1322,8 @@ fn runOne(
         .build_info = build_info,
         .access_log_dropped = access_log_dropped,
         .shed_tls_engines = counters.shed_tls_engines,
+        .shed_h2_sessions = counters.shed_h2_sessions,
+        .shed_h2_streams = counters.shed_h2_streams,
         .notes = try notes.toOwnedSlice(arena),
     };
 }
@@ -1341,6 +1390,32 @@ fn probeOnce(gpa: Allocator, io: Io, addr: net.IpAddress, path: []const u8, use_
     // ramp runs, so the probe can't accept what the measurement would reject.
     try st.handshake(io, gpa, stream, tls_probe_host, true, null, zrk.tls.alpn_http1);
     return probeExchange(st.writer(), st.reader(), path);
+}
+
+/// On h2 profiles, after `warmProbe`: one handshake offering what the ramp
+/// offers (`h2, http/1.1`), failing the turn if the listener picks anything
+/// but h2. zrk would count every such connection as a connect error and the
+/// row would read as a broken proxy; this names the cause before the ramp.
+fn assertH2(gpa: Allocator, io: Io, target: []const u8, name: []const u8) !void {
+    const url = try std.Uri.parse(target);
+    const host = switch (url.host orelse return error.InvalidTarget) {
+        .raw => |h| h,
+        .percent_encoded => |h| h,
+    };
+    const addr = try net.IpAddress.parse(host, url.port orelse 443);
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = probe_connect_timeout });
+    defer stream.close(io);
+
+    const st = try gpa.create(zrk.tls.State);
+    defer gpa.destroy(st);
+    st.init();
+    defer st.deinit();
+    try st.handshake(io, gpa, stream, tls_probe_host, true, null, zrk.tls.alpn_http2);
+    const got = st.negotiatedAlpn() orelse "none";
+    if (!std.mem.eql(u8, got, "h2")) {
+        redact.log("bench: [{s}] negotiated ALPN '{s}', not h2: this listener does not serve HTTP/2", .{ name, got });
+        return error.H2NotNegotiated;
+    }
 }
 
 /// SNI sent by the probe, never verified. No proxy here selects a certificate
@@ -1708,6 +1783,9 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySour
     if (ports) |pt| {
         try buf.print(arena, "PROXY_PORT={d} ", .{pt.plain});
         if (pt.tls) |tls_port| try buf.print(arena, "PROXY_TLS_PORT={d} ", .{tls_port});
+        // Every proxy's TLS listener offers `h2, http/1.1` when set, else
+        // `http/1.1` alone (see compose.yaml).
+        if (p.h2) try buf.print(arena, "PROXY_H2=on ", .{});
     }
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
@@ -1917,6 +1995,28 @@ test "the TLS turn carries both ports, and the profile's TLS engine pool" {
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT=") != null);
     // Pinned explicitly; zoxy's default is unrecorded and may change.
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_TLS_ENGINES=1024") != null);
+    // HTTP/1.1 over TLS: no proxy may be told to offer h2.
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_H2") == null);
+}
+
+test "the h2 turn is the TLS turn plus PROXY_H2 and zoxy's HTTP/2 pools" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ports = portsFor(profile.c1k_h2, test_fleet, 0);
+    try std.testing.expect(ports.tls != null);
+    const s = try envPrefix(arena, profile.c1k_h2, test_fleet, test_zoxy_src, ports);
+
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_TLS_PORT=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_H2=on ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_TLS_ENGINES=1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_H2_CONNECTIONS=1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_STREAM_SLOTS=1386") != null);
+
+    // `build` gets no ports, and so no protocol switch either.
+    const b = try envPrefix(arena, profile.c1k_h2, test_fleet, test_zoxy_src, null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "PROXY_H2") == null);
 }
 
 test "backendProfile starts one member per VM in cloud, the whole pool locally" {

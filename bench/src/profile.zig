@@ -42,6 +42,13 @@ pub const Profile = struct {
     /// crypto, not handshake throughput.
     tls: bool = false,
 
+    /// Speak HTTP/2 to the proxy: ALPN `h2` on the TLS listener, so `tls` must
+    /// be set (validate). One stream per connection, so in-flight requests
+    /// still equal `connections`. Inbound only, like TLS: every proxy's
+    /// upstream leg stays HTTP/1.1. The suite passes PROXY_H2=on to the
+    /// proxies, and the warm probe fails a listener that won't negotiate h2.
+    h2: bool = false,
+
     /// Summary-latency reference rate: a light, sub-knee load where latency
     /// reflects per-request cost rather than queueing. Per-profile because it
     /// must land after the connect storm (zrk/src/runner.zig:153-156).
@@ -59,6 +66,8 @@ pub const Profile = struct {
         if (self.ramp_seconds == 0) return error.InvalidRampSeconds;
         if (self.connections == 0) return error.InvalidConnections;
         if (self.threads == 0) return error.InvalidThreads;
+        // h2 is negotiated in the TLS handshake; nothing here speaks h2c.
+        if (self.h2 and !self.tls) return error.H2WithoutTls;
         // A zero wire timeout is allowed: as a compiled-in constant it cannot
         // arrive unnoticed the way the old env var's did.
 
@@ -160,6 +169,31 @@ pub const c1k_tls: Profile = blk: {
     break :blk p;
 };
 
+/// c1k-tls with HTTP/2 in place of HTTP/1.1 and nothing else changed, so the
+/// pair isolates the protocol. One stream per connection keeps 1000 requests
+/// in flight, as on c1k-tls: this measures HTTP/2 framing, HPACK and stream
+/// bookkeeping, not multiplexing. Every proxy advertises `h2, http/1.1`; zrk
+/// offers the same and counts a connection that lands on HTTP/1.1 as a
+/// connect error, and the warm probe refuses such a listener outright.
+pub const c1k_h2: Profile = blk: {
+    var p = c1k_tls;
+    p.name = "c1k-h2";
+    p.h2 = true;
+    // zoxy's HTTP/2 pools, legal only when a listener speaks h2 (zoxy
+    // refuses them otherwise, so only an h2 profile may set them).
+    // h2_connections: its 1024 default, pinned like tls_engines. With none
+    // free zoxy answers an h2 offer with HTTP/1.1, so it must cover the 1000
+    // connections; nonzero `zoxy_h2_shed_sessions` means it did not.
+    // stream_slots: required with h2, no default. One stream per connection
+    // needs 1000; conn_slots' 1386 keeps the same headroom. Nonzero
+    // `zoxy_h2_shed_streams` means the ramp measured this cap.
+    p.proxy_env = c1k_tls.proxy_env ++ [_]Pair{
+        .{ .key = "ZOXY_H2_CONNECTIONS", .value = "1024" },
+        .{ .key = "ZOXY_STREAM_SLOTS", .value = "1386" },
+    };
+    break :blk p;
+};
+
 pub const c100: Profile = .{
     .name = "c100",
     .connections = 100,
@@ -240,7 +274,7 @@ pub const smoke: Profile = .{
 /// APPEND-ONLY: `suite.proxyPort` keys per-turn host ports off the index, and
 /// renumbering reuses ports an earlier turn served load on (runs #25/#26).
 /// Dropping from the tail renumbers nothing (the c1k body bands left that way).
-pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke };
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_h2 };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -258,6 +292,7 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c1k") != null);
     try std.testing.expect(byName("c10k") != null);
     try std.testing.expect(byName("c1k-tls") != null);
+    try std.testing.expect(byName("c1k-h2") != null);
     try std.testing.expect(byName("") == null);
     try std.testing.expect(byName("c100k") == null);
     // The body bands are gone: naming one fails at argument parsing.
@@ -317,6 +352,53 @@ test "c1k-tls is c1k with TLS on, and nothing else" {
     try std.testing.expect(tls_engines <= 1024);
 }
 
+test "c1k-h2 is c1k-tls with HTTP/2 on, and nothing else" {
+    try std.testing.expect(c1k_h2.h2);
+    try std.testing.expect(c1k_h2.tls);
+    try std.testing.expect(!c1k_tls.h2);
+
+    try std.testing.expectEqual(c1k_tls.connections, c1k_h2.connections);
+    try std.testing.expectEqual(c1k_tls.threads, c1k_h2.threads);
+    try std.testing.expectEqual(c1k_tls.start_rate, c1k_h2.start_rate);
+    try std.testing.expectEqual(c1k_tls.max_rate, c1k_h2.max_rate);
+    try std.testing.expectEqual(c1k_tls.ramp_seconds, c1k_h2.ramp_seconds);
+    try std.testing.expectEqual(c1k_tls.timeout_s, c1k_h2.timeout_s);
+    try std.testing.expectEqual(c1k_tls.deadline_ms, c1k_h2.deadline_ms);
+    try std.testing.expectEqual(c1k_tls.ref_rate, c1k_h2.ref_rate);
+    try std.testing.expectEqual(c1k_tls.ref_band, c1k_h2.ref_band);
+    try std.testing.expectEqual(c1k_tls.cooldown_s, c1k_h2.cooldown_s);
+    try std.testing.expectEqualStrings(c1k_tls.req_path, c1k_h2.req_path);
+
+    // c1k-tls's tuning unchanged, plus exactly zoxy's two HTTP/2 pools.
+    try std.testing.expectEqual(c1k_tls.proxy_env.len + 2, c1k_h2.proxy_env.len);
+    for (c1k_tls.proxy_env, c1k_h2.proxy_env[0..c1k_tls.proxy_env.len]) |want, got| {
+        try std.testing.expectEqualStrings(want.key, got.key);
+        try std.testing.expectEqualStrings(want.value, got.value);
+    }
+    var h2_connections: u32 = 0;
+    var stream_slots: u32 = 0;
+    for (c1k_h2.proxy_env) |kv| {
+        if (std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS")) h2_connections = try std.fmt.parseInt(u32, kv.value, 10);
+        if (std.mem.eql(u8, kv.key, "ZOXY_STREAM_SLOTS")) stream_slots = try std.fmt.parseInt(u32, kv.value, 10);
+    }
+    // Short of either, zoxy hands connections HTTP/1.1 or refuses streams,
+    // and the ramp measures the cap rather than HTTP/2.
+    try std.testing.expect(h2_connections >= c1k_h2.connections);
+    try std.testing.expect(stream_slots >= c1k_h2.connections);
+}
+
+test "only an h2 profile sizes zoxy's HTTP/2 pools" {
+    // zoxy refuses stream_slots and h2_connections when no listener speaks
+    // h2, so on any other profile it would not start.
+    for (all) |p| {
+        if (p.h2) continue;
+        for (p.proxy_env) |kv| {
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS"));
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_STREAM_SLOTS"));
+        }
+    }
+}
+
 test "only a TLS profile sizes the TLS session pool" {
     // An engine pool on a plaintext profile would inflate published memory.
     for (all) |p| {
@@ -340,6 +422,7 @@ test "profile.all is append-only, because proxyPort keys off its index" {
     try std.testing.expectEqualStrings("c10k", all[2].name);
     try std.testing.expectEqualStrings("c1k-tls", all[3].name);
     try std.testing.expectEqualStrings("smoke", all[4].name);
+    try std.testing.expectEqualStrings("c1k-h2", all[5].name);
 }
 
 test "smoke shares no ramp shape with a published profile" {
@@ -370,6 +453,11 @@ test "validate rejects the misconfigurations the env plumbing used to allow" {
     p = c1k;
     p.ref_rate = @floatFromInt(p.max_rate);
     try std.testing.expectError(error.RefRateAboveRamp, p.validate());
+
+    // h2 rides ALPN; a plaintext h2 profile would have nothing to negotiate.
+    p = c1k;
+    p.h2 = true;
+    try std.testing.expectError(error.H2WithoutTls, p.validate());
 }
 
 test "c10k carries the deadline SLO and c1k does not" {

@@ -50,6 +50,10 @@ x-proxy-common: &proxy-common
 # turns must not carry one. Healthchecks stay on the plaintext listener; bench's
 # warm probe covers TLS.
 #
+# PROXY_H2: `on` only for h2 profiles (suite.zig envPrefix). Every TLS listener
+# then offers `h2, http/1.1` instead of `http/1.1` alone; the warm probe fails a
+# proxy that still picks HTTP/1.1. Upstream legs stay HTTP/1.1 either way.
+#
 # The cert is generated per run into ./proxies/tls (suite.zig
 # ensureTlsMaterial): ECDSA P-256, the only key type zoxy accepts.
 
@@ -175,9 +179,15 @@ services:
       # TLS session pool, set by TLS profiles only. One engine per admitted
       # connection, so anything under conn_slots sheds.
       ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
-      # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS.
+      # HTTP/2 pools, set by h2 profiles only: zoxy refuses both when no
+      # listener speaks h2.
+      ZOXY_H2_CONNECTIONS: ${ZOXY_H2_CONNECTIONS:-}
+      ZOXY_STREAM_SLOTS: ${ZOXY_STREAM_SLOTS:-}
+      # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS, and
+      # PROXY_H2 adds `h2` to its ALPN.
       PROXY_PORT: ${PROXY_PORT:-8080}
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
+      PROXY_H2: ${PROXY_H2:-}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
       - ./proxies/tls:/etc/bench/tls:ro
@@ -202,6 +212,8 @@ services:
       PROXY_PORT: ${PROXY_PORT:-8080}
       # Empty on plaintext turns: haproxy.cfg's `.if` drops the TLS frontend.
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
+      # `on` picks the bind line that advertises h2 (haproxy.cfg).
+      PROXY_H2: ${PROXY_H2:-}
     # haproxy cannot log to a path, so fd 1 (`log stdout`) goes to the file;
     # stderr still reaches `docker logs` for reportStartFailure. The image
     # entrypoint adds -W -db; `exec` keeps haproxy as PID 1.
@@ -227,14 +239,17 @@ services:
     profiles: [envoy]
     # --concurrency 1: envoy sizes workers from host CPUs, not the cgroup.
     # envoy.yaml has no env substitution, so sed bakes the ports in at compose
-    # parse time; plaintext turns delete @TLS_BEGIN@..@TLS_END@. `$$` escapes a
-    # dollar for the shell.
+    # parse time; plaintext turns delete @TLS_BEGIN@..@TLS_END@, and @ALPN@
+    # becomes `"h2", "http/1.1"` on h2 turns. `$$` escapes a dollar for the
+    # shell; `|` delimits the ALPN substitution, whose value holds a `/`.
     entrypoint: ["sh", "-c"]
     command:
       - >-
         tls='/@TLS_BEGIN@/,/@TLS_END@/d';
         [ -n "${PROXY_TLS_PORT:-}" ] && tls='s/@TLS_PORT@/${PROXY_TLS_PORT}/';
-        sed -e 's/@PORT@/${PROXY_PORT:-8080}/' -e "$$tls"
+        alpn='"http/1.1"';
+        [ -n "${PROXY_H2:-}" ] && alpn='"h2", "http/1.1"';
+        sed -e 's/@PORT@/${PROXY_PORT:-8080}/' -e "$$tls" -e "s|@ALPN@|$$alpn|"
         /etc/envoy/envoy.yaml.template > /tmp/envoy.yaml &&
         exec envoy -c /tmp/envoy.yaml --concurrency 1
     volumes:
@@ -257,6 +272,9 @@ services:
       PROXY_PORT: ${PROXY_PORT:-8080}
       # Empty on plaintext turns: 25-tls.sh deletes the TLS server block.
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
+      # The TLS server's `http2` directive: `on` for h2 profiles, else `off`
+      # (nginx's default, so HTTP/1.1 turns render what they always did).
+      NGINX_HTTP2: ${PROXY_H2:-off}
     volumes:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       # Shared by both server blocks so plaintext and TLS proxy identically.
@@ -285,6 +303,8 @@ services:
       LISTEN: 0.0.0.0:${PROXY_PORT:-8080}
       # Empty on plaintext turns, so main.rs adds no TLS endpoint.
       TLS_LISTEN: ${PROXY_TLS_PORT:+0.0.0.0:}${PROXY_TLS_PORT:-}
+      # Non-empty: the TLS endpoint prefers h2 (main.rs).
+      PROXY_H2: ${PROXY_H2:-}
       UPSTREAMS: backend0:9000,backend1:9000,backend2:9000,backend3:9000
     volumes:
       - ./proxies/tls:/etc/bench/tls:ro

@@ -59,8 +59,10 @@ http {
         ssl_protocols TLSv1.3;
         ssl_certificate     /etc/bench/tls/bench.crt;
         ssl_certificate_key /etc/bench/tls/bench.key;
-        # HTTP/1.1 only (no `http2 on;`), as on every proxy. Session tickets
-        # left default; the generator never resumes.
+        # `off` (nginx's default: ALPN http/1.1) except on h2 profiles, where
+        # it offers `h2, http/1.1` like every proxy. Session tickets left
+        # default; the generator never resumes.
+        http2 ${NGINX_HTTP2};
         include /etc/nginx/origin-location.conf;
         proxy_buffering off;
     }
