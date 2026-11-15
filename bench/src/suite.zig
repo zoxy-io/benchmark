@@ -246,8 +246,10 @@ fn cacheableImage(name: []const u8) ?[]const u8 {
 }
 
 /// Shell command asking the RUNNING container its version (what answered, not
-/// what compose requested). `head -1`: haproxy appends a blurb; `2>&1`: some
-/// print to stderr. Proxies with no version CLI report their image reference.
+/// what compose requested). `grep -m1 .`, the first NON-EMPTY line: haproxy
+/// appends a blurb, and envoy (1.40) prints a blank line before its version,
+/// which `head -1` kept as an empty version. `2>&1`: some print to stderr.
+/// Proxies with no version CLI report their image reference.
 fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
     const asks_itself = [_]struct { proxy: []const u8, argv: []const u8 }{
         .{ .proxy = "haproxy", .argv = "haproxy -v" },
@@ -256,7 +258,7 @@ fn versionProbe(arena: Allocator, name: []const u8) ![]const u8 {
     };
     for (asks_itself) |e| {
         if (std.mem.eql(u8, name, e.proxy)) {
-            return std.fmt.allocPrint(arena, "docker exec {s} {s} 2>&1 | head -1", .{ name, e.argv });
+            return std.fmt.allocPrint(arena, "docker exec {s} {s} 2>&1 | grep -m1 .", .{ name, e.argv });
         }
     }
     return std.fmt.allocPrint(arena, "docker inspect -f '{{{{.Config.Image}}}}' {s} 2>/dev/null", .{name});
@@ -2130,9 +2132,10 @@ test "the version probe asks the container, and falls back to the image tag" {
     // Proxies with a version CLI are asked inside the container.
     const hap = try versionProbe(arena, "haproxy");
     try std.testing.expect(std.mem.indexOf(u8, hap, "docker exec haproxy haproxy -v") != null);
-    // stderr folded in, one line kept (haproxy appends a blurb).
+    // stderr folded in, first non-empty line kept (haproxy appends a blurb;
+    // envoy leads with a blank line).
     try std.testing.expect(std.mem.indexOf(u8, hap, "2>&1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hap, "head -1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hap, "grep -m1 .") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, try versionProbe(arena, "envoy"), "envoy --version") != null);
     try std.testing.expect(std.mem.indexOf(u8, try versionProbe(arena, "zoxy"), "zoxy --version") != null);
