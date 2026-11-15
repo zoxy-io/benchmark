@@ -90,15 +90,18 @@ pub const Profile = struct {
 /// only to a release. Set a branch/tag/sha to build from source.
 pub const zoxy_ref = "release";
 
-// Shared ramp shape: the offered axis every chart shares. 100k rps of 10 KiB is
-// ~8.2 Gbps, past what the rig carries (the old 100 KiB band put every proxy at
-// 3-4 Gbps); no proxy gets near it, so compare proxies to each other, not to
-// line rate (`direct` in git history finds it).
+// Shared ramp shape: the offered axis every chart shares. 40k: the fastest
+// 10 KiB knee on record is zoxy's 27.2k (median 21.6k, runs 20260918-20261007),
+// and `sustained` reads the ceiling, not a knee, for a proxy that never falls
+// behind, so 1.5x that best night is the margin. ~133 rps/s is 2.5x finer
+// near each knee than the 100k ramp it replaced (2026-11-15). 40k of 10 KiB
+// is ~3.3 Gbps, where the old 100 KiB band put every proxy; compare proxies to
+// each other, not to line rate (`direct` in git history finds it).
 const start_rate: u64 = 200;
-const max_rate: u64 = 100_000;
+const max_rate: u64 = 40_000;
 const ramp_seconds: u64 = 300;
 
-/// The nightly baseline, and the one body size every nightly profile shares.
+/// The nightly baseline, and the one body size every profile shares.
 ///
 /// 10 KiB estimates the mean response behind an app-tier reverse proxy (API
 /// plus HTML, static assets on a CDN); the median is nearer 1 KiB, but the mean
@@ -157,10 +160,6 @@ pub const c1k_tls: Profile = blk: {
     break :blk p;
 };
 
-// c100, c10k and smoke stay on 1 KiB: none runs nightly, and at 10 KiB c10k's
-// ref_rate (8000, pinned past its connect storm) would sit above envoy's knee
-// (~7k), so its reference latency would read overload.
-
 pub const c100: Profile = .{
     .name = "c100",
     .connections = 100,
@@ -170,7 +169,7 @@ pub const c100: Profile = .{
     .ramp_seconds = ramp_seconds,
     .timeout_s = 1,
     .deadline_ms = 0,
-    .req_path = "/1k",
+    .req_path = "/10k",
     // c1k's ref_rate, for direct comparison; connections cap concurrency, not
     // throughput.
     .ref_rate = 2000,
@@ -192,12 +191,14 @@ pub const c10k: Profile = .{
     .timeout_s = 1,
 
     // One SLO for every proxy. Without it every c10k tail percentile is zrk's
-    // 60s clamp and each proxy's own timeouts decide the outcome. It sheds ~90%
-    // at the top of the ramp, but is negligible at `ref_rate`.
+    // 60s clamp and each proxy's own timeouts decide the outcome. It sheds
+    // heavily past each knee, but is negligible at `ref_rate`.
     .deadline_ms = 1000,
-    .req_path = "/1k",
-    // ~t=47s: past the connect storm for all 10k connections.
-    .ref_rate = 8000,
+    .req_path = "/10k",
+    // t=36s: past the 10k-connection connect storm (8000 sat at t=23 on the
+    // 100k ramp), and under envoy's 10 KiB knee (lowest c1k night 5989), so
+    // the reference latency is not overload.
+    .ref_rate = 5000,
     .ref_band = 0.15,
     .cooldown_s = 8,
     .proxy_env = &.{
@@ -227,7 +228,7 @@ pub const smoke: Profile = .{
     .ramp_seconds = 30,
     .timeout_s = 1,
     .deadline_ms = 0,
-    .req_path = "/1k",
+    .req_path = "/10k",
     // t=11.25s: clear of the t>=3 warmup, with the +/-20% band whole.
     .ref_rate = 2000,
     .ref_band = 0.20,
@@ -265,11 +266,12 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c1k-100k") == null);
 }
 
-test "c1k's body is 10 KiB, and no profile still sizes zoxy's relay buffer" {
-    try std.testing.expectEqualStrings("/10k", c1k.req_path);
-    // Over 16 KiB a body costs zoxy extra round trips; the knob that hid
-    // that left with the 100 KiB band, and its plumbing with it.
+test "every profile requests the one 10 KiB body, and none sizes zoxy's relay buffer" {
+    // backend/10-gen-bodies.sh serves /10k and nothing else.
     for (all) |p| {
+        try std.testing.expectEqualStrings("/10k", p.req_path);
+        // Over 16 KiB a body costs zoxy extra round trips; the knob that hid
+        // that left with the 100 KiB band, and its plumbing with it.
         for (p.proxy_env) |kv| {
             try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_RELAY_BUFFER_BYTES"));
         }

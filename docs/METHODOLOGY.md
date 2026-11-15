@@ -170,7 +170,7 @@ is the other half, and it is the half where proxies differ.
   - **The offered axis itself moved once, at the zrk 2.4.2 bump.** A
     `--timeseries` row's `target_rate` is the load offered across that window;
     it used to be the schedule at the window's closing instant, which is half a
-    window of slope higher (~166 rps on this ramp) and was paired with a
+    window of slope higher (~166 rps on the 100k ramp) and was paired with a
     window-averaged achieved rate beside it (zoxy-io/zrk#70). Every proxy in a
     run moves together, so within a run nothing changes; a small shift left on
     the trend chart across that commit is the commit.
@@ -186,6 +186,14 @@ is the other half, and it is the half where proxies differ.
     100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
     `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
     continues.
+  - **`MAX_RATE` moved once, from 100k to 40k (2026-11-15), right after the
+    body did.** At 10 KiB the fastest knee on record is zoxy's 27.2k, so
+    100k spent most of each ramp in overload; 40k keeps 1.5x over that best
+    night and puts 2.5x more windows near each knee. The run dispatched
+    between the two changes is the one night of 10 KiB on the 100k ramp: read
+    its offered axis apart from both sides. A proxy whose `sustained` reads
+    within a few percent of 40k hit the ceiling, not its knee: raise
+    `max_rate` before believing it.
 - **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
   engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
   those three syscalls — not `unconfined`. If io_uring init fails zoxy exits at

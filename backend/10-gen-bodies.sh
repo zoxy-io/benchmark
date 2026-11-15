@@ -1,7 +1,5 @@
 #!/bin/sh
-# Run by the nginx image before start: canned bodies into the tmpfs.
-# 10k is every nightly profile's; 1k serves c100/c10k/smoke and healthchecks.
+# Run by the nginx image before start: the canned body into the tmpfs.
+# One size, 10 KiB, for every profile and healthcheck (profile.zig `c1k`).
 set -eu
-gen() { head -c "$2" /dev/zero | tr '\0' 'x' > "/srv/bodies/$1"; }
-gen 1k 1024
-gen 10k 10240
+head -c 10240 /dev/zero | tr '\0' 'x' > /srv/bodies/10k

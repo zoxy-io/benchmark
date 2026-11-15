@@ -53,7 +53,7 @@ x-proxy-common: &proxy-common
 # The cert is generated per run into ./proxies/tls (suite.zig
 # ensureTlsMaterial): ECDSA P-256, the only key type zoxy accepts.
 
-# Healthcheck = a real request through the proxy to /1k, so `up --wait` waits
+# Healthcheck = a real request through the proxy to /10k, so `up --wait` waits
 # for serving, not merely running (a leftover container could answer instead).
 # It runs in the proxy's cgroup, so the timing must be identical for all five.
 x-healthcheck-timing: &healthcheck-timing
@@ -67,7 +67,7 @@ x-healthcheck-timing: &healthcheck-timing
 # container): haproxy and nginx (alpine) have busybox wget.
 x-healthcheck-wget: &healthcheck-wget
   <<: *healthcheck-timing
-  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PROXY_PORT:-8080}/1k"]
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PROXY_PORT:-8080}/10k"]
 
 # The rest have no wget, but their bash supports /dev/tcp.
 x-healthcheck-bash: &healthcheck-bash
@@ -76,7 +76,7 @@ x-healthcheck-bash: &healthcheck-bash
     - CMD
     - bash
     - -c
-    - 'exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT:-8080} && printf "GET /1k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
+    - 'exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT:-8080} && printf "GET /10k HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n" >&3 && grep -q "^HTTP/1.[01] 200" <&3'
 
 # --------------------------------------------------------------- the origin --
 # Four backends: picking a pool member is part of a proxy's job; every proxy
@@ -96,9 +96,9 @@ x-backend: &backend
     - ./backend/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
     - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
   tmpfs:
-    - /srv/bodies # canned 1k/10k responses live in RAM
+    - /srv/bodies # the canned 10k response lives in RAM
   healthcheck:
-    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/1k"]
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/10k"]
     interval: 2s
     timeout: 2s
     retries: 15

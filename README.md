@@ -9,12 +9,12 @@ It runs **unattended every night** on a throwaway six-VM fleet with no public
 addresses, and the summary is posted to Discord and published to Pages.
 
 ```
-             0 ──────── linear ramp ────────► MAX_RATE (100k)
+           200 ──────── linear ramp ────────► MAX_RATE (40k)
                                                   ┌─► backend0 ─┐
         zrk ───────► proxy-under-test ────────────┼─► backend1  │  nginx origin
- (open loop, CO-     (pinned core, 4 GiB cap,     ├─► backend2  │  pool: canned
-  corrected)          ONE at a time)              └─► backend3 ─┘  64B..100k
-      │                       │                    round-robin     bodies, 2
+ (open loop, CO-     (pinned core, 4 GiB cap,     ├─► backend2  │  pool: one
+  corrected)          ONE at a time)              └─► backend3 ─┘  canned 10 KiB
+      │                       │                    round-robin     body, 2
       │                       │                                    cpus each
       │                       └── cAdvisor :8081 ── sampled at 1Hz
       │                            (cpu + working-set, into the run's
@@ -23,6 +23,16 @@ addresses, and the summary is posted to Discord and published to Pages.
              │
              └─► bench report ── report.json + report.html
 ```
+
+**Every request fetches the same 10 KiB response, and nothing else is
+measured.** One body size, on purpose: 10 KiB is our estimate of the *mean*
+response behind an application-tier proxy (API and HTML, static assets on a
+CDN; the median is nearer 1 KiB, but the mean is what sets capacity under a
+real mix), and it is the size at which a proxy's per-request cost and its
+per-byte cost both show in the result. Smaller bodies measured mostly request
+handling; at 100 KiB every proxy converged on the network path. The 64 B to
+100 KiB nights this was decided from are in the published history
+(2026-09-18 to 2026-10-07).
 
 Every proxy is an **HTTP/1.1 reverse proxy** doing the same job: parse each
 request, **pick an origin from a four-node pool**, forward it over a pooled
