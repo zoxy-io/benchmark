@@ -28,7 +28,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k,c1k-tls,c1k-64,c1k-10k,c1k-100k
+        default: c1k,c1k-tls
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -66,11 +66,10 @@ jobs:
       BENCH: ${{ github.workspace }}/bin/bench
 
       # `inputs` is null on a scheduled run, hence the fallbacks.
-      # c1k-tls and the c1k body-size variants must run on the same night and
-      # fleet as c1k to be comparable; c1k-100k runs last (likeliest to
-      # misbehave). c10k is excluded while run #25's start failure is open;
-      # dispatch with it to run anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-64,c1k-10k,c1k-100k' }}
+      # c1k-tls must run on the same night and fleet as c1k to be comparable.
+      # c10k is excluded while run #25's start failure is open; dispatch with
+      # it to run anyway.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}

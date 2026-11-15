@@ -121,8 +121,9 @@ is the other half, and it is the half where proxies differ.
     ECDSA P-256/P-384 and rejects RSA outright, because an RSA signature would
     stall its single event loop.
   - **TLS 1.3, and HTTP/1.1 underneath it.** Every listener is pinned to 1.3,
-    and the generator offers **no ALPN**, so nothing here is HTTP/2 and the
-    protocol being proxied is the same one every other profile measures. The
+    and the generator offers **only `http/1.1` in ALPN**, so nothing here is
+    HTTP/2 and the protocol being proxied is the same one every other profile
+    measures. The
     ALPN list is pinned to `http/1.1` where it can be (haproxy, envoy) rather
     than left at each proxy's default: haproxy's TLS bind advertises `h2` by
     default and was measured negotiating HTTP/2 against an ALPN-offering client
@@ -173,6 +174,15 @@ is the other half, and it is the half where proxies differ.
     window-averaged achieved rate beside it (zoxy-io/zrk#70). Every proxy in a
     run moves together, so within a run nothing changes; a small shift left on
     the trend chart across that commit is the commit.
+  - **The body moved once, from 1 KiB to 10 KiB (2026-11-15),** in the same
+    change that moved envoy to 1.40 and pingora to 0.9, so the trend steps
+    once for all three. 10 KiB estimates the
+    mean response behind an app-tier proxy, and is where per-request and
+    per-byte cost both show (reasoning in `profile.zig`, on `c1k`). Every
+    proxy's `c1k` and `c1k-tls` trend steps down there; the 64 B, 10 KiB and
+    100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
+    `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
+    continues.
 - **zoxy runs io_uring**: Docker's default seccomp has denied `io_uring_*` since
   engine 25.0. `proxies/zoxy/seccomp-iouring.json` is the default profile *plus*
   those three syscalls — not `unconfined`. If io_uring init fails zoxy exits at

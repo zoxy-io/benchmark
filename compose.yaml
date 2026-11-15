@@ -96,9 +96,9 @@ x-backend: &backend
     - ./backend/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
     - ./backend/10-gen-bodies.sh:/docker-entrypoint.d/10-gen-bodies.sh:ro
   tmpfs:
-    - /srv/bodies # canned 64B/1k/10k/100k responses live in RAM
+    - /srv/bodies # canned 1k/10k responses live in RAM
   healthcheck:
-    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/64"]
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/1k"]
     interval: 2s
     timeout: 2s
     retries: 15
@@ -175,11 +175,6 @@ services:
       # TLS session pool, set by TLS profiles only. One engine per admitted
       # connection, so anything under conn_slots sheds.
       ZOXY_TLS_ENGINES: ${ZOXY_TLS_ENGINES:-}
-      # Bytes per relay direction, set by the large-body profile only: it
-      # sets how many recv->send round trips one body costs, and doubles
-      # zoxy's relay pool when raised. Unset elsewhere keeps zoxy's 16 KiB
-      # default; zoxy refuses above that on a TLS turn.
-      ZOXY_RELAY_BUFFER_BYTES: ${ZOXY_RELAY_BUFFER_BYTES:-}
       # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS.
       PROXY_PORT: ${PROXY_PORT:-8080}
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
@@ -227,7 +222,7 @@ services:
 
   envoy:
     <<: *proxy-common
-    image: envoyproxy/envoy:v1.36-latest
+    image: envoyproxy/envoy:v1.40-latest
     container_name: envoy
     profiles: [envoy]
     # --concurrency 1: envoy sizes workers from host CPUs, not the cgroup.
@@ -282,7 +277,7 @@ services:
       context: ./proxies/pingora
       args:
         PINGORA_TARGET_CPU: ${PINGORA_TARGET_CPU:-native}
-    image: zoxy-bench/pingora-http:0.8
+    image: zoxy-bench/pingora-http:0.9
     container_name: pingora
     profiles: [pingora]
     environment:

@@ -33,7 +33,7 @@ http {
 
     server {
         listen 9000 backlog=65535 reuseport;
-        root /srv/bodies; # /64 /1k /10k /100k generated at container start
+        root /srv/bodies; # /1k /10k generated at container start
 
         location = /healthz {
             return 200 "ok\n";

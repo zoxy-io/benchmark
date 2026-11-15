@@ -1,7 +1,7 @@
 # Minimal HTTP/1.1 reverse proxy built on Pingora (src/main.rs).
 # Build deps cover both TLS backends; main.rs uses `add_tls`, so a missing
 # backend fails here at build time rather than at the first TLS ramp.
-FROM rust:1.85-bookworm AS build
+FROM rust:1.100-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        cmake clang libclang-dev libssl-dev pkg-config perl \

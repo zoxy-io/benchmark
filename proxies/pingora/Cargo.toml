@@ -8,10 +8,10 @@ name = "pingora-http"
 path = "src/main.rs"
 
 [dependencies]
-# The `openssl` feature is required: without a TLS feature, pingora-core 0.8
-# compiles `add_tls` but panics at the first handshake (noop_tls).
-pingora-core = { version = "0.8", features = ["openssl"] }
-pingora-proxy = { version = "0.8", features = ["openssl"] }
+# The `openssl` feature is required: without a TLS feature, pingora-core
+# compiles `add_tls` but panics at the first handshake (noop_tls, seen on 0.8).
+pingora-core = { version = "0.9", features = ["openssl"] }
+pingora-proxy = { version = "0.9", features = ["openssl"] }
 async-trait = "0.1"
 # Access-log timestamps (already a pingora-core dep). default-features = false
 # avoids pulling iana-time-zone, which is not in the lockfile; logs are UTC.

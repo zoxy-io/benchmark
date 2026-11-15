@@ -118,7 +118,7 @@ variable "image_id" {
 # Sizing: the proxy container gets 1 CPU on cpuset 0 whatever the VM size;
 # spare cores keep OS/dockerd/cAdvisor off core 0 and speed up `docker build`.
 # CAVEAT: standard-v3 scales NIC bandwidth with vCPUs, and proxied traffic
-# crosses it twice (~408 Mbps at 24.9k rps of 1 KiB). If numbers rise after a
+# crosses it twice (~1.8 Gbps at 21.6k rps of 10 KiB). If numbers rise after a
 # core change, they were NIC-limited.
 variable "proxy_cores" {
   type    = number

@@ -241,7 +241,7 @@ const zig_toolchain_tag = "zoxy-bench/zig:0.16.0";
 /// null. zoxy is excluded: it tracks a moving ref, and a wrongly-keyed cache
 /// would silently benchmark a stale binary.
 fn cacheableImage(name: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, name, "pingora")) return "zoxy-bench/pingora-http:0.8";
+    if (std.mem.eql(u8, name, "pingora")) return "zoxy-bench/pingora-http:0.9";
     return null;
 }
 

@@ -90,13 +90,27 @@ pub const Profile = struct {
 /// only to a release. Set a branch/tag/sha to build from source.
 pub const zoxy_ref = "release";
 
-// Shared ramp shape: the offered axis every chart shares. 100k rps of 1 KiB is
-// ~820 Mbps, near the rig's NIC limit, which nothing measures now; compare
-// proxies to each other, not to line rate (`direct` in git history finds it).
+// Shared ramp shape: the offered axis every chart shares. 100k rps of 10 KiB is
+// ~8.2 Gbps, past what the rig carries (the old 100 KiB band put every proxy at
+// 3-4 Gbps); no proxy gets near it, so compare proxies to each other, not to
+// line rate (`direct` in git history finds it).
 const start_rate: u64 = 200;
 const max_rate: u64 = 100_000;
 const ramp_seconds: u64 = 300;
 
+/// The nightly baseline, and the one body size every nightly profile shares.
+///
+/// 10 KiB estimates the mean response behind an app-tier reverse proxy (API
+/// plus HTML, static assets on a CDN); the median is nearer 1 KiB, but the mean
+/// is what sets capacity under a real mix. It is also where per-request and
+/// per-byte cost both show: the 64B-100k bands (runs 20260918-20261007) put
+/// each proxy's break-even between 5 KiB (zoxy) and 43 KiB (envoy), and at
+/// 100 KiB every proxy converged on the network path. It fits zoxy's 16 KiB
+/// relay buffer and one default HTTP/2 DATA frame, so no knob or window
+/// default decides the result.
+///
+/// Was 1 KiB until 2026-11-15: c1k's trend steps there, and the old c1k-10k
+/// series is the one that continues.
 pub const c1k: Profile = .{
     .name = "c1k",
     .connections = 1000,
@@ -106,7 +120,7 @@ pub const c1k: Profile = .{
     .ramp_seconds = ramp_seconds,
     .timeout_s = 1,
     .deadline_ms = 0,
-    .req_path = "/1k",
+    .req_path = "/10k",
     .ref_rate = 2000,
     .ref_band = 0.20,
     .cooldown_s = 8,
@@ -123,7 +137,7 @@ pub const c1k: Profile = .{
 
 /// c1k with TLS on the client leg and nothing else changed, so the pair
 /// isolates the cost of TLS. Diverge only visibly, below. `ref_rate` stays
-/// 2000 so "TLS costs X" is a subtraction (~2.6 MB/s AEAD, well sub-knee).
+/// 2000 so "TLS costs X" is a subtraction (~21 MB/s AEAD, well sub-knee).
 pub const c1k_tls: Profile = blk: {
     var p = c1k;
     p.name = "c1k-tls";
@@ -143,44 +157,9 @@ pub const c1k_tls: Profile = blk: {
     break :blk p;
 };
 
-/// c1k with a different response body and nothing else changed (bodies from
-/// backend/10-gen-bodies.sh).
-fn c1kBody(comptime name: []const u8, comptime path: []const u8) Profile {
-    var p = c1k;
-    p.name = name;
-    p.req_path = path;
-    return p;
-}
-
-pub const c1k_64 = c1kBody("c1k-64", "/64");
-pub const c1k_10k = c1kBody("c1k-10k", "/10k");
-
-/// The large-body band, and the only profile that sets zoxy's relay buffer.
-///
-/// A 100k body is the first that does not fit one buffer: at zoxy's 16 KiB
-/// default it is 7 strict recv->send->recv round trips (zoxy DESIGN.md §6),
-/// 4 at 32 KiB. Run 20260918-014014 is what puts the knob here — zoxy
-/// placed last (4228/s against nginx 5838) while holding 0.47 of its one
-/// core, where nginx/pingora/haproxy all reached 0.94-1.0, and its 5586
-/// errors were every one a timeout rather than a refusal. A throughput
-/// ceiling with half the core idle is the shape a per-body round-trip bound
-/// makes, and this is the cheapest test of it: zoxy leads the same ramp by
-/// 2.3x at 64B and 1k, where a body is one chunk.
-///
-/// The knob doubles zoxy's relay pool (`relay_buffers` x 2 x this, so
-/// 1386 pairs cost ~87 MiB against ~43), which is why it stays on this
-/// profile alone — and why the memory column here is expected to move.
-/// Needs a zoxy whose `relay_buffer_bytes_max` is 32 KiB; releases through
-/// 0.8.2 cap it at 16 and would refuse to start
-/// (`LimitRelayBufferBytesOutOfRange`), so `zoxy_ref` must name a build
-/// that has it.
-pub const c1k_100k = blk: {
-    var p = c1kBody("c1k-100k", "/100k");
-    p.proxy_env = c1k.proxy_env ++ [_]Pair{
-        .{ .key = "ZOXY_RELAY_BUFFER_BYTES", .value = "32768" },
-    };
-    break :blk p;
-};
+// c100, c10k and smoke stay on 1 KiB: none runs nightly, and at 10 KiB c10k's
+// ref_rate (8000, pinned past its connect storm) would sit above envoy's knee
+// (~7k), so its reference latency would read overload.
 
 pub const c100: Profile = .{
     .name = "c100",
@@ -259,7 +238,8 @@ pub const smoke: Profile = .{
 
 /// APPEND-ONLY: `suite.proxyPort` keys per-turn host ports off the index, and
 /// renumbering reuses ports an earlier turn served load on (runs #25/#26).
-pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_64, c1k_10k, c1k_100k };
+/// Dropping from the tail renumbers nothing (the c1k body bands left that way).
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -277,11 +257,23 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c1k") != null);
     try std.testing.expect(byName("c10k") != null);
     try std.testing.expect(byName("c1k-tls") != null);
-    try std.testing.expect(byName("c1k-64") != null);
-    try std.testing.expect(byName("c1k-10k") != null);
-    try std.testing.expect(byName("c1k-100k") != null);
     try std.testing.expect(byName("") == null);
     try std.testing.expect(byName("c100k") == null);
+    // The body bands are gone: naming one fails at argument parsing.
+    try std.testing.expect(byName("c1k-64") == null);
+    try std.testing.expect(byName("c1k-10k") == null);
+    try std.testing.expect(byName("c1k-100k") == null);
+}
+
+test "c1k's body is 10 KiB, and no profile still sizes zoxy's relay buffer" {
+    try std.testing.expectEqualStrings("/10k", c1k.req_path);
+    // Over 16 KiB a body costs zoxy extra round trips; the knob that hid
+    // that left with the 100 KiB band, and its plumbing with it.
+    for (all) |p| {
+        for (p.proxy_env) |kv| {
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_RELAY_BUFFER_BYTES"));
+        }
+    }
 }
 
 test "c1k-tls is c1k with TLS on, and nothing else" {
@@ -346,43 +338,6 @@ test "profile.all is append-only, because proxyPort keys off its index" {
     try std.testing.expectEqualStrings("c10k", all[2].name);
     try std.testing.expectEqualStrings("c1k-tls", all[3].name);
     try std.testing.expectEqualStrings("smoke", all[4].name);
-    try std.testing.expectEqualStrings("c1k-64", all[5].name);
-    try std.testing.expectEqualStrings("c1k-10k", all[6].name);
-    try std.testing.expectEqualStrings("c1k-100k", all[7].name);
-}
-
-test "the body-size profiles are c1k with the body swapped, and nothing else" {
-    // The ramp shape is what makes the four bands comparable, so every
-    // field that shapes the offered axis must still match c1k exactly.
-    for ([_]Profile{ c1k_64, c1k_10k, c1k_100k }) |p| {
-        try std.testing.expect(!std.mem.eql(u8, c1k.req_path, p.req_path));
-        try std.testing.expectEqual(c1k.tls, p.tls);
-        try std.testing.expectEqual(c1k.connections, p.connections);
-        try std.testing.expectEqual(c1k.threads, p.threads);
-        try std.testing.expectEqual(c1k.start_rate, p.start_rate);
-        try std.testing.expectEqual(c1k.max_rate, p.max_rate);
-        try std.testing.expectEqual(c1k.ramp_seconds, p.ramp_seconds);
-        try std.testing.expectEqual(c1k.timeout_s, p.timeout_s);
-        try std.testing.expectEqual(c1k.deadline_ms, p.deadline_ms);
-        try std.testing.expectEqual(c1k.ref_rate, p.ref_rate);
-        try std.testing.expectEqual(c1k.ref_band, p.ref_band);
-        try std.testing.expectEqual(c1k.cooldown_s, p.cooldown_s);
-    }
-    // Two of the three are pure body swaps, sharing c1k's env slice.
-    try std.testing.expectEqual(c1k.proxy_env.ptr, c1k_64.proxy_env.ptr);
-    try std.testing.expectEqual(c1k.proxy_env.ptr, c1k_10k.proxy_env.ptr);
-    // c1k-100k is the documented exception: c1k's env plus the relay
-    // buffer, and nothing more. Pinned so a second knob cannot join it
-    // without saying so here — the band only stays a body swap if the
-    // proxy config is otherwise identical.
-    try std.testing.expectEqual(c1k.proxy_env.len + 1, c1k_100k.proxy_env.len);
-    for (c1k.proxy_env, c1k_100k.proxy_env[0..c1k.proxy_env.len]) |want, got| {
-        try std.testing.expectEqualStrings(want.key, got.key);
-        try std.testing.expectEqualStrings(want.value, got.value);
-    }
-    const extra = c1k_100k.proxy_env[c1k.proxy_env.len];
-    try std.testing.expectEqualStrings("ZOXY_RELAY_BUFFER_BYTES", extra.key);
-    try std.testing.expectEqualStrings("32768", extra.value);
 }
 
 test "smoke shares no ramp shape with a published profile" {
