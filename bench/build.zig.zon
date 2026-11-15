@@ -3,7 +3,7 @@
     .version = "0.0.0",
     // Regenerated; the old zrk_runner fingerprint belongs to loadgen/zrk-runner.
     .fingerprint = 0x66d8e325bc180f27,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     // Bump with `zig fetch --save=zrk git+https://github.com/zoxy-io/zrk#<ref>`,
     // or fetch without `--save` and hand-edit url+hash to keep these comments.
     // The zio pin MUST match the zio that zrk ref depends on (see its
@@ -14,16 +14,16 @@
     // zurl is pinned to whatever zrk pins; two copies would be incompatible.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.4.2#63d345286d563af82660b4ab02c970ef58999b2d",
-            .hash = "zrk-2.4.2-WqdFO6tKBwBy6heThWihtNgXHvz1YptJ-IVND3Hscw_3",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v3.0.1#518e5d2f2a2da91d148100312722d9ee6ce76667",
+            .hash = "zrk-3.0.1-WqdFOyTkDQCqDocn7xp4MLGWm_lQOzlEExpy41dEUBio",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
-            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
         },
         .zurl = .{
-            .url = "git+https://github.com/zoxy-io/zurl#4ecb1768985425d4f09b317f23f203983ef87d96",
-            .hash = "zurl-0.0.0--VALCi1dBQA6i4gkVVX11IV13I784dueJYYAzyZZTBPz",
+            .url = "git+https://github.com/zoxy-io/zurl#41a3637f7227f208f503295125e1119f91c9851a",
+            .hash = "zurl-0.0.2--VALCsF8BQDs0vOh8b6HYkJHXz0sg6P3sVL34bWgpnD6",
         },
     },
     .paths = .{

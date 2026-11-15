@@ -64,5 +64,5 @@ pub fn fetch(gpa: Allocator, io: Io, req: zurl.FetchRequest) !?Response {
     };
 
     // zurl range-checks the status before returning, so this is in 100..999.
-    return .{ .status = @enumFromInt(response.status) };
+    return .{ .status = @fromBackingInt(@intCast(response.status)) };
 }

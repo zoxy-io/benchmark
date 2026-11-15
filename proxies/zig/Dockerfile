@@ -3,10 +3,10 @@
 # truncated tarball). git/ca-certificates are for zoxy's clone.
 FROM debian:bookworm-slim
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.1
 # From ziglang.org/download/index.json. amd64 only (the fleet's arch); arm64
 # (local smoke) skips the check rather than trust an unverified value.
-ARG ZIG_SHA256_AMD64=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+ARG ZIG_SHA256_AMD64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
 ARG TARGETARCH
 
 RUN apt-get update \

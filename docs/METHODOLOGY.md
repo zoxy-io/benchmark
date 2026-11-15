@@ -175,8 +175,11 @@ is the other half, and it is the half where proxies differ.
     run moves together, so within a run nothing changes; a small shift left on
     the trend chart across that commit is the commit.
   - **The body moved once, from 1 KiB to 10 KiB (2026-11-15),** in the same
-    change that moved envoy to 1.40 and pingora to 0.9, so the trend steps
-    once for all three. 10 KiB estimates the
+    change that moved envoy to 1.40, pingora to 0.9 and the generator to zrk
+    3.0.1 (on Zig 0.17.1), so the trend steps once for all of them. zrk 3
+    sends a byte-identical HTTP/1.1 request and writes the same timeseries,
+    but its connection loop was reworked (HTTP/3, scripting), so part of that
+    step may be the generator rather than the proxies. 10 KiB estimates the
     mean response behind an app-tier proxy, and is where per-request and
     per-byte cost both show (reasoning in `profile.zig`, on `c1k`). Every
     proxy's `c1k` and `c1k-tls` trend steps down there; the 64 B, 10 KiB and

@@ -21,7 +21,7 @@ devenv.local.nix
 # zig build artifacts (build.zig.zon pins deps by hash)
 bench/.zig-cache/
 bench/zig-out/
-# Vestigial: no build uses it any more; safe to delete.
+# Zig 0.17 unpacks dependencies here; rebuilt from the global cache.
 bench/zig-pkg/
 
 # rust build artifacts (proxies/pingora); lockfile not committed

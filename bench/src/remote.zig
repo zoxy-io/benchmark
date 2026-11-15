@@ -28,7 +28,7 @@ pub const Outcome = struct {
         if (self.timed_out) return std.fmt.bufPrint(buf, "timed out", .{}) catch "timed out";
         return switch (self.term) {
             .exited => |c| std.fmt.bufPrint(buf, "exit {d}", .{c}) catch "exit ?",
-            .signal => |s| std.fmt.bufPrint(buf, "killed by signal {d}", .{@intFromEnum(s)}) catch "signalled",
+            .signal => |s| std.fmt.bufPrint(buf, "killed by signal {d}", .{@backingInt(s)}) catch "signalled",
             .stopped => "stopped",
             .unknown => "unknown termination",
         };
@@ -407,7 +407,7 @@ test "the deadline hook runs, and runs before the child is killed" {
 
     // The term survives the kill (single reaper; see `killGroup`).
     switch (res.term) {
-        .signal => |s| try std.testing.expectEqual(@as(u32, 9), @intFromEnum(s)),
+        .signal => |s| try std.testing.expectEqual(@as(u32, 9), @backingInt(s)),
         else => return error.TestExpectedSignalledChild,
     }
 }

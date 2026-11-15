@@ -50,7 +50,7 @@ RUN set -eu; \
 # ------------------------------------------------------------------- source --
 # Build natively and let Zig cross-compile (zig segfaults under emulation).
 # Toolchain image from proxies/zig; `bench suite` ensures it exists.
-FROM --platform=$BUILDPLATFORM zoxy-bench/zig:0.16.0 AS build-source
+FROM --platform=$BUILDPLATFORM zoxy-bench/zig:0.17.1 AS build-source
 ARG ZOXY_REF=main
 ARG BUILDARCH
 ARG TARGETARCH

@@ -356,7 +356,7 @@ pub fn post(
             },
             else => {
                 // Status only: an error body can echo request content back.
-                std.debug.print("bench: Discord returned {d}\n", .{@intFromEnum(res.status)});
+                std.debug.print("bench: Discord returned {d}\n", .{@backingInt(res.status)});
                 return error.DiscordPostFailed;
             },
         }

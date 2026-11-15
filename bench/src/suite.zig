@@ -235,7 +235,7 @@ fn selfExe(arena: Allocator) ![]const u8 {
 
 /// Must match the `FROM` in proxies/zoxy/Dockerfile. A mismatch fails zoxy's
 /// build loudly on a missing image, which is the right way for it to fail.
-const zig_toolchain_tag = "zoxy-bench/zig:0.16.0";
+const zig_toolchain_tag = "zoxy-bench/zig:0.17.1";
 
 /// The cache tag for a proxy whose image is a pure function of this repo, else
 /// null. zoxy is excluded: it tracks a moving ref, and a wrongly-keyed cache

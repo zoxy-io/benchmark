@@ -65,7 +65,7 @@ pub const Client = struct {
             .what = key,
         }) orelse return error.RequestTimedOut;
         if (res.status != .ok and res.status != .created) {
-            std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
+            std.debug.print("bench: PUT {s} returned {d}\n", .{ key, @backingInt(res.status) });
             return error.ObjectPutFailed;
         }
     }
@@ -92,7 +92,7 @@ pub const Client = struct {
         }) orelse return error.RequestTimedOut;
         if (res.status == .not_found) return null;
         if (res.status != .ok) {
-            std.debug.print("bench: GET {s} returned {d}\n", .{ key, @intFromEnum(res.status) });
+            std.debug.print("bench: GET {s} returned {d}\n", .{ key, @backingInt(res.status) });
             return error.ObjectGetFailed;
         }
         return body.written();

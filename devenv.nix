@@ -10,7 +10,7 @@
     pkgs.opentofu     # `tofu` for cloud/
     pkgs.openssh      # ssh/scp to the cloud fleet
     pkgs.curl         # poking at a proxy by hand behind `make up`
-    pkgs.zig_0_16     # bench; pin the exact attr, not the `zig` alias
+    pkgs.zig_0_17     # bench; pin the exact attr, not the `zig` alias
     pkgs.cmake        # proxies/pingora: flate2's zlib-ng builds with cmake
     pkgs.yandex-cloud # `yc compute ssh`: the only way onto a wedged fleet host
   ];
