@@ -184,12 +184,12 @@ pub const c1k_h2: Profile = blk: {
     // h2_connections: its 1024 default, pinned like tls_engines. With none
     // free zoxy answers an h2 offer with HTTP/1.1, so it must cover the 1000
     // connections; nonzero `zoxy_h2_shed_sessions` means it did not.
-    // stream_slots: required with h2, no default. One stream per connection
+    // h2_streams: required with h2, no default. One stream per connection
     // needs 1000; conn_slots' 1386 keeps the same headroom. Nonzero
     // `zoxy_h2_shed_streams` means the ramp measured this cap.
     p.proxy_env = c1k_tls.proxy_env ++ [_]Pair{
         .{ .key = "ZOXY_H2_CONNECTIONS", .value = "1024" },
-        .{ .key = "ZOXY_STREAM_SLOTS", .value = "1386" },
+        .{ .key = "ZOXY_H2_STREAMS", .value = "1386" },
     };
     break :blk p;
 };
@@ -376,25 +376,25 @@ test "c1k-h2 is c1k-tls with HTTP/2 on, and nothing else" {
         try std.testing.expectEqualStrings(want.value, got.value);
     }
     var h2_connections: u32 = 0;
-    var stream_slots: u32 = 0;
+    var h2_streams: u32 = 0;
     for (c1k_h2.proxy_env) |kv| {
         if (std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS")) h2_connections = try std.fmt.parseInt(u32, kv.value, 10);
-        if (std.mem.eql(u8, kv.key, "ZOXY_STREAM_SLOTS")) stream_slots = try std.fmt.parseInt(u32, kv.value, 10);
+        if (std.mem.eql(u8, kv.key, "ZOXY_H2_STREAMS")) h2_streams = try std.fmt.parseInt(u32, kv.value, 10);
     }
     // Short of either, zoxy hands connections HTTP/1.1 or refuses streams,
     // and the ramp measures the cap rather than HTTP/2.
     try std.testing.expect(h2_connections >= c1k_h2.connections);
-    try std.testing.expect(stream_slots >= c1k_h2.connections);
+    try std.testing.expect(h2_streams >= c1k_h2.connections);
 }
 
 test "only an h2 profile sizes zoxy's HTTP/2 pools" {
-    // zoxy refuses stream_slots and h2_connections when no listener speaks
+    // zoxy refuses h2_streams and h2_connections when no listener speaks
     // h2, so on any other profile it would not start.
     for (all) |p| {
         if (p.h2) continue;
         for (p.proxy_env) |kv| {
             try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS"));
-            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_STREAM_SLOTS"));
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_STREAMS"));
         }
     }
 }

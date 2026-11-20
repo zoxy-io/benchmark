@@ -183,7 +183,7 @@ is the other half, and it is the half where proxies differ.
   - **zoxy's HTTP/2 pools are hard ceilings the others do not have**, like
     its TLS engines. `h2_connections` (pinned at its 1024 default) bounds the
     connections speaking HTTP/2, and with none free zoxy answers an `h2`
-    offer with HTTP/1.1; `stream_slots` (1386, required whenever a listener
+    offer with HTTP/1.1; `h2_streams` (1386, required whenever a listener
     speaks h2) bounds the streams. `bench` reads `zoxy_h2_shed_sessions` and
     `zoxy_h2_shed_streams` after every h2 ramp and notes the row if either is
     nonzero. The sessions are preallocated at boot (~94 KB each), so zoxy's

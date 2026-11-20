@@ -93,7 +93,7 @@ pub const ProxyRecord = struct {
     shed_tls_engines: ?u64 = null,
     /// HTTP/2 connections and streams zoxy turned away for want of a pool
     /// slot (zoxy on h2 profiles only, else null). Nonzero means the ramp
-    /// measured `h2_connections` / `stream_slots` rather than zoxy's HTTP/2.
+    /// measured `h2_connections` / `h2_streams` rather than zoxy's HTTP/2.
     shed_h2_sessions: ?u64 = null,
     shed_h2_streams: ?u64 = null,
     notes: []const []const u8 = &.{},

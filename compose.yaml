@@ -182,7 +182,7 @@ services:
       # HTTP/2 pools, set by h2 profiles only: zoxy refuses both when no
       # listener speaks h2.
       ZOXY_H2_CONNECTIONS: ${ZOXY_H2_CONNECTIONS:-}
-      ZOXY_STREAM_SLOTS: ${ZOXY_STREAM_SLOTS:-}
+      ZOXY_H2_STREAMS: ${ZOXY_H2_STREAMS:-}
       # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS, and
       # PROXY_H2 adds `h2` to its ALPN.
       PROXY_PORT: ${PROXY_PORT:-8080}
@@ -315,7 +315,9 @@ services:
 
   # ------------------------------------------- per-host exporters (all roles) --
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    # Official images moved to GHCR in 0.53; avoid the gcr.io pull timeouts
+    # that left run #311 without an exporter for its entire first profile.
+    image: ghcr.io/google/cadvisor:0.55.1
     container_name: cadvisor
     profiles: [monitoring, backend, zoxy, haproxy, envoy, nginx, pingora]
     # The proxy host's cAdvisor is the run's only source of container CPU and

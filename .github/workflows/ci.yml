@@ -2,6 +2,7 @@
 # not cost a night.
 #   check  — fmt, unit tests, and the nightly's exact cross-compile.
 #   config — compose/terraform/workflow syntax.
+#   zoxy-config — real rendered configs checked by the latest release binary.
 #   smoke  — the suite end-to-end (profile.zig `smoke`) on local docker,
 #            against the stock nginx and haproxy images.
 
@@ -127,6 +128,24 @@ jobs:
         uses: raven-actions/actionlint@v2
         with:
           fail-on-error: true
+
+  zoxy-config:
+    name: zoxy release configs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Compose syntax cannot catch zoxy JSON-schema drift (run #311's
+      # limits.stream_slots -> limits.h2_streams). Check every profile with
+      # the same latest published release the nightly would resolve today.
+      - name: Check rendered zoxy configs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref=$(gh api repos/zoxy-io/zoxy/releases/latest --jq .tag_name)
+          ZOXY_REF="$ref" bash proxies/zoxy/check-configs.sh
 
   smoke:
     name: local suite end-to-end

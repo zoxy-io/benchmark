@@ -47,14 +47,14 @@ pub const Fleet = struct {
         return self.host(self.backend_ips[i]);
     }
 
-    /// Compose profile for backend `i`. Locally one `backend` profile starts
-    /// the whole pool; in cloud each VM must start only its own, or four
-    /// containers race for :9000 on one host.
-    pub fn backendProfile(self: Fleet, arena: Allocator, i: usize) ![]const u8 {
+    /// Start only the origin services, not cAdvisor (also in the local
+    /// `backend` profile): failed telemetry must not prevent the ramp. In
+    /// cloud each VM starts only its own backend, or four race for :9000.
+    pub fn backendUp(self: Fleet, arena: Allocator, i: usize) ![]const u8 {
         return if (self.isLocal())
-            "backend"
+            "--profile backend up -d --wait backend0 backend1 backend2 backend3"
         else
-            std.fmt.allocPrint(arena, "backend{d}", .{i});
+            std.fmt.allocPrint(arena, "--profile backend{d} up -d --wait backend{d}", .{ i, i });
     }
 
     /// Locally the base compose file is the whole config; the cloud overlay
@@ -279,7 +279,7 @@ const ZoxyCounters = struct {
 
     /// HTTP/2 connections answered with HTTP/1.1 (or shed) for want of a
     /// session, and streams refused for want of a slot. Nonzero means the
-    /// ramp hit `ZOXY_H2_CONNECTIONS` / `ZOXY_STREAM_SLOTS`, not zoxy's h2.
+    /// ramp hit `ZOXY_H2_CONNECTIONS` / `ZOXY_H2_STREAMS`, not zoxy's h2.
     /// Null on profiles without an h2 listener: the metrics are absent.
     shed_h2_sessions: ?u64 = null,
     shed_h2_streams: ?u64 = null,
@@ -559,21 +559,10 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         redact.log("bench: could not prepare {s}: {s}", .{ tls_dir, @errorName(e) });
     };
 
-    // --- cAdvisor. Must be started explicitly: `up --wait <proxy>` starts only
-    // that service. Not fatal; missing samples mark records `degraded`.
-    _ = remote.check(
-        gpa,
-        arena,
-        io,
-        opts.fleet.proxyHost(),
-        "cadvisor up",
-        try std.fmt.allocPrint(arena, "cd {s} && {s} --profile monitoring up -d --wait cadvisor", .{
-            opts.fleet.remote_dir, opts.fleet.composeCmd(),
-        }),
-        deadline.start,
-    ) catch |e| {
-        redact.log("bench: cAdvisor did not start ({s}); CPU and memory will be absent", .{@errorName(e)});
-    };
+    // --- cAdvisor. Explicit startup, with retries before any measurement.
+    // A failed exporter must not spend each turn warming/polling an absent
+    // endpoint. Missing samples still mark the records `degraded`.
+    const cadvisor_addr = try startCadvisor(gpa, arena, io, opts.fleet);
 
     // --- the origin pool. All-or-nothing: a missing member fails nothing, it
     // silently routes a share of requests into a refused connection. Locally
@@ -585,10 +574,10 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
             io,
             opts.fleet.backendHost(i),
             try std.fmt.allocPrint(arena, "backend {d} up", .{i}),
-            try std.fmt.allocPrint(arena, "cd {s} && {s} --profile {s} up -d --wait", .{
+            try std.fmt.allocPrint(arena, "cd {s} && {s} {s}", .{
                 opts.fleet.remote_dir,
                 opts.fleet.composeCmd(),
-                try opts.fleet.backendProfile(arena, i),
+                try opts.fleet.backendUp(arena, i),
             }),
             deadline.backend_up,
         ) catch |e| {
@@ -845,7 +834,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         }
         defer watchdog.done.store(true, .release);
 
-        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, zoxy_src, zoxy_ref_sha, &stage) catch |e| blk: {
+        const rec = runOne(gpa, arena, io, opts, name, proxy_idx, zoxy_src, zoxy_ref_sha, cadvisor_addr, &stage) catch |e| blk: {
             redact.log("bench: [{s}] {s} at stage {s}", .{ name, @errorName(e), stage.str() });
             break :blk artifact.ProxyRecord{
                 .name = name,
@@ -884,6 +873,32 @@ fn enter(stage: *artifact.Stage, next: artifact.Stage, name: []const u8) void {
     redact.log("bench: [{s}] {s}", .{ name, next.str() });
 }
 
+/// `up --wait <proxy>` starts only that service, not the exporter. Retry
+/// transient registry/healthcheck failures (#311) outside the timed turns.
+/// A null address disables both discovery and ramp scraping for this profile.
+fn startCadvisor(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) !?net.IpAddress {
+    const addr = try net.IpAddress.parse(fleet.proxy_ip, 8081);
+    const cmd = try std.fmt.allocPrint(arena, "cd {s} && {s} --profile monitoring up -d --wait cadvisor", .{
+        fleet.remote_dir, fleet.composeCmd(),
+    });
+    for (0..deadline.start_attempts) |attempt| {
+        if (remote.check(gpa, arena, io, fleet.proxyHost(), "cadvisor up", cmd, deadline.start)) |_| {
+            return addr;
+        } else |e| {
+            if (attempt + 1 == deadline.start_attempts) {
+                redact.log(
+                    "bench: cAdvisor did not start after {d} attempts ({s}); skipping CPU/memory scraping for this profile",
+                    .{ deadline.start_attempts, @errorName(e) },
+                );
+                return null;
+            }
+            redact.log("bench: cAdvisor start attempt {d}/{d} failed, retrying", .{ attempt + 1, deadline.start_attempts });
+            io.sleep(.fromNanoseconds(deadline.start_retry_backoff), .awake) catch {};
+        }
+    }
+    unreachable;
+}
+
 /// One proxy, start to finish. Every failure returns an error, which the caller
 /// records as `failed`; this never skips another proxy or stops the suite.
 fn runOne(
@@ -898,6 +913,7 @@ fn runOne(
     zoxy_src: ?ZoxySource,
     // The ref's sha before the build, or null if unknown.
     zoxy_ref_sha: ?[]const u8,
+    cadvisor_addr: ?net.IpAddress,
     stage: *artifact.Stage,
 ) !artifact.ProxyRecord {
     const p = opts.prof;
@@ -1090,8 +1106,6 @@ fn runOne(
 
     enter(stage, .warm, name);
 
-    const cadvisor_addr: ?net.IpAddress = try net.IpAddress.parse(opts.fleet.proxy_ip, 8081);
-
     {
         // These probes need a real connect timeout, which the top-level
         // `Io.Threaded` panics on (see cadvisor.scrape); use a scoped zio
@@ -1256,7 +1270,7 @@ fn runOne(
         }
 
         // HTTP/2 pools, as for TLS engines: nonzero means the ramp measured
-        // `h2_connections` / `stream_slots` (profile.zig), not zoxy's HTTP/2.
+        // `h2_connections` / `h2_streams` (profile.zig), not zoxy's HTTP/2.
         if (p.h2) {
             if (counters.shed_h2_sessions) |shed| {
                 if (shed > 0) {
@@ -1279,7 +1293,7 @@ fn runOne(
                     try notes.insert(arena, 0, try std.fmt.allocPrint(
                         arena,
                         "refused {d} HTTP/2 stream(s) for want of a stream slot: this profile's " ++
-                            "stream_slots pool was too small, so part of this number is zoxy's cap " ++
+                            "h2_streams pool was too small, so part of this number is zoxy's cap " ++
                             "rather than its HTTP/2",
                         .{shed},
                     ));
@@ -2014,24 +2028,25 @@ test "the h2 turn is the TLS turn plus PROXY_H2 and zoxy's HTTP/2 pools" {
     try std.testing.expect(std.mem.indexOf(u8, s, "PROXY_H2=on ") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_TLS_ENGINES=1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_H2_CONNECTIONS=1024") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_STREAM_SLOTS=1386") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_H2_STREAMS=1386") != null);
 
     // `build` gets no ports, and so no protocol switch either.
     const b = try envPrefix(arena, profile.c1k_h2, test_fleet, test_zoxy_src, null);
     try std.testing.expect(std.mem.indexOf(u8, b, "PROXY_H2") == null);
 }
 
-test "backendProfile starts one member per VM in cloud, the whole pool locally" {
+test "backendUp starts only origins: one per VM in cloud, the whole pool locally" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     // Cloud VMs are host-networked: each starts only its own backend.
-    try std.testing.expectEqualStrings("backend0", try test_fleet.backendProfile(arena, 0));
-    try std.testing.expectEqualStrings("backend3", try test_fleet.backendProfile(arena, 3));
+    try std.testing.expectEqualStrings("--profile backend0 up -d --wait backend0", try test_fleet.backendUp(arena, 0));
+    try std.testing.expectEqualStrings("--profile backend3 up -d --wait backend3", try test_fleet.backendUp(arena, 3));
 
+    // Explicit services exclude cAdvisor even though its profile is `backend`.
     const local: Fleet = .{ .proxy_ip = "127.0.0.1", .backend_ips = &.{"127.0.0.1"}, .ssh = null };
-    try std.testing.expectEqualStrings("backend", try local.backendProfile(arena, 0));
+    try std.testing.expectEqualStrings("--profile backend up -d --wait backend0 backend1 backend2 backend3", try local.backendUp(arena, 0));
 }
 
 test "proxyPort never repeats within one suite dispatch, including a proxy's own repeat turn across profiles" {

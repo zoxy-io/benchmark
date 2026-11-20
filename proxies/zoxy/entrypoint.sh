@@ -23,12 +23,12 @@ if [ -n "${ZOXY_TLS_ENGINES:-}" ]; then
 fi
 # HTTP/2 pools, only on h2 turns: zoxy refuses both unless a listener speaks
 # h2. h2_connections short of the offered connections answers the rest with
-# HTTP/1.1; stream_slots short refuses streams (zoxy_h2_shed_*).
+# HTTP/1.1; h2_streams short refuses streams (zoxy_h2_shed_*).
 if [ -n "${ZOXY_H2_CONNECTIONS:-}" ]; then
     fields="${fields}, \"h2_connections\": ${ZOXY_H2_CONNECTIONS}"
 fi
-if [ -n "${ZOXY_STREAM_SLOTS:-}" ]; then
-    fields="${fields}, \"stream_slots\": ${ZOXY_STREAM_SLOTS}"
+if [ -n "${ZOXY_H2_STREAMS:-}" ]; then
+    fields="${fields}, \"h2_streams\": ${ZOXY_H2_STREAMS}"
 fi
 LIMITS="{${fields}}"
 
@@ -73,9 +73,10 @@ sed -e "s|@BACKEND_ADDRS@|$addrs|" -e "s/@LIMITS@/$LIMITS/" \
     /etc/zoxy/config.template.json > /etc/zoxy/config.json
 
 # `--check` validates the rendered config without binding, printing the
-# refusing rule and the config to stderr. Probed via --help: refs before 0.8.0
-# (profile.zig `zoxy_ref`) would read it as a second config path.
-if /usr/local/bin/zoxy --help 2>&1 | grep -q -- '--check'; then
+# refusing rule and the config to stderr. Default startup probes support via
+# --help: refs before 0.8.0 would read it as a second config path. An explicit
+# --check (CI) must fail rather than silently skip an unsupported validator.
+if [ "${1:-}" = "--check" ] || /usr/local/bin/zoxy --help 2>&1 | grep -q -- '--check'; then
     check_status=0
     /usr/local/bin/zoxy --check /etc/zoxy/config.json || check_status=$?
     if [ "$check_status" -ne 0 ]; then
@@ -84,6 +85,9 @@ if /usr/local/bin/zoxy --help 2>&1 | grep -q -- '--check'; then
         exit "$check_status"
     fi
 fi
+
+# CI validates the real renderer and parser without starting a listener.
+[ "${1:-}" != "--check" ] || exit 0
 
 # One event loop per process: exec a single zoxy as PID 1. Stdout is not
 # redirected (zoxy writes the access log file itself); it carries the startup

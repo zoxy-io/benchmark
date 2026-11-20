@@ -364,6 +364,23 @@ test "scrape reads the counter and cAdvisor's timestamp off a real exposition li
     try std.testing.expectEqual(@as(i64, 1785556717668), m.timestamp_ms.?);
 }
 
+test "scrape accepts cAdvisor 0.55.1 empty image labels and scientific-notation memory" {
+    // Captured from the official GHCR image with our production flags.
+    const exposition =
+        \\container_cpu_usage_seconds_total{container_label_org_opencontainers_image_created="",container_label_org_opencontainers_image_description="",container_label_org_opencontainers_image_licenses="",container_label_org_opencontainers_image_revision="",container_label_org_opencontainers_image_source="",container_label_org_opencontainers_image_title="",container_label_org_opencontainers_image_url="",container_label_org_opencontainers_image_version="",cpu="total",id="/docker/901a4e08eadf65748535efaea384d0c0bbb3c710723f3d27fdc3dd10e658ed23",image="alpine:latest",name="zoxy-cadvisor-recheck-target"} 0.012028 1795158756789
+        \\container_memory_working_set_bytes{container_label_org_opencontainers_image_created="",container_label_org_opencontainers_image_description="",container_label_org_opencontainers_image_licenses="",container_label_org_opencontainers_image_revision="",container_label_org_opencontainers_image_source="",container_label_org_opencontainers_image_title="",container_label_org_opencontainers_image_url="",container_label_org_opencontainers_image_version="",id="/docker/901a4e08eadf65748535efaea384d0c0bbb3c710723f3d27fdc3dd10e658ed23",image="alpine:latest",name="zoxy-cadvisor-recheck-target"} 1.708032e+06 1795158756789
+    ;
+    var ctx: ScrapeCtx = .{ .proxy = "zoxy-cadvisor-recheck-target" };
+    var lines = std.mem.splitScalar(u8, exposition, '\n');
+    while (lines.next()) |line| ScrapeCtx.onLine(&ctx, line);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.seen_expected);
+    try std.testing.expect(ctx.obs.intruder == null);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.012028), ctx.obs.cpu_seconds_total, 1e-9);
+    try std.testing.expectEqual(@as(u64, 1708032), ctx.obs.mem_ws);
+    try std.testing.expectEqual(@as(i64, 1795158756789), ctx.obs.cadvisor_ms);
+}
+
 test "matchKnownProxy returns the static entry, not the caller's slice" {
     // Must return `known_proxies[i]`, never `name`, or `intruder` dangles.
     var buf: [16]u8 = undefined;
