@@ -18,8 +18,9 @@ coming out, both through Object Storage.
 ## Profiles
 
 Ramp profiles are compiled into [`bench/src/profile.zig`](../bench/src/profile.zig)
-and run across `zoxy, haproxy, nginx, pingora, envoy`. `c1k`, `c1k-tls` and
-`c1k-h2` run on the schedule, once a night at 00:00 UTC; add `c10k` to
+and run across `zoxy, haproxy, nginx, pingora, envoy` (pingora sits out
+`c1k-h3`: it has no HTTP/3). `c1k`, `c1k-tls`, `c1k-h2` and `c1k-h3` run on the
+schedule, once a night at 00:00 UTC; add `c10k` to
 `profiles` on a manual dispatch to run it too. Every profile requests the same
 10 KiB body (why: the README, and the `c1k` doc comment in `profile.zig`), on
 one ramp: 200 → 40 000 req/s in 300 s (`smoke` excepted).
@@ -30,6 +31,7 @@ one ramp: 200 → 40 000 req/s in 300 s (`smoke` excepted).
 | `c1k` | 1 000 | plaintext | — | yes (default) | how fast is each proxy at a healthy concurrency |
 | `c1k-tls` | 1 000 | TLS 1.3 | — | yes (default) | what terminating TLS costs each proxy — `c1k` with TLS on and nothing else changed |
 | `c1k-h2` | 1 000 | HTTP/2, TLS 1.3 | — | yes (default) | what serving HTTP/2 costs each proxy — `c1k-tls` with ALPN `h2` and nothing else changed (one stream per connection; upstream stays HTTP/1.1) |
+| `c1k-h3` | 1 000 | HTTP/3, QUIC | — | yes (default) | what serving HTTP/3 costs each proxy — `c1k-tls` with QUIC on the same port number and nothing else changed (one request per connection; upstream stays HTTP/1.1 over TCP; pingora sits out) |
 | `c10k` | 10 000 | plaintext | 1 s | manual only | how much of a 10k-connection schedule can each serve *within an SLO* |
 | `smoke` | 50 | plaintext | — | never | **not a measurement** — the CI gate. A 30 s, 200→5 000 req/s ramp that exists so a push can prove the harness still runs end-to-end without paying for a fleet. Its ramp shape deliberately matches no other profile, so its numbers cannot be plotted against a real one; `profile.zig` has a test asserting that stays true. |
 

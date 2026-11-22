@@ -168,6 +168,9 @@ pub fn run(gpa: Allocator, caller_arena: Allocator, opts: Options) !Outcome {
         // as a connect error rather than measuring it. One stream per
         // connection, so in-flight requests still equal `connections`.
         .http2 = p.h2,
+        // QUIC to the TLS port's UDP twin, ALPN `h3` alone. One request per
+        // connection here too.
+        .http3 = p.h3,
         .streams = 1,
         // No zrk whole-run JSON: it embeds the target URL (a private address)
         // in a published file (zrk/src/report.zig writeUrl).

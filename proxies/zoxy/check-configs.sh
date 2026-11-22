@@ -26,14 +26,15 @@ check() {
     # Clear optional tuning between checks, including inherited shell values.
     # Numeric loopback endpoints need no running Docker DNS/backend services.
     env ZOXY_CONN_SLOTS= ZOXY_UPSTREAM_SLOTS= ZOXY_TLS_ENGINES= \
-        ZOXY_H2_CONNECTIONS= ZOXY_H2_STREAMS= PROXY_TLS_PORT= PROXY_H2= "$@" \
+        ZOXY_H2_CONNECTIONS= ZOXY_H2_STREAMS= ZOXY_QUIC_CONNECTIONS= \
+        PROXY_TLS_PORT= PROXY_H2= PROXY_H3= "$@" \
         docker compose -f compose.yaml --profile zoxy run --rm -T --no-deps \
         -e BACKENDS=127.0.0.1:9000,127.0.0.2:9000,127.0.0.3:9000,127.0.0.4:9000 \
         -v "$tls:/etc/bench/tls:ro" zoxy --check
 }
 
 # Keep values aligned with bench/src/profile.zig; its unit tests assert the
-# HTTP/2 keys and that only HTTP/2 profiles set them.
+# HTTP/2 and QUIC keys and which profiles may set them.
 check c100
 check smoke
 check c1k ZOXY_CONN_SLOTS=1386 ZOXY_UPSTREAM_SLOTS=5544
@@ -43,3 +44,6 @@ check c1k-tls ZOXY_CONN_SLOTS=1386 ZOXY_UPSTREAM_SLOTS=5544 \
 check c1k-h2 ZOXY_CONN_SLOTS=1386 ZOXY_UPSTREAM_SLOTS=5544 \
     ZOXY_TLS_ENGINES=1024 PROXY_TLS_PORT=8443 PROXY_H2=on \
     ZOXY_H2_CONNECTIONS=1024 ZOXY_H2_STREAMS=1386
+check c1k-h3 ZOXY_CONN_SLOTS=1386 ZOXY_UPSTREAM_SLOTS=5544 \
+    ZOXY_TLS_ENGINES=1024 PROXY_TLS_PORT=8443 PROXY_H3=on \
+    ZOXY_QUIC_CONNECTIONS=1024 ZOXY_H2_STREAMS=1386

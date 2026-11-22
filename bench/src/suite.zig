@@ -283,6 +283,15 @@ const ZoxyCounters = struct {
     /// Null on profiles without an h2 listener: the metrics are absent.
     shed_h2_sessions: ?u64 = null,
     shed_h2_streams: ?u64 = null,
+
+    /// QUIC connections left unanswered for want of a slot, and HTTP/3
+    /// requests refused for want of a stream slot. Nonzero means the ramp hit
+    /// `ZOXY_QUIC_CONNECTIONS` / `ZOXY_H2_STREAMS`, not zoxy's h3. (QUIC's
+    /// own TLS-engine shed is not read: tls_engines is sized at or above
+    /// quic_connections, so the QUIC pool runs out first.) Null on profiles
+    /// without a QUIC binding: the metrics are absent.
+    shed_h3_connections: ?u64 = null,
+    shed_h3_streams: ?u64 = null,
 };
 
 /// Scrape zoxy's admin endpoint from inside the container via bash's /dev/tcp:
@@ -299,15 +308,19 @@ fn zoxyCounters(gpa: Allocator, arena: Allocator, io: Io, fleet: Fleet) ZoxyCoun
         // question answered ("no such metric"), not a transport failure.
         "docker exec zoxy bash -c 'exec 3<>/dev/tcp/127.0.0.1/9101 && " ++
             "printf \"GET /metrics HTTP/1.1\\r\\nHost: admin\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && " ++
-            "cat <&3' 2>/dev/null | grep -E 'access_log_dropped|shed_tls_engines|h2_shed_' || true",
+            "cat <&3' 2>/dev/null | grep -E 'access_log_dropped|shed_tls_engines|h2_shed_|h3_shed_' || true",
         deadline.inspect,
     ) catch return .{};
 
     return .{
         .access_log_dropped = counterNamed(res.stdout, "access_log_dropped"),
-        .shed_tls_engines = counterNamed(res.stdout, "shed_tls_engines"),
+        // The full name: `shed_tls_engines` alone is also inside
+        // `zoxy_h3_shed_tls_engines`, and the first match wins.
+        .shed_tls_engines = counterNamed(res.stdout, "zoxy_shed_tls_engines"),
         .shed_h2_sessions = counterNamed(res.stdout, "h2_shed_sessions"),
         .shed_h2_streams = counterNamed(res.stdout, "h2_shed_streams"),
+        .shed_h3_connections = counterNamed(res.stdout, "zoxy_h3_shed_connections"),
+        .shed_h3_streams = counterNamed(res.stdout, "zoxy_h3_shed_streams"),
     };
 }
 
@@ -497,6 +510,26 @@ pub const Result = struct {
 };
 
 pub fn run(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
+    // A proxy that cannot speak this profile's protocol (profile.serves) is
+    // left out before anything runs: no build, no turn, no row. Recording it
+    // as a failure would read as a broken proxy, and the night as degraded.
+    // Ports key off the index in this filtered list, which stays unique
+    // within the profile.
+    var served: std.ArrayList([]const u8) = .empty;
+    for (opts.proxies) |name| {
+        if (opts.prof.serves(name)) {
+            try served.append(arena, name);
+        } else {
+            redact.log("bench: [{s}] not run on {s}: it cannot speak this profile's protocol", .{ name, opts.prof.name });
+        }
+    }
+    if (served.items.len == 0) return error.NoProxyServesProfile;
+    var o = opts;
+    o.proxies = served.items;
+    return runServed(gpa, arena, io, o);
+}
+
+fn runServed(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     const p = opts.prof;
     try p.validate();
 
@@ -1116,6 +1149,7 @@ fn runOne(
 
         try warmProbe(gpa, probe_io, target, name);
         if (p.h2) try assertH2(gpa, probe_io, target, name);
+        if (p.h3) try assertH3(arena, probe_io, target, name);
 
         // Best-effort cAdvisor head start before the ramp's sampling window.
         if (cadvisor_addr) |addr| {
@@ -1305,6 +1339,43 @@ fn runOne(
                 );
             }
         }
+
+        // QUIC pools, the same way: nonzero means the ramp measured
+        // `quic_connections` / `h2_streams` (profile.zig), not zoxy's HTTP/3.
+        if (p.h3) {
+            if (counters.shed_h3_connections) |shed| {
+                if (shed > 0) {
+                    try notes.insert(arena, 0, try std.fmt.allocPrint(
+                        arena,
+                        "left {d} QUIC connection attempt(s) unanswered for want of a slot: this profile's " ++
+                            "quic_connections pool was too small for {d} offered connections, so part of " ++
+                            "this number is zoxy's admission cap rather than its HTTP/3",
+                        .{ shed, p.connections },
+                    ));
+                }
+            } else {
+                try notes.append(
+                    arena,
+                    "could not read zoxy's QUIC connection shed counter; whether connections went unanswered is unknown, not zero",
+                );
+            }
+            if (counters.shed_h3_streams) |shed| {
+                if (shed > 0) {
+                    try notes.insert(arena, 0, try std.fmt.allocPrint(
+                        arena,
+                        "refused {d} HTTP/3 request(s) for want of a stream slot: this profile's " ++
+                            "h2_streams pool was too small, so part of this number is zoxy's cap " ++
+                            "rather than its HTTP/3",
+                        .{shed},
+                    ));
+                }
+            } else {
+                try notes.append(
+                    arena,
+                    "could not read zoxy's HTTP/3 stream shed counter; whether requests were refused is unknown, not zero",
+                );
+            }
+        }
     }
     if (stale_build) {
         // Not `failed` (some zoxy was measured), but never a plain `ok`: it is
@@ -1340,6 +1411,8 @@ fn runOne(
         .shed_tls_engines = counters.shed_tls_engines,
         .shed_h2_sessions = counters.shed_h2_sessions,
         .shed_h2_streams = counters.shed_h2_streams,
+        .shed_h3_connections = counters.shed_h3_connections,
+        .shed_h3_streams = counters.shed_h3_streams,
         .notes = try notes.toOwnedSlice(arena),
     };
 }
@@ -1433,6 +1506,45 @@ fn assertH2(gpa: Allocator, io: Io, target: []const u8, name: []const u8) !void 
         return error.H2NotNegotiated;
     }
 }
+
+/// On h3 profiles, after `warmProbe` (which proves the TCP listener): a short,
+/// light zrk run over HTTP/3 at the ramp's own target, failing the turn unless
+/// every request completes. zrk counts a connection that never finishes its
+/// QUIC handshake as a connect error, and the row would read as a broken
+/// proxy; this names the cause before the ramp. zrk exports no QUIC handshake
+/// of its own (it does TLS's, which `assertH2` uses), so the probe is its
+/// runner.
+fn assertH3(arena: Allocator, io: Io, target: []const u8, name: []const u8) !void {
+    const cfg: zrk.cli.Config = .{
+        .connections = 1,
+        .threads = 1,
+        .rate = h3_probe_rate,
+        .duration_ns = h3_probe_seconds * std.time.ns_per_s,
+        .interval_ns = 1 * std.time.ns_per_s,
+        .timeout_ns = 1 * std.time.ns_per_s,
+        .insecure = true,
+        .http3 = true,
+        .streams = 1,
+        .url = zrk.cli.parseUrl(target) catch return error.InvalidTarget,
+    };
+    const result = zrk.runner.run(arena, io, &cfg, 0, null, null, null) catch |e| {
+        redact.log("bench: [{s}] HTTP/3 probe failed to run ({s}): this listener does not serve HTTP/3", .{ name, @errorName(e) });
+        return error.H3NotServed;
+    };
+    const c = result.snapshot.counters;
+    if (c.completed == 0 or c.connect_errors > 0 or c.status_errors > 0) {
+        redact.log(
+            "bench: [{s}] HTTP/3 probe completed {d} request(s), {d} connect error(s), {d} non-2xx: this listener does not serve HTTP/3",
+            .{ name, c.completed, c.connect_errors, c.status_errors },
+        );
+        return error.H3NotServed;
+    }
+}
+
+/// `assertH3`'s load: enough requests over a couple of seconds to see one
+/// connection handshake and serve, far below any proxy's knee.
+const h3_probe_rate: u64 = 20;
+const h3_probe_seconds: u64 = 2;
 
 /// SNI sent by the probe, never verified. No proxy here selects a certificate
 /// by name, and zoxy's L4 SNI routing is not in the path.
@@ -1802,6 +1914,9 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySour
         // Every proxy's TLS listener offers `h2, http/1.1` when set, else
         // `http/1.1` alone (see compose.yaml).
         if (p.h2) try buf.print(arena, "PROXY_H2=on ", .{});
+        // A QUIC listener on UDP at the TLS port's number, beside the TCP one
+        // (see compose.yaml).
+        if (p.h3) try buf.print(arena, "PROXY_H3=on ", .{});
     }
     for (p.proxy_env) |kv| {
         try buf.print(arena, "{s}={s} ", .{ kv.key, kv.value });
@@ -2110,6 +2225,21 @@ test "the drop counter is read past the HELP and TYPE lines that share its name"
     // Absent or failed scrape: unknown, distinct from zero.
     try std.testing.expectEqual(@as(?u64, null), counterValue(""));
     try std.testing.expectEqual(@as(?u64, null), counterValue("# HELP zoxy_access_log_dropped nope\n"));
+}
+
+test "the TCP TLS shed counter is not read off QUIC's, whichever comes first" {
+    const scrape =
+        \\zoxy_h3_shed_tls_engines 9
+        \\zoxy_h3_shed_connections 3
+        \\zoxy_h3_shed_streams 2
+        \\zoxy_shed_tls_engines 5
+        \\
+    ;
+    try std.testing.expectEqual(@as(?u64, 5), counterNamed(scrape, "zoxy_shed_tls_engines"));
+    try std.testing.expectEqual(@as(?u64, 3), counterNamed(scrape, "zoxy_h3_shed_connections"));
+    try std.testing.expectEqual(@as(?u64, 2), counterNamed(scrape, "zoxy_h3_shed_streams"));
+    // A plaintext scrape has none of them: unknown, not zero.
+    try std.testing.expectEqual(@as(?u64, null), counterNamed("zoxy_access_log_dropped 0\n", "zoxy_h3_shed_streams"));
 }
 
 test "a stale zoxy build is detected, and an unrunnable check is not one" {

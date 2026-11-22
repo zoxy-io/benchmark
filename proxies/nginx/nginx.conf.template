@@ -63,6 +63,12 @@ http {
         # it offers `h2, http/1.1` like every proxy. Session tickets left
         # default; the generator never resumes.
         http2 ${NGINX_HTTP2};
+        # h3 turns: QUIC on UDP at the same port, ALPN `h3`, beside the TCP
+        # listener the warm probe uses. 25-tls.sh deletes the two lines that
+        # carry the H3 marker unless PROXY_H3 is set, so no other line may
+        # spell it. Every QUIC setting (GSO, Retry, windows) is nginx's default.
+        listen ${PROXY_TLS_PORT} quic reuseport; # @H3@
+        http3 on; # @H3@
         include /etc/nginx/origin-location.conf;
         proxy_buffering off;
     }

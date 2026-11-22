@@ -28,7 +28,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k,c1k-tls,c1k-h2
+        default: c1k,c1k-tls,c1k-h2,c1k-h3
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -51,7 +51,8 @@ jobs:
   bench:
     runs-on: ubuntu-24.04
 
-    # ~105 min on a normal night (3 profiles x 5 proxies x ~350 s + builds);
+    # ~140 min on a normal night (4 profiles x 5 proxies, 4 on c1k-h3, x ~350 s
+    # + builds);
     # under GitHub's 360-minute cap, with room for a slow night. Wait chunks have their own step timeouts
     # so a hung loadgen fails a step, not the job, and teardown still runs.
     timeout-minutes: 270
@@ -66,11 +67,13 @@ jobs:
       BENCH: ${{ github.workspace }}/bin/bench
 
       # `inputs` is null on a scheduled run, hence the fallbacks.
-      # c1k-tls and c1k-h2 must run on the same night and fleet as c1k to be
-      # comparable: c1k -> c1k-tls prices TLS, c1k-tls -> c1k-h2 prices HTTP/2.
+      # c1k-tls, c1k-h2 and c1k-h3 must run on the same night and fleet as c1k
+      # to be comparable: c1k -> c1k-tls prices TLS, c1k-tls -> c1k-h2 prices
+      # HTTP/2, c1k-tls -> c1k-h3 prices HTTP/3 over QUIC. pingora has no
+      # HTTP/3 and sits c1k-h3 out (profile.zig `serves`).
       # c10k is excluded while run #25's start failure is open; dispatch with
       # it to run anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-h2' }}
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-h2,c1k-h3' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}

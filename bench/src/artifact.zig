@@ -96,6 +96,12 @@ pub const ProxyRecord = struct {
     /// measured `h2_connections` / `h2_streams` rather than zoxy's HTTP/2.
     shed_h2_sessions: ?u64 = null,
     shed_h2_streams: ?u64 = null,
+    /// QUIC connections zoxy left unanswered and HTTP/3 requests it refused
+    /// for want of a pool slot (zoxy on h3 profiles only, else null). Nonzero
+    /// means the ramp measured `quic_connections` / `h2_streams` rather than
+    /// zoxy's HTTP/3.
+    shed_h3_connections: ?u64 = null,
+    shed_h3_streams: ?u64 = null,
     notes: []const []const u8 = &.{},
 };
 
@@ -190,6 +196,8 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
     try j.boolean(p.prof.tls);
     try j.key("h2");
     try j.boolean(p.prof.h2);
+    try j.key("h3");
+    try j.boolean(p.prof.h3);
     try j.key("ref_rate");
     try j.float(p.prof.ref_rate, 1);
     try j.key("ref_band");
@@ -261,6 +269,10 @@ fn render(w: *std.Io.Writer, p: Profile) !void {
         if (r.shed_h2_sessions) |d| try j.int(@intCast(d)) else try j.nullValue();
         try j.key("shed_h2_streams");
         if (r.shed_h2_streams) |d| try j.int(@intCast(d)) else try j.nullValue();
+        try j.key("shed_h3_connections");
+        if (r.shed_h3_connections) |d| try j.int(@intCast(d)) else try j.nullValue();
+        try j.key("shed_h3_streams");
+        if (r.shed_h3_streams) |d| try j.int(@intCast(d)) else try j.nullValue();
 
         try j.key("notes");
         try j.beginArray();

@@ -49,6 +49,15 @@ pub const Profile = struct {
     /// proxies, and the warm probe fails a listener that won't negotiate h2.
     h2: bool = false,
 
+    /// Speak HTTP/3 to the proxy: QUIC on UDP, at the TLS listener's port
+    /// number, so `tls` must be set and `h2` must not (validate). One request
+    /// per connection, as on h2. Inbound only: every proxy's upstream leg
+    /// stays HTTP/1.1. The suite passes PROXY_H3=on to the proxies, leaves out
+    /// a proxy that has no HTTP/3 (`serves`), and the warm probe fails a
+    /// listener that won't complete an HTTP/3 request. The TCP TLS listener
+    /// stays up beside it, offering http/1.1, for the warm probe.
+    h3: bool = false,
+
     /// Summary-latency reference rate: a light, sub-knee load where latency
     /// reflects per-request cost rather than queueing. Per-profile because it
     /// must land after the connect storm (zrk/src/runner.zig:153-156).
@@ -68,6 +77,11 @@ pub const Profile = struct {
         if (self.threads == 0) return error.InvalidThreads;
         // h2 is negotiated in the TLS handshake; nothing here speaks h2c.
         if (self.h2 and !self.tls) return error.H2WithoutTls;
+        // QUIC has no cleartext mode, and one connection speaks one protocol.
+        // zrk's CLI refuses both; the bench fills zrk's config directly, so
+        // its CLI checks never run and these stand in for them.
+        if (self.h3 and !self.tls) return error.H3WithoutTls;
+        if (self.h3 and self.h2) return error.H3WithH2;
         // A zero wire timeout is allowed: as a compiled-in constant it cannot
         // arrive unnoticed the way the old env var's did.
 
@@ -79,6 +93,14 @@ pub const Profile = struct {
         if (t_at_ref < 3) return error.RefRateInsideWarmup;
         if (self.ref_rate >= @as(f64, @floatFromInt(self.max_rate))) return error.RefRateAboveRamp;
         if (self.ref_band <= 0 or self.ref_band >= 1) return error.InvalidRefBand;
+    }
+
+    /// Whether `proxy` can be measured on this profile. pingora (0.9) has no
+    /// HTTP/3, so an h3 profile leaves it out rather than recording a turn
+    /// that could only fail.
+    pub fn serves(self: Profile, proxy: []const u8) bool {
+        if (self.h3 and std.mem.eql(u8, proxy, "pingora")) return false;
+        return true;
     }
 
     pub fn timeoutNs(self: Profile) u64 {
@@ -194,6 +216,30 @@ pub const c1k_h2: Profile = blk: {
     break :blk p;
 };
 
+/// c1k-tls with HTTP/3 in place of HTTP/1.1 and nothing else changed, so the
+/// pair isolates the protocol, as c1k-h2 does for HTTP/2. One request per
+/// connection keeps 1000 in flight: this measures QUIC packet protection,
+/// loss recovery and QPACK, not multiplexing. Four proxies: pingora has no
+/// HTTP/3 (`serves`).
+pub const c1k_h3: Profile = blk: {
+    var p = c1k_tls;
+    p.name = "c1k-h3";
+    p.h3 = true;
+    // zoxy's QUIC pool. quic_connections defaults to 64, and a connection
+    // past it gets no answer, so it must cover the 1000; at most tls_engines,
+    // since each QUIC connection holds an engine for its life, so it is
+    // tls_engines' 1024. Each costs ~835 KiB, which the published memory
+    // shows. h2_streams: zoxy requires it with a QUIC binding (h3 requests
+    // share HTTP/2's stream pool); 1386 as on c1k-h2. h2_connections stays
+    // unset: the TCP listener offers http/1.1 alone, and zoxy refuses it
+    // there. Nonzero `zoxy_h3_shed_*` means the ramp measured a cap.
+    p.proxy_env = c1k_tls.proxy_env ++ [_]Pair{
+        .{ .key = "ZOXY_QUIC_CONNECTIONS", .value = "1024" },
+        .{ .key = "ZOXY_H2_STREAMS", .value = "1386" },
+    };
+    break :blk p;
+};
+
 pub const c100: Profile = .{
     .name = "c100",
     .connections = 100,
@@ -274,7 +320,7 @@ pub const smoke: Profile = .{
 /// APPEND-ONLY: `suite.proxyPort` keys per-turn host ports off the index, and
 /// renumbering reuses ports an earlier turn served load on (runs #25/#26).
 /// Dropping from the tail renumbers nothing (the c1k body bands left that way).
-pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_h2 };
+pub const all = [_]Profile{ c100, c1k, c10k, c1k_tls, smoke, c1k_h2, c1k_h3 };
 
 pub fn byName(name: []const u8) ?Profile {
     for (all) |p| {
@@ -293,6 +339,7 @@ test "byName is exhaustive and rejects unknown names" {
     try std.testing.expect(byName("c10k") != null);
     try std.testing.expect(byName("c1k-tls") != null);
     try std.testing.expect(byName("c1k-h2") != null);
+    try std.testing.expect(byName("c1k-h3") != null);
     try std.testing.expect(byName("") == null);
     try std.testing.expect(byName("c100k") == null);
     // The body bands are gone: naming one fails at argument parsing.
@@ -387,14 +434,88 @@ test "c1k-h2 is c1k-tls with HTTP/2 on, and nothing else" {
     try std.testing.expect(h2_streams >= c1k_h2.connections);
 }
 
-test "only an h2 profile sizes zoxy's HTTP/2 pools" {
-    // zoxy refuses h2_streams and h2_connections when no listener speaks
-    // h2, so on any other profile it would not start.
+test "c1k-h3 is c1k-tls with HTTP/3 on, and nothing else" {
+    try std.testing.expect(c1k_h3.h3);
+    try std.testing.expect(c1k_h3.tls);
+    try std.testing.expect(!c1k_h3.h2);
+    try std.testing.expect(!c1k_tls.h3);
+    try std.testing.expect(!c1k_h2.h3);
+
+    try std.testing.expectEqual(c1k_tls.connections, c1k_h3.connections);
+    try std.testing.expectEqual(c1k_tls.threads, c1k_h3.threads);
+    try std.testing.expectEqual(c1k_tls.start_rate, c1k_h3.start_rate);
+    try std.testing.expectEqual(c1k_tls.max_rate, c1k_h3.max_rate);
+    try std.testing.expectEqual(c1k_tls.ramp_seconds, c1k_h3.ramp_seconds);
+    try std.testing.expectEqual(c1k_tls.timeout_s, c1k_h3.timeout_s);
+    try std.testing.expectEqual(c1k_tls.deadline_ms, c1k_h3.deadline_ms);
+    try std.testing.expectEqual(c1k_tls.ref_rate, c1k_h3.ref_rate);
+    try std.testing.expectEqual(c1k_tls.ref_band, c1k_h3.ref_band);
+    try std.testing.expectEqual(c1k_tls.cooldown_s, c1k_h3.cooldown_s);
+    try std.testing.expectEqualStrings(c1k_tls.req_path, c1k_h3.req_path);
+
+    // c1k-tls's tuning unchanged, plus exactly zoxy's QUIC pool and the
+    // stream pool a QUIC binding requires.
+    try std.testing.expectEqual(c1k_tls.proxy_env.len + 2, c1k_h3.proxy_env.len);
+    for (c1k_tls.proxy_env, c1k_h3.proxy_env[0..c1k_tls.proxy_env.len]) |want, got| {
+        try std.testing.expectEqualStrings(want.key, got.key);
+        try std.testing.expectEqualStrings(want.value, got.value);
+    }
+    var quic_connections: u32 = 0;
+    var h2_streams: u32 = 0;
+    var tls_engines: u32 = 0;
+    for (c1k_h3.proxy_env) |kv| {
+        if (std.mem.eql(u8, kv.key, "ZOXY_QUIC_CONNECTIONS")) quic_connections = try std.fmt.parseInt(u32, kv.value, 10);
+        if (std.mem.eql(u8, kv.key, "ZOXY_H2_STREAMS")) h2_streams = try std.fmt.parseInt(u32, kv.value, 10);
+        if (std.mem.eql(u8, kv.key, "ZOXY_TLS_ENGINES")) tls_engines = try std.fmt.parseInt(u32, kv.value, 10);
+        // zoxy refuses HTTP/2's connection pool unless a listener offers h2.
+        try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS"));
+    }
+    // Short of the offered connections, zoxy leaves the rest unanswered and
+    // the ramp measures the cap rather than HTTP/3. Over tls_engines, zoxy
+    // refuses to start.
+    try std.testing.expect(quic_connections >= c1k_h3.connections);
+    try std.testing.expect(quic_connections <= tls_engines);
+    try std.testing.expect(h2_streams >= c1k_h3.connections);
+}
+
+test "only an h3 profile leaves a proxy out, and only pingora" {
+    for (all) |p| {
+        try std.testing.expect(p.serves("zoxy"));
+        try std.testing.expect(p.serves("haproxy"));
+        try std.testing.expect(p.serves("nginx"));
+        try std.testing.expect(p.serves("envoy"));
+        try std.testing.expectEqual(!p.h3, p.serves("pingora"));
+    }
+}
+
+test "only an h2 profile sizes zoxy's HTTP/2 connection pool" {
+    // zoxy refuses h2_connections when no listener speaks h2, so on any
+    // other profile it would not start.
     for (all) |p| {
         if (p.h2) continue;
         for (p.proxy_env) |kv| {
             try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_CONNECTIONS"));
+        }
+    }
+}
+
+test "only an h2 or h3 profile sizes zoxy's stream pool" {
+    // zoxy refuses h2_streams unless a listener speaks h2 or binds QUIC,
+    // and requires it when one does.
+    for (all) |p| {
+        if (p.h2 or p.h3) continue;
+        for (p.proxy_env) |kv| {
             try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_H2_STREAMS"));
+        }
+    }
+}
+
+test "only an h3 profile sizes zoxy's QUIC pool" {
+    // zoxy refuses quic_connections when no listener binds QUIC.
+    for (all) |p| {
+        if (p.h3) continue;
+        for (p.proxy_env) |kv| {
+            try std.testing.expect(!std.mem.eql(u8, kv.key, "ZOXY_QUIC_CONNECTIONS"));
         }
     }
 }
@@ -423,6 +544,7 @@ test "profile.all is append-only, because proxyPort keys off its index" {
     try std.testing.expectEqualStrings("c1k-tls", all[3].name);
     try std.testing.expectEqualStrings("smoke", all[4].name);
     try std.testing.expectEqualStrings("c1k-h2", all[5].name);
+    try std.testing.expectEqualStrings("c1k-h3", all[6].name);
 }
 
 test "smoke shares no ramp shape with a published profile" {
@@ -458,6 +580,16 @@ test "validate rejects the misconfigurations the env plumbing used to allow" {
     p = c1k;
     p.h2 = true;
     try std.testing.expectError(error.H2WithoutTls, p.validate());
+
+    // QUIC has no cleartext mode.
+    p = c1k;
+    p.h3 = true;
+    try std.testing.expectError(error.H3WithoutTls, p.validate());
+
+    // One connection speaks one protocol; zrk would refuse the pair.
+    p = c1k_h2;
+    p.h3 = true;
+    try std.testing.expectError(error.H3WithH2, p.validate());
 }
 
 test "c10k carries the deadline SLO and c1k does not" {

@@ -33,6 +33,8 @@ pub const Options = struct {
     tls: bool = false,
     /// HTTP/2 over that TLS; the page says so.
     h2: bool = false,
+    /// HTTP/3 over QUIC in place of TCP; the page says so.
+    h3: bool = false,
     /// Absolute prefix for `.hgrm` links: relative links 404 in Discord.
     base_url: []const u8 = "",
 };
@@ -97,10 +99,10 @@ pub fn render(
         // Resumption matters most: zoxy ships session tickets, unexercised here.
         try out.writeAll(
             \\ <b>The load is offered over TLS 1.3</b>, terminated by the proxy; every proxy's
-            \\upstream leg stays plaintext, as zoxy terminates inbound only. All five load the same
+            \\upstream leg stays plaintext, as zoxy terminates inbound only. Every proxy loads the same
             \\self-signed <b>ECDSA P-256</b> certificate — the key type is part of the measurement, since
             \\the signature is per handshake. The generator offers <b>only <code>http/1.1</code> in ALPN</b>
-            \\unless this profile is HTTP/2 (below), and <b>never resumes a session</b>, so each connection pays a full
+            \\unless this profile is HTTP/2 or HTTP/3 (below), and <b>never resumes a session</b>, so each connection pays a full
             \\handshake at connect time and the steady state read below is record-layer crypto on
             \\kept-alive connections, not handshake throughput. The <b>cipher suite is each proxy's own
             \\choice</b> from what the generator offers — AES-GCM and ChaCha20-Poly1305 do not cost the
@@ -118,6 +120,19 @@ pub fn render(
             \\HTTP/2 framing, HPACK and stream bookkeeping against the TLS profile's HTTP/1.1, not
             \\multiplexing. Every proxy's upstream leg stays HTTP/1.1, and each one's HTTP/2
             \\settings (windows, concurrent-stream limits) are its own defaults.
+        );
+    }
+    if (opts.h3) {
+        // What separates this page from the TLS one: the transport and the
+        // protocol, and who could not take part.
+        try out.writeAll(
+            \\ <b>The clients speak HTTP/3 over QUIC</b>, on UDP at the TLS listener's port, with ALPN
+            \\<code>h3</code> alone and no 0-RTT; a connection that does not complete is counted as an
+            \\error rather than measured. Each connection carries <b>one request at a time</b>, so requests
+            \\in flight still equal connections: this measures QUIC packet protection, loss recovery and
+            \\QPACK against the TLS profile's TCP and HTTP/1.1, not multiplexing. Every proxy's upstream
+            \\leg stays HTTP/1.1 over TCP, and each one's QUIC settings (windows, stream limits, Retry) are
+            \\its own defaults. <b>pingora is not in this profile</b>: it has no HTTP/3.
         );
     }
     try out.writeAll("</p>");

@@ -30,6 +30,12 @@ fi
 if [ -n "${ZOXY_H2_STREAMS:-}" ]; then
     fields="${fields}, \"h2_streams\": ${ZOXY_H2_STREAMS}"
 fi
+# QUIC pool, only on h3 turns: zoxy refuses it unless a listener binds QUIC.
+# Short of the offered connections, the rest go unanswered
+# (zoxy_h3_shed_connections).
+if [ -n "${ZOXY_QUIC_CONNECTIONS:-}" ]; then
+    fields="${fields}, \"quic_connections\": ${ZOXY_QUIC_CONNECTIONS}"
+fi
 LIMITS="{${fields}}"
 
 # All-or-nothing: a dropped member would round-robin over three backends.
@@ -59,10 +65,15 @@ done
 # ~250 MiB). `tls` sits beside the `http` body (0.8.0 config).
 # One line: it becomes a sed replacement, which rejects raw newlines.
 # PROXY_H2 adds `alpn`; absent, zoxy (0.10.0+) offers `http/1.1` alone.
+# PROXY_H3 adds a QUIC binding (1.2.0+) on UDP at the same port number, beside
+# the TCP listener the warm probe uses. `alt_svc_max_age_s: 0`: no Alt-Svc
+# header on every answer, which no other proxy adds and the client ignores.
 if [ -n "${PROXY_TLS_PORT:-}" ]; then
     ALPN=""
     [ -n "${PROXY_H2:-}" ] && ALPN=", \"alpn\": [\"h2\", \"http/1.1\"]"
-    TLS_LISTENER=", { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"tls\": { \"cert\": \"/etc/bench/tls/bench.crt\", \"key\": \"/etc/bench/tls/bench.key\"${ALPN} }, \"http\": { \"cluster\": \"origin\" } }"
+    QUIC=""
+    [ -n "${PROXY_H3:-}" ] && QUIC=", \"quic\": { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"alt_svc_max_age_s\": 0 }"
+    TLS_LISTENER=", { \"bind\": \"0.0.0.0:${PROXY_TLS_PORT}\", \"tls\": { \"cert\": \"/etc/bench/tls/bench.crt\", \"key\": \"/etc/bench/tls/bench.key\"${ALPN} }, \"http\": { \"cluster\": \"origin\"${QUIC} } }"
 else
     TLS_LISTENER=""
 fi

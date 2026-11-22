@@ -54,6 +54,12 @@ x-proxy-common: &proxy-common
 # then offers `h2, http/1.1` instead of `http/1.1` alone; the warm probe fails a
 # proxy that still picks HTTP/1.1. Upstream legs stay HTTP/1.1 either way.
 #
+# PROXY_H3: `on` only for h3 profiles. The TLS listener keeps its TCP side
+# (http/1.1, for the warm probe) and gains a QUIC listener on UDP at the same
+# port number, ALPN `h3`. pingora has no HTTP/3 and is never started on an h3
+# profile (profile.zig `serves`), so it reads neither. Locally the TLS port is
+# published for UDP as well.
+#
 # The cert is generated per run into ./proxies/tls (suite.zig
 # ensureTlsMaterial): ECDSA P-256, the only key type zoxy accepts.
 
@@ -183,17 +189,22 @@ services:
       # listener speaks h2.
       ZOXY_H2_CONNECTIONS: ${ZOXY_H2_CONNECTIONS:-}
       ZOXY_H2_STREAMS: ${ZOXY_H2_STREAMS:-}
-      # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS, and
-      # PROXY_H2 adds `h2` to its ALPN.
+      # QUIC pool, set by h3 profiles only: zoxy refuses it when no listener
+      # binds QUIC.
+      ZOXY_QUIC_CONNECTIONS: ${ZOXY_QUIC_CONNECTIONS:-}
+      # Rendered by entrypoint.sh; an empty PROXY_TLS_PORT omits TLS,
+      # PROXY_H2 adds `h2` to its ALPN, and PROXY_H3 adds a QUIC binding.
       PROXY_PORT: ${PROXY_PORT:-8080}
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
       PROXY_H2: ${PROXY_H2:-}
+      PROXY_H3: ${PROXY_H3:-}
     volumes:
       - ./proxies/zoxy/config.template.json:/etc/zoxy/config.template.json:ro
       - ./proxies/tls:/etc/bench/tls:ro
     ports:
       - "8080:8080"
       - "8443:8443"
+      - "8443:8443/udp"
     healthcheck: *healthcheck-bash
 
   haproxy:
@@ -214,6 +225,8 @@ services:
       PROXY_TLS_PORT: ${PROXY_TLS_PORT:-}
       # `on` picks the bind line that advertises h2 (haproxy.cfg).
       PROXY_H2: ${PROXY_H2:-}
+      # `on` adds the QUIC bind line (haproxy.cfg).
+      PROXY_H3: ${PROXY_H3:-}
     # haproxy cannot log to a path, so fd 1 (`log stdout`) goes to the file;
     # stderr still reaches `docker logs` for reportStartFailure. The image
     # entrypoint adds -W -db; `exec` keeps haproxy as PID 1.
@@ -227,6 +240,7 @@ services:
     ports:
       - "8080:8080"
       - "8443:8443"
+      - "8443:8443/udp"
     healthcheck: *healthcheck-wget
 
 
@@ -240,8 +254,10 @@ services:
     # --concurrency 1: envoy sizes workers from host CPUs, not the cgroup.
     # envoy.yaml has no env substitution, so sed bakes the ports in at compose
     # parse time; plaintext turns delete @TLS_BEGIN@..@TLS_END@, and @ALPN@
-    # becomes `"h2", "http/1.1"` on h2 turns. `$$` escapes a dollar for the
-    # shell; `|` delimits the ALPN substitution, whose value holds a `/`.
+    # becomes `"h2", "http/1.1"` on h2 turns. The QUIC listener between the
+    # H3 markers is deleted unless PROXY_H3 is set; on h3 turns only the two
+    # marker lines go. `$$` escapes a dollar for the shell; `|` delimits the
+    # ALPN substitution, whose value holds a `/`.
     entrypoint: ["sh", "-c"]
     command:
       - >-
@@ -249,7 +265,9 @@ services:
         [ -n "${PROXY_TLS_PORT:-}" ] && tls='s/@TLS_PORT@/${PROXY_TLS_PORT}/';
         alpn='"http/1.1"';
         [ -n "${PROXY_H2:-}" ] && alpn='"h2", "http/1.1"';
-        sed -e 's/@PORT@/${PROXY_PORT:-8080}/' -e "$$tls" -e "s|@ALPN@|$$alpn|"
+        h3='/@H3_BEGIN@/,/@H3_END@/d';
+        [ -n "${PROXY_H3:-}" ] && h3='/@H3_[A-Z]*@/d';
+        sed -e "$$h3" -e 's/@PORT@/${PROXY_PORT:-8080}/' -e "$$tls" -e "s|@ALPN@|$$alpn|"
         /etc/envoy/envoy.yaml.template > /tmp/envoy.yaml &&
         exec envoy -c /tmp/envoy.yaml --concurrency 1
     volumes:
@@ -258,6 +276,7 @@ services:
     ports:
       - "8080:8080"
       - "8443:8443"
+      - "8443:8443/udp"
     healthcheck: *healthcheck-bash
 
   nginx:
@@ -275,6 +294,9 @@ services:
       # The TLS server's `http2` directive: `on` for h2 profiles, else `off`
       # (nginx's default, so HTTP/1.1 turns render what they always did).
       NGINX_HTTP2: ${PROXY_H2:-off}
+      # Non-empty keeps the TLS server's QUIC lines; 25-tls.sh deletes them
+      # otherwise.
+      PROXY_H3: ${PROXY_H3:-}
     volumes:
       - ./proxies/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       # Shared by both server blocks so plaintext and TLS proxy identically.
@@ -285,6 +307,7 @@ services:
     ports:
       - "8080:8080"
       - "8443:8443"
+      - "8443:8443/udp"
     healthcheck: *healthcheck-wget
 
   pingora:

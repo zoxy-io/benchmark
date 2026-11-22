@@ -35,7 +35,8 @@ handling; at 100 KiB every proxy converged on the network path. The 64 B to
 (2026-09-18 to 2026-10-07).
 
 Every proxy is a **reverse proxy speaking HTTP/1.1 to the origins** (and
-HTTP/1.1, or HTTP/2 on `c1k-h2`, to the clients) doing the same job: parse each
+HTTP/1.1, or HTTP/2 on `c1k-h2` and HTTP/3 on `c1k-h3`, to the clients) doing
+the same job: parse each
 request, **pick an origin from a four-node pool**, forward it over a pooled
 keep-alive upstream, stream the response back. The pool is what makes the job
 the one a production proxy actually does — a single origin measures forwarding,

@@ -59,8 +59,9 @@ listener: parse each request,
 **pick an origin from a four-node pool**, forward it over a pooled keep-alive
 upstream, stream the response back. The generator speaks HTTP/1.1 to the proxy
 — over TLS on `c1k-tls` — except on `c1k-h2`, where it speaks HTTP/2 over the
-same TLS; every proxy speaks plaintext HTTP/1.1 onward to the origins in every
-profile, and the origins are nginx.
+same TLS, and on `c1k-h3`, where it speaks HTTP/3 over QUIC; every proxy speaks
+plaintext HTTP/1.1 onward to the origins in every profile, and the origins are
+nginx.
 
 The pool is what makes the job the one a production proxy actually does: a
 single origin measures forwarding, and forwarding alone. Balancing across a set
@@ -188,6 +189,40 @@ is the other half, and it is the half where proxies differ.
     `zoxy_h2_shed_streams` after every h2 ramp and notes the row if either is
     nonzero. The sessions are preallocated at boot (~94 KB each), so zoxy's
     memory on `c1k-h2` sits roughly 100 MiB above `c1k-tls` by construction.
+- **HTTP/3 is a profile too, and only to the client.** `c1k-h3` is `c1k-tls`
+  with a QUIC listener added on UDP at the TLS listener's port number, and the
+  generator speaking HTTP/3 to it; `c1k-tls` → `c1k-h3` prices HTTP/3 over
+  QUIC against HTTP/1.1 over TLS on TCP. What travels with those numbers:
+  - **pingora is not in it.** Pingora 0.9 has no HTTP/3, so `bench` leaves it
+    out of the profile before anything runs (`profile.zig`'s `serves`): no
+    build, no turn, no row, rather than a failed row read as a broken proxy.
+  - **One request per connection**, as on `c1k-h2`: 1 000 in flight. This
+    prices QUIC packet protection, loss recovery and QPACK, not multiplexing.
+  - **ALPN `h3` alone, no 0-RTT, no session resumption.** The generator
+    leaves SNI out for the IP-literal target, as RFC 6066 requires. A QUIC
+    connection that does not complete is a connect error, and `bench`'s warm
+    probe (a two-second, one-connection zrk run over HTTP/3) fails the turn
+    before the ramp unless every probe request completes.
+  - **The TCP TLS listener stays up** beside the QUIC one, offering
+    `http/1.1`, because the warm probe's first check and the healthchecks
+    use it. The switch is one variable, `PROXY_H3`: haproxy `bind quic4@`,
+    nginx `listen … quic` with `http3 on`, envoy a UDP listener with an HTTP3
+    codec, zoxy `http.quic.bind`. With it unset each proxy renders exactly
+    its `c1k-tls` configuration.
+  - **Each proxy's QUIC settings are its own defaults** (flow-control
+    windows, stream limits, Retry, GSO/GRO), and so are the hosts' UDP socket
+    buffers: no proxy here sets its own, and `bench` does not raise the
+    kernel's.
+  - **Upstream stays HTTP/1.1 over TCP** on every proxy.
+  - **zoxy's QUIC pool is a hard ceiling the others do not have.**
+    `quic_connections` (1024, at most `tls_engines`) bounds the connections,
+    and one that finds no slot is left unanswered; its requests share
+    `h2_streams` (1386, required with a QUIC binding). zoxy sends a Retry once
+    the pool is half full. `bench` reads `zoxy_h3_shed_connections` and
+    `zoxy_h3_shed_streams` after every h3 ramp and notes the row if either is
+    nonzero. Each QUIC connection reserves about 835 KiB at boot, so zoxy's
+    memory on `c1k-h3` sits well above `c1k-tls` by construction, roughly
+    835 MiB more.
 - **Same box for every proxy**: hard-capped to **1 CPU** / `PROXY_MEM`
   (default 4 GiB) by cgroups, identical per proxy; thread counts hardcoded to 1
   (`nbthread 1`, `--concurrency 1`, `worker_processes 1`, pingora `threads=1`).
@@ -217,6 +252,12 @@ is the other half, and it is the half where proxies differ.
     100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
     `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
     continues.
+  - **The generator moved to zrk 3.0.3 when `c1k-h3` started.** 3.0.2 shares
+    latency statistics between the generator's threads instead of keeping a
+    histogram per connection (much less memory on the loadgen); 3.0.3 fixes
+    HTTP/3 against haproxy and envoy. The HTTP/1.1 and HTTP/2 requests and the
+    timeseries are unchanged, so the `c1k`, `c1k-tls` and `c1k-h2` series carry
+    on; a step on that night may still be the generator.
   - **`MAX_RATE` moved once, from 100k to 40k (2026-11-15), right after the
     body did.** At 10 KiB the fastest knee on record is zoxy's 27.2k, so
     100k spent most of each ramp in overload; 40k keeps 1.5x over that best
