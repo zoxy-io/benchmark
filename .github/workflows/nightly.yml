@@ -28,7 +28,7 @@ on:
         description: 'Profiles to run, comma-separated, in order (BENCH_PROFILES)'
         required: false
         type: string
-        default: c1k,c1k-tls,c1k-h2,c1k-h3
+        default: c1k,c1k-tls,c1k-h2
       proxies:
         description: 'Proxies to run, comma-separated (BENCH_PROXIES)'
         required: false
@@ -60,8 +60,8 @@ jobs:
   bench:
     runs-on: ubuntu-24.04
 
-    # ~140 min on a normal night (4 profiles x 5 proxies, 4 on c1k-h3, x ~350 s
-    # + builds);
+    # ~105 min on a normal night (3 profiles x 5 proxies x ~350 s + builds);
+    # ~140 min with c1k-h3 (4 proxies);
     # under GitHub's 360-minute cap, with room for a slow night. Wait chunks have their own step timeouts
     # so a hung loadgen fails a step, not the job, and teardown still runs.
     timeout-minutes: 270
@@ -82,7 +82,10 @@ jobs:
       # HTTP/3 and sits c1k-h3 out (profile.zig `serves`).
       # c10k is excluded while run #25's start failure is open; dispatch with
       # it to run anyway.
-      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-h2,c1k-h3' }}
+      # c1k-h3 is excluded while its 1,000 QUIC handshakes fail under load
+      # (test run 45012685864: haproxy completed nothing, zoxy and envoy
+      # mostly connect errors); dispatch with it to run anyway.
+      BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-h2' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}

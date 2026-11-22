@@ -252,7 +252,7 @@ is the other half, and it is the half where proxies differ.
     100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
     `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
     continues.
-  - **The generator moved to zrk 3.0.3 when `c1k-h3` started.** 3.0.2 shares
+  - **The generator moved to zrk 3.0.3 on 2026-11-23.** 3.0.2 shares
     latency statistics between the generator's threads instead of keeping a
     histogram per connection (much less memory on the loadgen); 3.0.3 fixes
     HTTP/3 against haproxy and envoy. The HTTP/1.1 and HTTP/2 requests and the
