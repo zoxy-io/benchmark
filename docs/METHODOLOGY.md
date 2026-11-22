@@ -200,9 +200,12 @@ is the other half, and it is the half where proxies differ.
     prices QUIC packet protection, loss recovery and QPACK, not multiplexing.
   - **ALPN `h3` alone, no 0-RTT, no session resumption.** The generator
     leaves SNI out for the IP-literal target, as RFC 6066 requires. A QUIC
-    connection that does not complete is a connect error, and `bench`'s warm
-    probe (a two-second, one-connection zrk run over HTTP/3) fails the turn
-    before the ramp unless every probe request completes.
+    connection that does not complete is a connect error. The generator gives
+    a handshake two `--timeout`s (2 s), what a TCP connect and its TLS
+    handshake get between them, and closes an attempt it gives up with a
+    CONNECTION_CLOSE rather than going silent. `bench`'s warm probe (a
+    two-second, one-connection zrk run over HTTP/3) fails the turn before the
+    ramp unless every probe request completes.
   - **The TCP TLS listener stays up** beside the QUIC one, offering
     `http/1.1`, because the warm probe's first check and the healthchecks
     use it. The switch is one variable, `PROXY_H3`: haproxy `bind quic4@`,
@@ -210,9 +213,13 @@ is the other half, and it is the half where proxies differ.
     codec, zoxy `http.quic.bind`. With it unset each proxy renders exactly
     its `c1k-tls` configuration.
   - **Each proxy's QUIC settings are its own defaults** (flow-control
-    windows, stream limits, Retry, GSO/GRO), and so are the hosts' UDP socket
-    buffers: no proxy here sets its own, and `bench` does not raise the
-    kernel's.
+    windows, stream limits, Retry, GSO/GRO), and no config here sets a socket
+    buffer size. The hosts' UDP buffers are raised for all of them alike
+    (`net.core.rmem_default` and `wmem_default` 4 MiB, the maxima 16 MiB, in
+    `cloud/cloud-init.yaml.tftpl`), the QUIC counterpart of the `somaxconn`
+    and SYN backlog raised for TCP: the kernel's 208 KiB does not hold the
+    1,000 Initials of a turn's first second. TCP sockets are sized by
+    `tcp_rmem`/`tcp_wmem`, which stay at the kernel's defaults.
   - **Upstream stays HTTP/1.1 over TCP** on every proxy.
   - **zoxy's QUIC pool is a hard ceiling the others do not have.**
     `quic_connections` (1024, at most `tls_engines`) bounds the connections,
@@ -252,12 +259,15 @@ is the other half, and it is the half where proxies differ.
     100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
     `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
     continues.
-  - **The generator moved to zrk 3.0.3 on 2026-11-23.** 3.0.2 shares
+  - **The generator moved to zrk 3.0.4 on 2026-11-23.** 3.0.2 shares
     latency statistics between the generator's threads instead of keeping a
     histogram per connection (much less memory on the loadgen); 3.0.3 fixes
-    HTTP/3 against haproxy and envoy. The HTTP/1.1 and HTTP/2 requests and the
-    timeseries are unchanged, so the `c1k`, `c1k-tls` and `c1k-h2` series carry
-    on; a step on that night may still be the generator.
+    HTTP/3 against haproxy and envoy; 3.0.4 fixes HTTP/3 loss recovery (3.0.3
+    sent probes every 20 ms to a peer that had not answered, not on RFC 9002's
+    timer) and how it gives up a handshake. The HTTP/1.1 and HTTP/2 requests
+    and the timeseries are unchanged, so the `c1k`, `c1k-tls` and `c1k-h2`
+    series carry on; a step on that night may still be the generator. The
+    hosts' UDP buffers were raised the same day, which TCP does not use.
   - **`MAX_RATE` moved once, from 100k to 40k (2026-11-15), right after the
     body did.** At 10 KiB the fastest knee on record is zoxy's 27.2k, so
     100k spent most of each ramp in overload; 40k keeps 1.5x over that best

@@ -47,6 +47,19 @@ write_files:
       #               for the profiles proxyPort has yet to number
       net.ipv4.ip_local_reserved_ports = 8080-8081,8443,9000,9101,9902,18080-19199
       net.ipv4.tcp_tw_reuse = 1
+      # UDP socket buffers, for c1k-h3: QUIC's equivalent of the backlogs
+      # above. 1,000 connections opening at once put 1,000 Initials (1,200 B
+      # each, ~2.3 KiB of buffer) on the proxy's one UDP socket, and the
+      # default 208 KiB holds fewer than two hundred. 4 MiB holds the burst.
+      # Every proxy keeps its stock QUIC settings and no config here sets a
+      # buffer size, so the default is what a socket gets unless the proxy
+      # asks for its own; the max is raised so such a request is not cut back
+      # to 208 KiB. TCP sockets are sized by tcp_rmem/tcp_wmem, which stay at
+      # the kernel's defaults, so the TCP profiles do not move.
+      net.core.rmem_default = 4194304
+      net.core.wmem_default = 4194304
+      net.core.rmem_max = 16777216
+      net.core.wmem_max = 16777216
       fs.file-max = 2097152
       fs.nr_open = 2097152
 
