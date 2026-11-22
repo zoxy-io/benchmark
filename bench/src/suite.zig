@@ -943,6 +943,7 @@ fn runServed(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         // Before teardown removes the container, and outside `runOne` so a
         // failed turn still leaves its reason.
         captureErrorLog(gpa, arena, io, opts.fleet, opts.out_dir, name);
+        captureHostDiag(gpa, arena, io, opts.fleet, opts.out_dir, name);
 
         // Always tear down. A failure surfaces in the next proxy's identity
         // check.
@@ -1684,6 +1685,49 @@ fn captureErrorLog(
         return;
     };
     writeErrorLog(io, arena, out_dir, name, clean);
+}
+
+/// The proxy host's view of the turn, for diagnosing one rather than for the
+/// report: each interface's MTU, the kernel's IP/UDP counters (UDP receive
+/// buffer drops above all, which no proxy reports), and for zoxy its whole
+/// /metrics. The counters are the host's, cumulative across the night's
+/// turns (host networking), so a turn's own is the difference from the turn
+/// before. Saved as `<name>.diag.txt`: not publishable
+/// (`commands.publishable`), addresses scrubbed. Best-effort.
+fn captureHostDiag(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    fleet: Fleet,
+    out_dir: []const u8,
+    name: []const u8,
+) void {
+    const zoxy_metrics = if (std.mem.eql(u8, name, "zoxy"))
+        "echo '== zoxy /metrics'; docker exec zoxy bash -c 'exec 3<>/dev/tcp/127.0.0.1/9101 && " ++
+            "printf \"GET /metrics HTTP/1.1\\r\\nHost: admin\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && " ++
+            "cat <&3' 2>/dev/null | grep -v '^#' | grep -v ' 0$'; "
+    else
+        "";
+    const cmd = std.fmt.allocPrint(
+        arena,
+        "echo '== mtu'; for i in /sys/class/net/*; do echo \"${{i##*/}} $(cat $i/mtu)\"; done; " ++
+            "echo '== /proc/net/snmp'; cat /proc/net/snmp; {s}true",
+        .{zoxy_metrics},
+    ) catch return;
+    const res = remote.check(gpa, arena, io, fleet.proxyHost(), "capture host diagnostics", cmd, deadline.inspect) catch |e| {
+        redact.log("bench: [{s}] could not capture host diagnostics: {s}", .{ name, @errorName(e) });
+        return;
+    };
+    if (res.stdout.len == 0) return;
+    const clean = redact.scrubAnyIpAlloc(arena, res.stdout) catch return;
+    redact.assertNoIps("host diagnostics", clean) catch {
+        redact.log("bench: [{s}] host diagnostics withheld: they still contain an address", .{name});
+        return;
+    };
+    const path = std.fmt.allocPrint(arena, "{s}/{s}.diag.txt", .{ out_dir, name }) catch return;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = clean }) catch |e| {
+        redact.log("bench: [{s}] could not write {s}: {s}", .{ name, path, @errorName(e) });
+    };
 }
 
 fn captureWhat(arena: Allocator, name: []const u8) []const u8 {
