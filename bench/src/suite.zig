@@ -1721,7 +1721,7 @@ fn captureHostDiag(
     if (res.stdout.len == 0) return;
     // And the loadgen's own, where this process runs: a datagram the proxy
     // sent and the generator's host dropped is a loss neither side reports.
-    const loadgen = loadgenDiag(arena, io);
+    const loadgen = loadgenDiag(gpa, arena, io);
     const both = std.mem.concat(arena, u8, &.{ res.stdout, loadgen }) catch res.stdout;
     const clean = redact.scrubAnyIpAlloc(arena, both) catch return;
     redact.assertNoIps("host diagnostics", clean) catch {
@@ -1734,14 +1734,20 @@ fn captureHostDiag(
     };
 }
 
-/// The loadgen's /proc/net/snmp and /proc/net/dev, read where `bench` runs.
-fn loadgenDiag(arena: Allocator, io: Io) []const u8 {
-    var parts: std.ArrayList(u8) = .empty;
-    for ([_][]const u8{ "/proc/net/snmp", "/proc/net/dev" }) |path| {
-        const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch continue;
-        parts.print(arena, "== loadgen {s}\n{s}", .{ path, text }) catch return "";
-    }
-    return parts.items;
+/// The loadgen's /proc/net/snmp and /proc/net/dev, where `bench` runs. Through
+/// `cat`, not a file read: a /proc file reports a size of zero, and a read
+/// sized by it came back empty.
+fn loadgenDiag(gpa: Allocator, arena: Allocator, io: Io) []const u8 {
+    const res = remote.check(
+        gpa,
+        arena,
+        io,
+        .local,
+        "capture loadgen diagnostics",
+        "echo '== loadgen /proc/net/snmp'; cat /proc/net/snmp; echo '== loadgen /proc/net/dev'; cat /proc/net/dev",
+        deadline.inspect,
+    ) catch return "";
+    return res.stdout;
 }
 
 fn captureWhat(arena: Allocator, name: []const u8) []const u8 {
