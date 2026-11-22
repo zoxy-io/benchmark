@@ -1711,7 +1711,7 @@ fn captureHostDiag(
     const cmd = std.fmt.allocPrint(
         arena,
         "echo '== mtu'; for i in /sys/class/net/*; do echo \"${{i##*/}} $(cat $i/mtu)\"; done; " ++
-            "echo '== /proc/net/snmp'; cat /proc/net/snmp; {s}true",
+            "echo '== /proc/net/snmp'; cat /proc/net/snmp; echo '== /proc/net/dev'; cat /proc/net/dev; {s}true",
         .{zoxy_metrics},
     ) catch return;
     const res = remote.check(gpa, arena, io, fleet.proxyHost(), "capture host diagnostics", cmd, deadline.inspect) catch |e| {
@@ -1719,7 +1719,11 @@ fn captureHostDiag(
         return;
     };
     if (res.stdout.len == 0) return;
-    const clean = redact.scrubAnyIpAlloc(arena, res.stdout) catch return;
+    // And the loadgen's own, where this process runs: a datagram the proxy
+    // sent and the generator's host dropped is a loss neither side reports.
+    const loadgen = loadgenDiag(arena, io);
+    const both = std.mem.concat(arena, u8, &.{ res.stdout, loadgen }) catch res.stdout;
+    const clean = redact.scrubAnyIpAlloc(arena, both) catch return;
     redact.assertNoIps("host diagnostics", clean) catch {
         redact.log("bench: [{s}] host diagnostics withheld: they still contain an address", .{name});
         return;
@@ -1728,6 +1732,16 @@ fn captureHostDiag(
     Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = clean }) catch |e| {
         redact.log("bench: [{s}] could not write {s}: {s}", .{ name, path, @errorName(e) });
     };
+}
+
+/// The loadgen's /proc/net/snmp and /proc/net/dev, read where `bench` runs.
+fn loadgenDiag(arena: Allocator, io: Io) []const u8 {
+    var parts: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ "/proc/net/snmp", "/proc/net/dev" }) |path| {
+        const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch continue;
+        parts.print(arena, "== loadgen {s}\n{s}", .{ path, text }) catch return "";
+    }
+    return parts.items;
 }
 
 fn captureWhat(arena: Allocator, name: []const u8) []const u8 {
