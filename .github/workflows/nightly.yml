@@ -34,6 +34,15 @@ on:
         required: false
         type: string
         default: zoxy,haproxy,nginx,pingora,envoy
+      # Off for a test run: no Pages deploy, no history rows, no Discord post
+      # and no site refresh. The numbers stay in the run's bench-<runid>
+      # artifact (and results.tar in the bucket). A scheduled run always
+      # publishes.
+      publish:
+        description: 'Publish: Pages, history.ndjson, Discord and the site (off = test run, artifact only)'
+        required: false
+        type: boolean
+        default: true
 
 # Job-level `permissions:` REPLACE this block, so each job restates its own;
 # for a job calling a reusable workflow, that is also the callee's ceiling.
@@ -483,7 +492,10 @@ jobs:
     needs: bench
     # `!cancelled()`, NOT `always()`: run #36 published a cancelled run.
     # Not `success()`: a teardown failure must not block a good report.
-    if: ${{ !cancelled() && needs.bench.outputs.results == 'success' }}
+    # A dispatch with `publish` off is a test run, kept out of the history;
+    # `inputs` is null on a schedule, which always publishes. Skipping this
+    # skips `dispatch` too (it needs a successful publish).
+    if: ${{ !cancelled() && needs.bench.outputs.results == 'success' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
     uses: ./.github/workflows/publish.yml
     with:
       source-run: ${{ github.run_id }}

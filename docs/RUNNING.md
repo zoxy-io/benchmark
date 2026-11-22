@@ -4,6 +4,15 @@ The nightly runs itself. One-time cloud setup — service accounts, the OIDC
 federation, the results bucket — is in [SETUP.md](SETUP.md); after that, use
 `workflow_dispatch` to trigger a run by hand.
 
+A dispatched run publishes like the nightly unless `publish` is off. Turn it
+off for a **test run** (a harness change, a new profile, a branch): the fleet
+runs and the numbers land in the run's `bench-<runid>` artifact and the
+bucket's `results.tar`, but nothing reaches Pages, `history.ndjson`, Discord
+or the site, so the published trend holds only real nightlies. A run from a
+branch other than `main` cannot publish anyway (the `github-pages`
+environment deploys from `main` only), but its failed publish then retries
+twice; `publish` off skips it cleanly.
+
 ## How a nightly run happens
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) creates a
