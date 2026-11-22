@@ -70,6 +70,12 @@ variable "bench_proxies" {
   description = "BENCH_PROXIES — comma-separated, passed straight to `bench suite --proxies`."
 }
 
+variable "bench_zoxy_ref" {
+  type        = string
+  default     = ""
+  description = "BENCH_ZOXY_REF — a zoxy commit or tag built from source (ReleaseSafe, x86_64_v3) in place of the latest release, for a test run. Empty: the release."
+}
+
 variable "zone" {
   type        = string
   default     = "ru-central1-a"

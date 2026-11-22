@@ -13,6 +13,13 @@ branch other than `main` cannot publish anyway (the `github-pages`
 environment deploys from `main` only), but its failed publish then retries
 twice; `publish` off skips it cleanly.
 
+To measure a zoxy change before it is released, dispatch with `zoxy_ref` set
+to a zoxy commit (or tag) and `publish` off. The fleet builds that commit from
+source as the release is built (ReleaseSafe, `-Dcpu=x86_64_v3`) in place of
+the latest release, so its numbers compare with a release's on the same
+night. Use a SHA: a branch name with a slash cannot be in zoxy's image tag. A
+`zoxy_ref` run with `publish` on fails before the fleet exists.
+
 ## How a nightly run happens
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) creates a

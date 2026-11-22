@@ -75,6 +75,9 @@ pub const Options = struct {
     runid: []const u8,
     /// Where this profile's artifacts are written.
     out_dir: []const u8,
+    /// BENCH_ZOXY_REF: a zoxy commit or tag to build from source in place of
+    /// the latest release, for a test run (`zoxyOverride`). Empty: the release.
+    zoxy_ref: []const u8 = "",
 };
 
 /// Stage deadlines; every remote and in-process step is bounded.
@@ -438,11 +441,28 @@ pub const ZoxySource = struct {
     /// The binary's real cpu target: `native` for source; releases are built
     /// upstream with `-Dcpu=x86_64_v3`.
     cpu: []const u8,
+    /// ZOXY_OPTIMIZE for a source build; null leaves compose's default
+    /// (ReleaseFast). The release flavour's mode is the artifact's own.
+    optimize: ?[]const u8 = null,
 
     fn isSource(self: ZoxySource) bool {
         return std.mem.eql(u8, self.flavour, "source");
     }
 };
+
+/// A test run's zoxy (BENCH_ZOXY_REF): `ref` built from source as the release
+/// is built — ReleaseSafe, `-Dcpu=x86_64_v3` — so its numbers compare with a
+/// release's on the same fleet, and what changed is the code. Null for a ref
+/// that cannot be an image tag (zoxy's tag carries it): a commit or a tag
+/// name, not a branch with a slash in it.
+pub fn zoxyOverride(ref: []const u8) ?ZoxySource {
+    if (ref.len == 0 or ref.len > 64) return null;
+    for (ref) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return null;
+    }
+    if (ref[0] == '.' or ref[0] == '-') return null;
+    return .{ .flavour = "source", .ref = ref, .cpu = "x86_64_v3", .optimize = "ReleaseSafe" };
+}
 
 /// Resolve `profile.zoxy_ref` into a `ZoxySource`; null if `release` could not
 /// be resolved. Never falls back to a source build: that is a different binary.
@@ -673,6 +693,8 @@ fn runServed(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
         if (std.mem.eql(u8, name, "zoxy")) break true;
     } else false;
     const zoxy_src = if (wants_zoxy) blk: {
+        // A test run's own zoxy wins over everything: it is the point of the run.
+        if (opts.zoxy_ref.len > 0) break :blk zoxyOverride(opts.zoxy_ref);
         // A tag pinned by an earlier profile of this run wins; see `zoxy_pin_name`.
         if (readZoxyPin(arena, io, opts.out_dir)) |tag| {
             redact.log("bench: [zoxy] release pinned by this run: {s}", .{tag});
@@ -687,6 +709,8 @@ fn runServed(gpa: Allocator, arena: Allocator, io: Io, opts: Options) !Result {
     if (wants_zoxy) {
         if (zoxy_src) |z| {
             redact.log("bench: [zoxy] {s} build at {s} (cpu {s})", .{ z.flavour, z.ref, z.cpu });
+        } else if (opts.zoxy_ref.len > 0) {
+            redact.log("bench: [zoxy] BENCH_ZOXY_REF '{s}' is not a commit or tag an image can be tagged with — zoxy cannot build", .{opts.zoxy_ref});
         } else {
             redact.log("bench: [zoxy] could not resolve the latest release — zoxy cannot build", .{});
         }
@@ -1941,6 +1965,8 @@ fn envPrefix(arena: Allocator, p: profile.Profile, fleet: Fleet, zoxy: ?ZoxySour
     // trio; without them compose builds a floating main.
     if (zoxy) |z| {
         try buf.print(arena, "ZOXY_FLAVOUR={s} ZOXY_REF={s} ZOXY_CPU={s} ", .{ z.flavour, z.ref, z.cpu });
+        // Part of the image tag too, so `build` and `up` agree on it.
+        if (z.optimize) |mode| try buf.print(arena, "ZOXY_OPTIMIZE={s} ", .{mode});
     }
     // Ports only for `start`. PROXY_TLS_PORT only on TLS profiles: unset means
     // no TLS listener (see compose.yaml x-proxy-common).
@@ -2303,6 +2329,30 @@ test "only a real commit sha counts as a resolved ref" {
     try std.testing.expect(!isSha("z1d03b10f698256857615c2e256ce29548dfd51a"));
     // A short sha is not enough to compare against a full one.
     try std.testing.expect(!isSha("91d03b1"));
+}
+
+test "a test run's zoxy is built from source as the release is, and only from a ref a tag can carry" {
+    const z = zoxyOverride("433b11b0123456789abcdef0123456789abcdef0").?;
+    try std.testing.expectEqualStrings("source", z.flavour);
+    try std.testing.expectEqualStrings("x86_64_v3", z.cpu);
+    try std.testing.expectEqualStrings("ReleaseSafe", z.optimize.?);
+    try std.testing.expect(zoxyOverride("v1.2.1") != null);
+    // Not an image tag: a branch with a slash, a leading dot or dash, a space.
+    try std.testing.expect(zoxyOverride("perf/h3-send-path") == null);
+    try std.testing.expect(zoxyOverride(".hidden") == null);
+    try std.testing.expect(zoxyOverride("-x") == null);
+    try std.testing.expect(zoxyOverride("a b") == null);
+    try std.testing.expect(zoxyOverride("") == null);
+
+    // The mode is part of zoxy's image tag, so `build` and `up` both carry it;
+    // a release leaves it to the artifact.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try envPrefix(arena_state.allocator(), profile.c1k_h3, test_fleet, z, null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_FLAVOUR=source ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "ZOXY_OPTIMIZE=ReleaseSafe ") != null);
+    const r = try envPrefix(arena_state.allocator(), profile.c1k_h3, test_fleet, test_zoxy_src, null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "ZOXY_OPTIMIZE") == null);
 }
 
 test "a ref is read from git's ref advertisement as git would read it" {

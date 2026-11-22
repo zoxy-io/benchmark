@@ -177,6 +177,7 @@ resource "yandex_compute_instance" "host" {
       runid                = var.runid
       bench_profiles       = var.bench_profiles
       bench_proxies        = var.bench_proxies
+      bench_zoxy_ref       = var.bench_zoxy_ref
       proxy_ip             = local.hosts["proxy"].ip
       backend_ips          = join(",", local.backend_ips)
     })

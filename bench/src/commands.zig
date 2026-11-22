@@ -250,6 +250,7 @@ pub fn runSuite(
         .runid = runid,
         .out_dir = out_dir,
         .fleet = fleet,
+        .zoxy_ref = Env.get(environ, "BENCH_ZOXY_REF"),
     });
 
     var ok: usize = 0;

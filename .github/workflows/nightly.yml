@@ -34,6 +34,15 @@ on:
         required: false
         type: string
         default: zoxy,haproxy,nginx,pingora,envoy
+      # A zoxy commit or tag to build from source (ReleaseSafe, x86_64_v3, as
+      # the release is built) in place of the latest release: a test of a
+      # change before it ships. Needs publish off; a commit SHA, since a
+      # branch name with a slash cannot be in zoxy's image tag.
+      zoxy_ref:
+        description: 'zoxy commit or tag to build instead of the latest release (test runs only, publish off)'
+        required: false
+        type: string
+        default: ''
       # Off for a test run: no Pages deploy, no history rows, no Discord post
       # and no site refresh. The numbers stay in the run's bench-<runid>
       # artifact (and results.tar in the bucket). A scheduled run always
@@ -84,6 +93,7 @@ jobs:
       # it to run anyway.
       BENCH_PROFILES: ${{ inputs.profiles || 'c1k,c1k-tls,c1k-h2,c1k-h3' }}
       BENCH_PROXIES: ${{ inputs.proxies || 'zoxy,haproxy,nginx,pingora,envoy' }}
+      BENCH_ZOXY_REF: ${{ inputs.zoxy_ref || '' }}
 
       BENCH_BUCKET: ${{ vars.BENCH_BUCKET }}
       YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID }}
@@ -104,6 +114,14 @@ jobs:
       results: ${{ steps.fetch.outcome }}
 
     steps:
+      # A zoxy built from a ref is not a release, and its numbers must not
+      # reach the history, Pages or the site.
+      - name: A zoxy_ref run is a test run
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.zoxy_ref != '' && inputs.publish }}
+        run: |
+          echo "::error::zoxy_ref is set, so this is a test run: dispatch it with publish off"
+          exit 1
+
       - uses: actions/checkout@v7
 
       - name: Install Zig 0.17.1
@@ -229,6 +247,7 @@ jobs:
             -var "bench_bucket=$BENCH_BUCKET" \
             -var "bench_profiles=$BENCH_PROFILES" \
             -var "bench_proxies=$BENCH_PROXIES" \
+            -var "bench_zoxy_ref=$BENCH_ZOXY_REF" \
             2>&1 | sed -u -E \
               -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
               -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
@@ -418,6 +437,7 @@ jobs:
             -var "bench_bucket=$BENCH_BUCKET" \
             -var "bench_profiles=$BENCH_PROFILES" \
             -var "bench_proxies=$BENCH_PROXIES" \
+            -var "bench_zoxy_ref=$BENCH_ZOXY_REF" \
             2>&1 | sed -u -E \
               -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[private key redacted]' \
               -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/[ip redacted]/g'
