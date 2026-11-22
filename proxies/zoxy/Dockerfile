@@ -20,6 +20,12 @@ WORKDIR /dl
 # binaries contain safety-check panic strings. `tr` range is spelled out:
 # busybox `tr -c '[:print:]'` silently matches nothing. Check: v0.1.0 reads
 # ReleaseFast, v0.2.1 ReleaseSafe.
+# The tag's commit comes from git's own ref advertisement (what `git ls-remote`
+# reads), not api.github.com: the REST API allows 60 unauthenticated requests
+# an hour per IP, GitHub-hosted runners share IPs, and CI run 45022445107 got a
+# 403 here. An annotated tag is advertised twice, its `^{}` line naming the
+# commit; zoxy's tags are lightweight, advertised once. Check: v1.2.0 reads
+# 71e511053ffe02e6fd635dc5f904265f867b3b5f.
 RUN set -eu; \
     v="${ZOXY_REF#v}"; \
     case "$TARGETARCH" in \
@@ -35,8 +41,12 @@ RUN set -eu; \
     sha256sum -c sum.txt; \
     mkdir -p /out; \
     tar xzf "$tgz" -C /out zoxy; \
-    wget -qO /out/zoxy-commit --header 'Accept: application/vnd.github.sha' \
-        "https://api.github.com/repos/zoxy-io/zoxy/commits/v$v"; \
+    wget -qO refs "https://github.com/zoxy-io/zoxy.git/info/refs?service=git-upload-pack"; \
+    tr '\000' '\n' < refs > refs.txt; \
+    sha=$(sed -n "s|^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) refs/tags/v$v^{}\$|\1|p" refs.txt); \
+    [ -n "$sha" ] || sha=$(sed -n "s|^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) refs/tags/v$v\$|\1|p" refs.txt); \
+    [ -n "$sha" ] || { echo "tag v$v not advertised by zoxy-io/zoxy" >&2; exit 1; }; \
+    echo "$sha" > /out/zoxy-commit; \
     if tr -c '\040-\176' '\n' < /out/zoxy \
         | grep -q -e 'index out of bounds' -e 'reached unreachable code' \
                   -e 'integer overflow'; then \
@@ -55,9 +65,11 @@ ARG ZOXY_REF=main
 ARG BUILDARCH
 ARG TARGETARCH
 
-# Bust the clone cache when $ZOXY_REF's commit changes, not its name, so `main`
-# is never silently frozen.
-ADD https://api.github.com/repos/zoxy-io/zoxy/commits/$ZOXY_REF /tmp/zoxy-head.json
+# Bust the clone cache when the repository's refs change, so `main` is never
+# silently frozen. Git's ref advertisement rather than the REST API, for the
+# release stage's reason. It changes on any push to the repository, pull
+# requests included, so this rebuilds more often than $ZOXY_REF alone needs.
+ADD https://github.com/zoxy-io/zoxy.git/info/refs?service=git-upload-pack /tmp/zoxy-refs
 
 RUN git clone https://github.com/zoxy-io/zoxy /src \
     && git -C /src checkout "$ZOXY_REF" \

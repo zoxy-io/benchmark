@@ -362,9 +362,15 @@ fn counterValue(text: []const u8) ?u64 {
     return null;
 }
 
-/// Ask GitHub, from the proxy host, what `ref` points at (bare sha via
-/// `Accept: application/vnd.github.sha`; no jq on the fleet). Best-effort:
-/// null means unknown, never stale.
+/// Ask GitHub, from the proxy host, what `ref` points at. Best-effort: null
+/// means unknown, never stale.
+///
+/// Read from git's own ref advertisement (what `git ls-remote` reads), not
+/// api.github.com: the REST API allows 60 unauthenticated requests an hour per
+/// IP, GitHub-hosted runners share IPs, and a 403 there left the local suite's
+/// freshness check unchecked (proxies/zoxy/Dockerfile reads the same endpoint,
+/// after CI run 45022445107 failed on it). A full commit sha is its own answer;
+/// an abbreviated one is advertised nowhere, so it reads as unknown.
 fn resolveRef(
     gpa: Allocator,
     arena: Allocator,
@@ -373,23 +379,53 @@ fn resolveRef(
     ref: []const u8,
     timeout_ns: u64,
 ) ?[]const u8 {
+    if (isSha(ref)) return ref;
     const res = remote.check(
         gpa,
         arena,
         io,
         fleet.proxyHost(),
         "resolve zoxy ref",
-        std.fmt.allocPrint(
-            arena,
-            "curl -sS --max-time 20 -H 'Accept: application/vnd.github.sha' " ++
-                "https://api.github.com/repos/zoxy-io/zoxy/commits/{s}",
-            .{ref},
-        ) catch return null,
+        "curl -sS --max-time 20 'https://github.com/zoxy-io/zoxy.git/info/refs?service=git-upload-pack'",
         timeout_ns,
     ) catch return null;
+    return advertisedSha(res.stdout, ref);
+}
 
-    const sha = std.mem.trim(u8, res.stdout, " \n\r\t");
-    return if (isSha(sha)) sha else null;
+/// The commit `ref` names in a git smart-HTTP ref advertisement, read the way
+/// git reads a name: a tag before a branch, and an annotated tag through its
+/// peeled `^{}` line, which names the commit rather than the tag object.
+///
+/// Each line is a pkt-line, four hex digits of length and then `<sha> <name>`.
+/// The first ref follows a `0000` flush on the same line and carries the
+/// capabilities after a NUL; neither gets in the way of reading a name.
+fn advertisedSha(advertisement: []const u8, ref: []const u8) ?[]const u8 {
+    var peeled: ?[]const u8 = null;
+    var tag: ?[]const u8 = null;
+    var branch: ?[]const u8 = null;
+    var lines = std.mem.tokenizeAny(u8, advertisement, "\n\x00");
+    while (lines.next()) |whole| {
+        const line = if (std.mem.startsWith(u8, whole, "0000")) whole[4..] else whole;
+        if (line.len < 4 + 40 + 1 or line[44] != ' ') continue;
+        const sha = line[4..44];
+        if (!isSha(sha)) continue;
+        const name = line[45..];
+        if (refIs(name, "refs/tags/", ref, "^{}")) {
+            peeled = sha;
+        } else if (refIs(name, "refs/tags/", ref, "")) {
+            tag = sha;
+        } else if (refIs(name, "refs/heads/", ref, "")) {
+            branch = sha;
+        }
+    }
+    return peeled orelse tag orelse branch;
+}
+
+fn refIs(name: []const u8, prefix: []const u8, ref: []const u8, suffix: []const u8) bool {
+    return name.len == prefix.len + ref.len + suffix.len and
+        std.mem.startsWith(u8, name, prefix) and
+        std.mem.eql(u8, name[prefix.len..][0..ref.len], ref) and
+        std.mem.endsWith(u8, name, suffix);
 }
 
 /// Where tonight's zoxy binary comes from, resolved once before any build so
@@ -2267,6 +2303,38 @@ test "only a real commit sha counts as a resolved ref" {
     try std.testing.expect(!isSha("z1d03b10f698256857615c2e256ce29548dfd51a"));
     // A short sha is not enough to compare against a full one.
     try std.testing.expect(!isSha("91d03b1"));
+}
+
+test "a ref is read from git's ref advertisement as git would read it" {
+    // Shaped like github.com/<repo>.git/info/refs?service=git-upload-pack: the
+    // service line, a flush glued to the first ref, capabilities after a NUL.
+    const advertisement =
+        "001e# service=git-upload-pack\n" ++
+        "0000015a1111111111111111111111111111111111111111 HEAD\x00multi_ack thin-pack agent=git/github\n" ++
+        "003f2222222222222222222222222222222222222222 refs/heads/main\n" ++
+        "00413333333333333333333333333333333333333333 refs/heads/v2.0.0\n" ++
+        "003e4444444444444444444444444444444444444444 refs/tags/v1.2.0\n" ++
+        "00425555555555555555555555555555555555555555 refs/tags/v1.2.0-rc1\n" ++
+        "003e6666666666666666666666666666666666666666 refs/tags/v2.0.0\n" ++
+        "00417777777777777777777777777777777777777777 refs/tags/v2.0.0^{}\n" ++
+        "0000";
+    const expectSha = struct {
+        fn f(want: ?[]const u8, ref: []const u8) !void {
+            const got = advertisedSha(advertisement, ref);
+            if (want) |w| try std.testing.expectEqualStrings(w, got.?) else try std.testing.expect(got == null);
+        }
+    }.f;
+    // A lightweight tag (zoxy's) is its own commit, and `-rc1` is another tag.
+    try expectSha("4444444444444444444444444444444444444444", "v1.2.0");
+    // An annotated tag names its commit on the peeled line, and a tag wins
+    // over a branch of the same name.
+    try expectSha("7777777777777777777777777777777777777777", "v2.0.0");
+    try expectSha("2222222222222222222222222222222222222222", "main");
+    try expectSha(null, "v1.2");
+    try expectSha(null, "missing");
+    // What a rate-limited or failed fetch returns is no answer.
+    try std.testing.expect(advertisedSha("{\"message\":\"API rate limit exceeded\"}", "main") == null);
+    try std.testing.expect(advertisedSha("", "main") == null);
 }
 
 test "the version probe asks the container, and falls back to the image tag" {
