@@ -14,8 +14,8 @@
     // zurl is pinned to whatever zrk pins; two copies would be incompatible.
     .dependencies = .{
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v3.0.4#60f6e1b9bacb0c30ad1c514de9d60a95b947161a",
-            .hash = "zrk-3.0.4-WqdFO2wlDgAGRUoBJ-yvWAaYrhNVVZK3vDyfFIOsqjKT",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v3.0.5#e4c529665a58c340f5020a02730ff66e0ed81e0f",
+            .hash = "zrk-3.0.5-WqdFO9knDgCunZPeeD-gPcKnTAfxzv0O1bvJPGB4QDzx",
         },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",

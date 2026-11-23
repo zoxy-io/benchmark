@@ -259,12 +259,17 @@ is the other half, and it is the half where proxies differ.
     100 KiB bands that ran from 2026-09-18 to 2026-10-07 stay in
     `history.ndjson`, and the old `c1k-10k` series is the one the new `c1k`
     continues.
-  - **The generator moved to zrk 3.0.4 on 2026-11-23.** 3.0.2 shares
+  - **The generator moved to zrk 3.0.5 on 2026-11-23.** 3.0.2 shares
     latency statistics between the generator's threads instead of keeping a
     histogram per connection (much less memory on the loadgen); 3.0.3 fixes
     HTTP/3 against haproxy and envoy; 3.0.4 fixes HTTP/3 loss recovery (3.0.3
     sent probes every 20 ms to a peer that had not answered, not on RFC 9002's
-    timer) and how it gives up a handshake. The HTTP/1.1 and HTTP/2 requests
+    timer) and how it gives up a handshake; 3.0.5 keeps an HTTP/3 connection
+    when the server repeats a frame about a request already finished (a
+    retransmitted tail after a probe or spurious loss). 3.0.4 closed it with
+    STREAM_STATE_ERROR, a read error and a reconnect, which charged each proxy
+    by how often it retransmits: against zoxy it was every HTTP/3 read error.
+    The HTTP/1.1 and HTTP/2 requests
     and the timeseries are unchanged, so the `c1k`, `c1k-tls` and `c1k-h2`
     series carry on; a step on that night may still be the generator. The
     hosts' UDP buffers were raised the same day, which TCP does not use.
